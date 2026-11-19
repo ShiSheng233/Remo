@@ -1,12 +1,16 @@
+import CoreMedia
 import Darwin
 import Dispatch
 import Foundation
 import Network
+import RemoCodec
+import RemoEngine
 import RemoTransport
 
 enum Message: UInt8 {
     case hello = 1
-    case heartbeat, goodbye, video, control
+    case heartbeat, goodbye
+    case control = 5
 
     func packet(sequence: UInt64, size: Int) -> Data {
         var bytes = Data(repeating: rawValue, count: size)
@@ -21,6 +25,10 @@ final class DemoSession {
 
     let role: Role
     let peer: NWEndpoint
+    private var video: VideoSession?
+    private var acknowledgedReferences = 0
+    private var codecDrops: UInt64 = 0
+    private var verifiedFrames: UInt64 = 0
     private var session: NetworkMessageSession?
     private let trace = HeartbeatTrace(layer: "session")
     private var active = false
@@ -31,7 +39,6 @@ final class DemoSession {
     private var latestFrame: UInt64 = 0
     private var latestControl: UInt64 = 0
     private var backpressureDrops: UInt64 = 0
-    private var lateFrames: UInt64 = 0
     private var heartbeats = 0
     private var videoBytes = 0
     private var previousFrames: UInt64 = 0
@@ -73,6 +80,7 @@ final class DemoSession {
             lastReport = lastSeen
             trace.write(peer, "\(role) ready")
             do {
+                try prepareVideo()
                 if role == .client {
                     try session.send(Data([Message.hello.rawValue]), mode: .reliable)
                     trace.write(peer, "hello queued")
@@ -84,9 +92,64 @@ final class DemoSession {
                 stop("send failed: \(error)", failed: true)
             }
         }
+        video?.close()
         session?.cancel()
         session = nil
         return failure == nil
+    }
+
+    private func prepareVideo() throws {
+        let encoder =
+            role == .server
+            ? try VideoEncoder(
+                width: SimulatedVideo.width, height: SimulatedVideo.height,
+                framesPerSecond: 30, bitRate: 2_000_000, enableLongTermReferences: true) : nil
+        video = VideoSession(
+            encoder: encoder,
+            send: { [weak self] data, mode in
+                guard let self, !stopping, let session else {
+                    throw NetworkMessageSession.SendError.closed
+                }
+                try session.send(data, mode: mode)
+            },
+            onFrame: { [weak self] id, frame, bytes in
+                guard let self, !stopping else { return }
+                let index = CMTimeConvertScale(
+                    frame.presentationTime, timescale: 30, method: .default
+                ).value
+                guard index >= 0, SimulatedVideo.matches(frame.pixels, index: UInt64(index)) else {
+                    stop("decoded image mismatch frame=\(id) pts=\(index)", failed: true)
+                    return
+                }
+                verifiedFrames += 1
+                frames += 1
+                latestFrame = max(latestFrame, id)
+                videoBytes += bytes
+                lastSeen = DispatchTime.now().uptimeNanoseconds
+            },
+            onEvent: { [weak self] event in
+                guard let self else { return }
+                switch event {
+                case .acknowledged(let frame, let token):
+                    acknowledgedReferences += 1
+                    if acknowledgedReferences == 1 {
+                        log(
+                            "[\(peer)] first LTR acknowledged frame=\(frame) token=\(token.rawValue)"
+                        )
+                    }
+                case .requestedRecovery(let last, let available):
+                    log(
+                        "[\(peer)] recovery requested lastDecoded=\(last) nextAvailable=\(available)"
+                    )
+                case .encodedRefresh(let id, let reference):
+                    log(
+                        "[\(peer)] recovery encoded frame=\(id) kind=\(reference.map { "LTR-P ackToken=\($0.rawValue)" } ?? "IDR")"
+                    )
+                case .decodedRefresh(let id, let idr):
+                    log("[\(peer)] recovery decoded frame=\(id) kind=\(idr ? "IDR" : "LTR-P")")
+                }
+            },
+            onFailure: { [weak self] error in self?.stop("video failed: \(error)", failed: true) })
     }
 
     func requestExit() {
@@ -109,7 +172,9 @@ final class DemoSession {
     }
 
     private func receive(_ channel: MessageTransport.Channel, _ bytes: Data) {
-        guard !stopping, let first = bytes.first, let kind = Message(rawValue: first) else {
+        guard !stopping, video?.receive(channel, bytes) != true, let first = bytes.first,
+            let kind = Message(rawValue: first)
+        else {
             return
         }
         switch (role, channel, kind) {
@@ -128,12 +193,6 @@ final class DemoSession {
             trace.write(peer, "heartbeat accepted count=\(heartbeats)")
         case (.server, .reliable, .goodbye) where bytes.count == 1:
             stop("client left", failed: false)
-        case (.client, .unreliable, .video) where bytes.count == 12_288:
-            frames += 1
-            let number = sequence(in: bytes)
-            if number < latestFrame { lateFrames += 1 }
-            latestFrame = max(latestFrame, number)
-            videoBytes += bytes.count
         case (.client, .reliable, .control) where bytes.count == 9:
             controls += 1
             latestControl = sequence(in: bytes)
@@ -165,12 +224,14 @@ final class DemoSession {
                     nextControl = now + 1_000_000_000
                 }
                 frames += 1
-                let frame = Message.video.packet(sequence: frames, size: 12_288)
-                let deadline = Double(DispatchTime.now().uptimeNanoseconds) / 1e9 + 0.033
+                guard let video else { throw VideoSession.Failure.closed }
+                let pixels = try SimulatedVideo.pixels(frames)
                 do {
-                    try session.send(
-                        frame, mode: .unreliable(retryBudget: 0.08, firstSendDeadline: deadline))
-                    videoBytes += frame.count
+                    videoBytes += try await video.sendFrame(
+                        pixels, presentationTime: CMTime(value: Int64(frames), timescale: 30),
+                        duration: CMTime(value: 1, timescale: 30))
+                } catch VideoCodecError.frameDropped {
+                    codecDrops += 1
                 } catch NetworkMessageSession.SendError.backpressure {
                     backpressureDrops += 1
                 }
@@ -202,7 +263,7 @@ final class DemoSession {
         let elapsed = now - lastReport
         guard elapsed >= 1_000_000_000 else { return }
         let seconds = Double(elapsed) / 1e9
-        let countedFrames = frames - backpressureDrops
+        let countedFrames = frames - backpressureDrops - codecDrops
         let fps = Double(countedFrames - previousFrames) / seconds
         let mbps = Double(videoBytes - previousBytes) * 8 / seconds / 1e6
         let stats = session.statistics
@@ -210,11 +271,11 @@ final class DemoSession {
         let details: String
         if role == .server {
             details =
-                "generated=\(frames) queued=\(countedFrames) backpressureDrops=\(backpressureDrops)"
-                + " controlsQueued=\(controls) heartbeatsRx=\(heartbeats)"
+                "generated=\(frames) queued=\(countedFrames) backpressureDrops=\(backpressureDrops) codecDrops=\(codecDrops)"
+                + " ltrAcks=\(acknowledgedReferences) controlsQueued=\(controls) heartbeatsRx=\(heartbeats)"
         } else {
             details =
-                "frames=\(frames) latest=#\(latestFrame) missingFrames=\(max(latestFrame, frames) - frames) lateFrames=\(lateFrames)"
+                "frames=\(frames) latest=#\(latestFrame) missingFrames=\(max(latestFrame, frames) - frames) verified=\(verifiedFrames)"
                 + " controls=\(controls) latest=#\(latestControl) heartbeatsQueued=\(heartbeats)"
         }
         let direction = role == .server ? "video queued" : "video received"

@@ -11,6 +11,8 @@
     ],
   },
   "files": [
+    { "path": "Packages/RemoCodec" },
+    { "path": "Packages/RemoEngine" },
     { "path": "Packages/RemoTransport" },
     { "kind": "folder", "path": "Remo", "target-membership": [ "Remo" ] },
     {

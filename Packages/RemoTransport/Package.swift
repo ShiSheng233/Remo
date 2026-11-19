@@ -11,7 +11,6 @@ let package = Package(
             name: "RemoTransport",
             targets: ["RemoTransport"]
         ),
-        .executable(name: "remo-transport", targets: ["RemoTransportCLI"]),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -22,7 +21,6 @@ let package = Package(
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],
         ),
-        .executableTarget(name: "RemoTransportCLI", dependencies: ["RemoTransport"]),
         .testTarget(
             name: "RemoTransportTests",
             dependencies: ["RemoTransport"],
