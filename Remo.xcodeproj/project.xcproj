@@ -11,6 +11,7 @@
     ],
   },
   "files": [
+    { "path": "Packages/RemoTransport" },
     { "kind": "folder", "path": "Remo", "target-membership": [ "Remo" ] },
     {
       "kind": "group",
