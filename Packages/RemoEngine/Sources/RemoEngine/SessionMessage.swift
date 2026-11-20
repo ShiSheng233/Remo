@@ -11,4 +11,7 @@ public enum SessionMessage: UInt8 {
     case control = 5
     case screenHello = 6
     case modeMismatch = 7
+    case mouseHello = 8
+    case mouseReady = 9
+    case mouseInput = 10
 }

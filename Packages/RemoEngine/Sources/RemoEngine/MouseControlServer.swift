@@ -1,0 +1,164 @@
+//
+//  Created by Cyandev on 11/21/26.
+//  Copyright (c) 2026 Cyandev. All rights reserved.
+//
+
+import Foundation
+import RemoTransport
+
+/// Serializes remote mouse input from one controlling peer at a time.
+@MainActor
+public final class MouseControlServer {
+    enum Event: Equatable {
+        case move(CGPoint, dragging: Bool)
+        case button(MouseMessage.Button, CGPoint)
+        case scroll(Int32)
+    }
+
+    private struct Move {
+        let sequence: UInt64
+        let afterButton: UInt64
+        let position: CGPoint
+    }
+
+    private let initialState: () -> MouseMessage?
+    private let emit: (Event) -> Void
+    private var owner: UUID?
+    private var position = CGPoint.zero
+    private var leftDown = false
+    private var latestPosition: UInt64 = 0
+    private var latestButton: UInt64 = 0
+    private var pendingMove: Move?
+
+    init(initialState: @escaping () -> MouseMessage?, emit: @escaping (Event) -> Void) {
+        self.initialState = initialState
+        self.emit = emit
+    }
+
+    public func begin(for peer: UUID) -> MouseMessage? {
+        guard owner == nil, let message = initialState(),
+            case .ready(let position, _, _) = message
+        else { return nil }
+        owner = peer
+        self.position = position
+        return message
+    }
+
+    public func receive(_ bytes: Data, on channel: MessageTransport.Channel, from peer: UUID) {
+        guard owner == peer, let input = try? MouseMessage(decoding: bytes) else { return }
+        switch (channel, input) {
+        case let (.unreliable, .move(sequence, afterButton, position)):
+            receiveMove(Move(sequence: sequence, afterButton: afterButton, position: position))
+        case let (.reliable, .button(sequence, action, position)):
+            guard sequence > latestPosition else { return }
+            latestButton = sequence
+            latestPosition = sequence
+            switch action {
+            case .leftDown where !leftDown:
+                leftDown = true
+                self.position = position
+                emit(.button(action, position))
+            case .leftUp where leftDown:
+                if self.position != position { emit(.move(position, dragging: true)) }
+                leftDown = false
+                self.position = position
+                emit(.button(action, position))
+            case .leftClick, .rightClick:
+                if !leftDown {
+                    self.position = position
+                    emit(.button(action, position))
+                }
+            default: break
+            }
+            if let pendingMove, pendingMove.afterButton <= sequence {
+                self.pendingMove = nil
+                receiveMove(pendingMove)
+            }
+        case let (.reliable, .scroll(delta)):
+            emit(.scroll(delta))
+        default: break
+        }
+    }
+
+    private func receiveMove(_ move: Move) {
+        guard move.sequence > latestPosition, move.afterButton >= latestButton else { return }
+        // A move can overtake its reliable button transition. Keep only the latest such move.
+        if move.afterButton > latestButton {
+            if move.sequence > (pendingMove?.sequence ?? 0) { pendingMove = move }
+            return
+        }
+        latestPosition = move.sequence
+        position = move.position
+        emit(.move(position, dragging: leftDown))
+    }
+
+    public func end(for peer: UUID) {
+        if owner == peer { stop() }
+    }
+
+    public func stop() {
+        if leftDown { emit(.button(.leftUp, position)) }
+        leftDown = false
+        owner = nil
+        latestPosition = 0
+        latestButton = 0
+        pendingMove = nil
+    }
+}
+
+#if os(macOS)
+    import CoreGraphics
+
+    extension MouseControlServer {
+        public convenience init(displayID: CGDirectDisplayID) {
+            let source = CGEventSource(stateID: .hidSystemState)
+            self.init(initialState: {
+                let bounds = CGDisplayBounds(displayID)
+                guard !bounds.isEmpty,
+                    let width = UInt32(exactly: bounds.width), width > 0,
+                    let height = UInt32(exactly: bounds.height), height > 0,
+                    let location = CGEvent(source: nil)?.location
+                else { return nil }
+                let position = CGPoint(
+                    x: min(1, max(0, (location.x - bounds.minX) / max(1, bounds.width - 1))),
+                    y: min(1, max(0, (location.y - bounds.minY) / max(1, bounds.height - 1))))
+                return .ready(position: position, width: width, height: height)
+            }, emit: { event in
+                let bounds = CGDisplayBounds(displayID)
+                guard !bounds.isEmpty else { return }
+                func post(_ type: CGEventType, _ button: CGMouseButton, at position: CGPoint) {
+                    let location = CGPoint(
+                        x: bounds.minX + position.x * max(0, bounds.width - 1),
+                        y: bounds.minY + position.y * max(0, bounds.height - 1))
+                    let event = CGEvent(
+                        mouseEventSource: source, mouseType: type, mouseCursorPosition: location,
+                        mouseButton: button)
+                    if type != .mouseMoved && type != .leftMouseDragged {
+                        event?.setIntegerValueField(.mouseEventClickState, value: 1)
+                    }
+                    event?.post(tap: .cghidEventTap)
+                }
+                switch event {
+                case let .move(position, dragging):
+                    post(dragging ? .leftMouseDragged : .mouseMoved, .left, at: position)
+                case let .button(action, position):
+                    switch action {
+                    case .leftClick:
+                        post(.leftMouseDown, .left, at: position)
+                        post(.leftMouseUp, .left, at: position)
+                    case .rightClick:
+                        post(.rightMouseDown, .right, at: position)
+                        post(.rightMouseUp, .right, at: position)
+                    case .leftDown:
+                        post(.leftMouseDown, .left, at: position)
+                    case .leftUp:
+                        post(.leftMouseUp, .left, at: position)
+                    }
+                case let .scroll(delta):
+                    CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 1,
+                        wheel1: delta, wheel2: 0, wheel3: 0)?.post(tap: .cghidEventTap)
+                }
+            })
+        }
+    }
+#endif

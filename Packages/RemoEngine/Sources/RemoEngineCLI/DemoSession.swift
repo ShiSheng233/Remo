@@ -22,6 +22,8 @@ final class DemoSession {
     typealias StartCapture = @MainActor () async throws -> any ScreenFrameSource
     let screen: Bool
     private let startCapture: StartCapture?
+    private let mouse: MouseControlServer?
+    private let mousePeer = UUID()
     private var source: (any ScreenFrameSource)?
     private var previousCapturePTS = CMTime.invalid
     private var lastCaptureSend: UInt64 = 0
@@ -69,13 +71,14 @@ final class DemoSession {
 
     init(
         role: Role, peer: NWEndpoint, screen: Bool = false, startCapture: StartCapture? = nil,
-        settings: VideoSettings = VideoSettings()
+        mouse: MouseControlServer? = nil, settings: VideoSettings = VideoSettings()
     ) {
         self.settings = settings
         targetBitRate = settings.maxVideoBitRate
         refreshBitRate = settings.maxVideoBitRate
         self.screen = screen
         self.startCapture = startCapture
+        self.mouse = mouse
         self.role = role
         self.peer = peer
     }
@@ -210,6 +213,7 @@ final class DemoSession {
     private func stop(_ reason: String, failed: Bool) {
         guard !stopping else { return }
         stopping = true
+        mouse?.end(for: mousePeer)
         if failed { failure = reason }
         setup?.cancel()
         let idleMs = (DispatchTime.now().uptimeNanoseconds - lastSeen) / 1_000_000
@@ -248,6 +252,16 @@ final class DemoSession {
             trace.write(peer, "heartbeat accepted count=\(heartbeats)")
         case (.server, .reliable, .goodbye) where bytes.count == 1:
             stop("client left", failed: false)
+        case (.server, .reliable, .mouseHello) where active && bytes.count == 1:
+            guard let mouse, let session, let ready = mouse.begin(for: mousePeer) else { return }
+            do {
+                try session.send(ready.encoded, mode: .reliable)
+            } catch {
+                mouse.end(for: mousePeer)
+            }
+        case (.server, _, .mouseInput) where active:
+            mouse?.receive(bytes, on: channel, from: mousePeer)
+            return
         case (.client, .reliable, .modeMismatch):
             stop("screen sharing requires client --screen", failed: true)
         case (.client, .reliable, .control) where bytes.count == 9:

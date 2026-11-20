@@ -3,12 +3,14 @@
 //  Copyright (c) 2026 Cyandev. All rights reserved.
 //
 
+import CoreGraphics
 import Foundation
 import Network
 import Observation
 import RemoCodec
 import RemoEngine
 import RemoTransport
+import UIKit
 
 @MainActor
 @Observable
@@ -19,7 +21,13 @@ final class StreamPlayer {
 
     private(set) var surface: VideoSurface?
     private(set) var phase = Phase.idle
+    var mouseAvailable: Bool { mouseDisplaySize != nil }
 
+    private var mouseDisplaySize: CGSize?
+    @ObservationIgnored private var mousePosition = CGPoint.zero
+    @ObservationIgnored private var mouseSequence: UInt64 = 0
+    @ObservationIgnored private var mouseButtonSequence: UInt64 = 0
+    @ObservationIgnored private var scrollRemainder: CGFloat = 0
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var transport: NetworkMessageSession?
     @ObservationIgnored private var video: VideoSession?
@@ -58,6 +66,10 @@ final class StreamPlayer {
             phase = failure.map(Phase.failed) ?? .idle
             failure = nil
             receivedControl = false
+            mouseDisplaySize = nil
+            mouseSequence = 0
+            mouseButtonSequence = 0
+            scrollRemainder = 0
             task = nil
         }
 
@@ -102,6 +114,7 @@ final class StreamPlayer {
         let started = ProcessInfo.processInfo.systemUptime
         lastSeen = started
         lastFrame = started
+        var nextMouseHello = started
         while !Task.isCancelled {
             let now = ProcessInfo.processInfo.systemUptime
             if now - lastSeen >= 4 {
@@ -116,6 +129,10 @@ final class StreamPlayer {
                 try video?.requestRefresh()
             }
             do {
+                if !mouseAvailable, now >= nextMouseHello {
+                    nextMouseHello = now + 1.2
+                    try session.send(Data([SessionMessage.mouseHello.rawValue]), mode: .reliable)
+                }
                 try session.send(
                     Data([SessionMessage.heartbeat.rawValue]), mode: .unreliable(retryBudget: 0))
             } catch NetworkMessageSession.SendError.backpressure {
@@ -136,7 +153,52 @@ final class StreamPlayer {
             lastSeen = ProcessInfo.processInfo.systemUptime
         case .modeMismatch where data.count == 1:
             fail("The server doesn’t support this video session.")
+        case .mouseReady where !mouseAvailable:
+            if case let .ready(position, width, height) = try? MouseMessage(decoding: data) {
+                mousePosition = position
+                mouseDisplaySize = CGSize(width: Int(width), height: Int(height))
+            }
         default: break
+        }
+    }
+
+    func handleTrackpad(_ gesture: TrackpadGesture) {
+        guard phase == .streaming, task?.isCancelled == false, let transport,
+            let displaySize = mouseDisplaySize, let bounds = surface?.bounds, !bounds.isEmpty
+        else { return }
+
+        let message: MouseMessage
+        let mode: MessageTransport.Mode
+        switch gesture {
+        case let .move(delta):
+            guard delta != .zero else { return }
+            let scale = min(bounds.width / displaySize.width, bounds.height / displaySize.height)
+            mousePosition = CGPoint(
+                x: min(1, max(0, mousePosition.x + delta.x / (displaySize.width * scale))),
+                y: min(1, max(0, mousePosition.y + delta.y / (displaySize.height * scale))))
+            mouseSequence += 1
+            message = .move(
+                sequence: mouseSequence, afterButton: mouseButtonSequence, position: mousePosition)
+            let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+            mode = .unreliable(retryBudget: 0, firstSendDeadline: now + 0.05)
+        case let .button(action):
+            mouseSequence += 1
+            mouseButtonSequence = mouseSequence
+            message = .button(sequence: mouseSequence, action: action, position: mousePosition)
+            mode = .reliable
+        case let .scroll(delta):
+            scrollRemainder = min(1000, max(-1000, scrollRemainder + delta))
+            let wheel = Int32(scrollRemainder.rounded(.towardZero))
+            guard wheel != 0 else { return }
+            scrollRemainder -= CGFloat(wheel)
+            message = .scroll(wheel)
+            mode = .reliable
+        }
+        do {
+            try transport.send(message.encoded, mode: mode)
+        } catch {
+            if case .unreliable = mode { return }
+            fail("Mouse input couldn’t be sent. \(error.localizedDescription)")
         }
     }
 

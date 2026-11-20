@@ -6,6 +6,7 @@ import RemoEngine
 
 #if os(macOS)
     import AppKit
+    import CoreGraphics
 #endif
 
 struct VideoSettings {
@@ -21,7 +22,7 @@ struct VideoSettings {
 enum Command {
     static let usage = """
         Usage:
-          remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--wire-stats] [--trace-heartbeats]
+          remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--mouse-control] [--wire-stats] [--trace-heartbeats]
           remo-engine client <host> [port] [--screen] [--wire-stats] [--trace-heartbeats]
 
         Default UDP port: 7711
@@ -30,6 +31,7 @@ enum Command {
         --fps sets the server frame rate (1...240, default 30). Screen capture may run slower.
         --max-video-bitrate sets the video bitrate ceiling in bits per second (default 2000000).
         --screen streams the main display on the server and opens a video window on the client (macOS).
+        --mouse-control enables remote mouse input on a macOS screen server (requires Accessibility access).
         --trace-heartbeats traces heartbeat submission, UDP framing, session delivery, and timeouts.
         --wire-stats observes outgoing UDP payload bytes, DATA, ACK, and retransmissions.
         """
@@ -63,7 +65,10 @@ enum Command {
         var args = Array(CommandLine.arguments.dropFirst())
         let wireStats = args.contains("--wire-stats")
         let screen = args.contains("--screen")
-        args.removeAll { $0 == "--screen" || $0 == "--wire-stats" || $0 == "--trace-heartbeats" }
+        let mouseControl = args.contains("--mouse-control")
+        args.removeAll {
+            $0 == "--screen" || $0 == "--mouse-control" || $0 == "--wire-stats" || $0 == "--trace-heartbeats"
+        }
         if args == ["--help"] || args == ["-h"] {
             log(usage)
             return
@@ -101,6 +106,9 @@ enum Command {
                 || (args.first == "client" && (2...3).contains(args.count))
         else { fail(usage) }
         let server = args[0] == "server"
+        if mouseControl && (!server || !screen) {
+            fail("--mouse-control requires server --screen.")
+        }
         let value = args.dropFirst(server ? 1 : 2).first ?? "7711"
         guard let raw = UInt16(value), raw > 0, let port = NWEndpoint.Port(rawValue: raw) else {
             fail("Invalid UDP port: \(value)")
@@ -109,10 +117,17 @@ enum Command {
             (wireStats || HeartbeatTrace.enabled) ? DatagramMonitor.parameters() : .udp
         if server {
             var capture: DemoSession.StartCapture?
+            var mouse: MouseControlServer?
             if screen {
                 #if os(macOS)
                     guard #available(macOS 12.3, *) else {
                         fail("Screen capture requires macOS 12.3 or later.")
+                    }
+                    if mouseControl {
+                        guard CGPreflightPostEventAccess() else {
+                            fail("Mouse control requires Accessibility access in System Settings → Privacy & Security.")
+                        }
+                        mouse = MouseControlServer(displayID: CGMainDisplayID())
                     }
                     do {
                         let config = try await ScreenCaptureConfiguration.mainDisplay(
@@ -138,7 +153,8 @@ enum Command {
                 )
             }
             do {
-                try await listen(port, parameters: parameters, capture: capture, settings: settings)
+                try await listen(
+                    port, parameters: parameters, capture: capture, mouse: mouse, settings: settings)
             } catch {
                 fail("Listener failed: \(error)")
             }
@@ -181,7 +197,7 @@ enum Command {
     @MainActor
     static func listen(
         _ port: NWEndpoint.Port, parameters: NWParameters, capture: DemoSession.StartCapture?,
-        settings: VideoSettings
+        mouse: MouseControlServer?, settings: VideoSettings
     ) async throws {
         let listener = try NWListener(using: parameters, on: port)
         let (states, events) = AsyncStream<NWListener.State>.makeStream()
@@ -190,12 +206,28 @@ enum Command {
             Task { @MainActor in
                 let peer = DemoSession(
                     role: .server, peer: connection.endpoint, screen: capture != nil,
-                    startCapture: capture, settings: settings)
+                    startCapture: capture, mouse: mouse, settings: settings)
                 _ = await peer.run(connection)
             }
         }
         listener.start(queue: DispatchQueue(label: "RemoEngineCLI.listener"))
+        let signals: [any DispatchSourceSignal] = mouse.map { mouse in
+            [SIGINT, SIGTERM].map { number in
+                signal(number, SIG_IGN)
+                let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+                source.setEventHandler(handler: DispatchWorkItem {
+                    Task { @MainActor in
+                        mouse.stop()
+                        listener.cancel()
+                    }
+                })
+                source.activate()
+                return source
+            }
+        } ?? []
         defer {
+            for source in signals { source.cancel() }
+            mouse?.stop()
             listener.cancel()
             events.finish()
         }

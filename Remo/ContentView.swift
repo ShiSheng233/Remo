@@ -59,6 +59,9 @@ struct ContentView: View {
         ZStack {
             VideoSurfaceView(surface: surface)
                 .accessibilityLabel("Remote video")
+            if player.phase == .streaming, player.mouseAvailable {
+                TrackpadView(onInput: player.handleTrackpad)
+            }
             if player.phase == .connecting {
                 ProgressView("Connecting…")
                     .tint(.white)
