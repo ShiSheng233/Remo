@@ -36,21 +36,23 @@ final class StreamPlayer {
     @ObservationIgnored private var lastFrame: TimeInterval = 0
     @ObservationIgnored private var receivedControl = false
 
-    func connect(to endpoint: NWEndpoint) {
+    func connect(to endpoint: NWEndpoint, wireGuard: WireGuardConfiguration? = nil) {
         guard task == nil else { return }
         surface = VideoSurface()
         phase = .connecting
-        task = Task { await run(endpoint) }
+        task = Task { await run(endpoint, wireGuard: wireGuard) }
     }
 
     func disconnect() {
         task?.cancel()
     }
 
-    private func run(_ endpoint: NWEndpoint) async {
+    private func run(_ endpoint: NWEndpoint, wireGuard: WireGuardConfiguration?) async {
         let setupTimeout = Task { [weak self] in
             try await Task.sleep(for: .seconds(8))
-            self?.fail("Couldn’t open a connection to the server.")
+            self?.fail(
+                wireGuard == nil
+                    ? "Couldn’t open a connection to the server." : "The WireGuard handshake timed out.")
         }
         defer {
             setupTimeout.cancel()
@@ -74,17 +76,27 @@ final class StreamPlayer {
         }
 
         do {
-            let session = try await NetworkMessageSession(
-                connection: NWConnection(to: endpoint, using: .udp),
-                dataHandler: { [weak self] in self?.receive($0, $1) },
-                closeHandler: { [weak self] reason in
-                    guard let self, transport != nil else { return }
-                    if case .network(let error) = reason {
-                        fail(error.localizedDescription)
-                    } else {
-                        fail("The connection to the server closed.")
-                    }
-                })
+            let receive: (MessageTransport.Channel, Data) -> Void = { [weak self] in
+                self?.receive($0, $1)
+            }
+            let close: (NetworkMessageSession.CloseReason) -> Void = { [weak self] reason in
+                guard let self, transport != nil else { return }
+                if case .network(let error) = reason {
+                    fail(error.localizedDescription)
+                } else {
+                    fail("The connection to the server closed.")
+                }
+            }
+            let session: NetworkMessageSession
+            if let wireGuard {
+                session = try await NetworkMessageSession(
+                    driver: WireGuardDatagramConnection(wireGuard),
+                    dataHandler: receive, closeHandler: close)
+            } else {
+                session = try await NetworkMessageSession(
+                    connection: NWConnection(to: endpoint, using: .udp),
+                    dataHandler: receive, closeHandler: close)
+            }
             transport = session
             setupTimeout.cancel()
             try Task.checkCancellation()

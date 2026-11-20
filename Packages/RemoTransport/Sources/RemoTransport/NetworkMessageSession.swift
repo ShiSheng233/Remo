@@ -2,7 +2,7 @@ import Dispatch
 import Foundation
 import Network
 
-enum ConnectionEvent: Sendable {
+public enum ConnectionEvent: Sendable {
     case state(NWConnection.State)
     case received(Data?, final: Bool = false)
     case processed(Int)
@@ -10,7 +10,9 @@ enum ConnectionEvent: Sendable {
     case timer
 }
 
-protocol DatagramConnection: AnyObject {
+/// A message-oriented connection driven by a `NetworkMessageSession`'s owning actor.
+/// Each receive requests one datagram. Send completions report the original admitted byte count.
+public protocol DatagramConnection: AnyObject {
     func start(events: AsyncStream<ConnectionEvent>.Continuation)
     func receive()
     func send(_ datagram: Data)
@@ -98,7 +100,8 @@ public final class NetworkMessageSession {
             isolation: isolation, dataHandler: dataHandler, closeHandler: closeHandler)
     }
 
-    init(
+    /// Takes ownership of an unstarted datagram driver.
+    public init(
         driver: any DatagramConnection, datagramLimit: Int = 1200,
         isolation: isolated any Actor = #isolation,
         dataHandler: @escaping (MessageTransport.Channel, Data) -> Void,

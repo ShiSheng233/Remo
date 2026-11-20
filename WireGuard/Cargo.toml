@@ -1,0 +1,12 @@
+[package]
+name = "remo-wireguard"
+version = "0.1.0"
+edition = "2024"
+authors = ["Cyandev"]
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+boringtun = "=0.7.1"
