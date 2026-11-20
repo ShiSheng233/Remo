@@ -67,6 +67,8 @@ public final class MessageTransport {
     }
 
     public let datagramLimit: Int
+    public private(set) var isClosed = false
+
     private let clock: () -> TimeInterval
     private let dataHandler: (Channel, Data) -> Void
     private let ioHandler: (IORequest) -> Bool
@@ -83,7 +85,6 @@ public final class MessageTransport {
     private var ackCount = 0
     private var ackDue: TimeInterval?
     private var blocked = false
-    public private(set) var isClosed = false
     private var running = false
     private var needsDrive = false
     private var events: [Event] = []
@@ -91,14 +92,25 @@ public final class MessageTransport {
     private var credit: Double
     private var creditAt: TimeInterval
     private var rate = 4_000_000.0
+    private var recoveryCeiling = 0.0
+    private var healthyFeedbackTime: TimeInterval = 0
     private var rtt: TimeInterval?
     private var variation = 0.0
     private var rto: TimeInterval { max(0.03, min(0.5, (rtt ?? 0.1) + 4 * variation)) }
+    // Allow transient wireless ACK batching before declaring a feedback blackout.
+    private var probeDelay: TimeInterval { max(0.2, 2 * rto) }
     private var progressAt: TimeInterval?
     private var probeAt: TimeInterval?
     private var probeInterval = 0.1
     private var sampleAt: TimeInterval
-    private var losses = 0
+    private var congestedLastWindow = false
+    private var windowBytes = 0
+    private var probeReducedRate = false
+    // Recovery acts on a timeout immediately. Rate control waits one full observation
+    // window so a later bitmap can clear that exact transmission, even after payload eviction.
+    private var suspectedLosses: Set<UInt32> = []
+    private var agingLosses: Set<UInt32> = []
+    private var agingWindowUtilized = false
     private var confirmations = 0
     private var baselineRTT: TimeInterval?
 
@@ -120,11 +132,14 @@ public final class MessageTransport {
         sampleAt = creditAt
     }
 
+    private var queuedBytes: Int {
+        r.values.reduce(0) { $0 + $1.queuedBytes } + u.values.reduce(0) { $0 + $1.queuedBytes }
+    }
+
     public var statistics: Statistics {
-        let queued =
-            r.values.reduce(0) { $0 + $1.queuedBytes } + u.values.reduce(0) { $0 + $1.queuedBytes }
         return Statistics(
-            bitsPerSecond: rate, roundTripTime: rtt, estimatedQueueDelay: Double(queued) * 8 / rate)
+            bitsPerSecond: rate, roundTripTime: rtt,
+            estimatedQueueDelay: Double(queuedBytes) * 8 / rate)
     }
 
     /// Attempts admission without waiting for network credit or acknowledgement.
@@ -242,6 +257,7 @@ public final class MessageTransport {
                                 ackDue = nil
                                 ackCount = 0
                                 credit -= 13
+                                windowBytes += 13
                             } else {
                                 blocked = true
                             }
@@ -294,6 +310,8 @@ public final class MessageTransport {
         var sample: TimeInterval?
         for offset in 0..<64 where bits & (UInt64(1) << offset) != 0 {
             let number = largest - UInt32(offset)
+            suspectedLosses.remove(number)
+            agingLosses.remove(number)
             if (highConfirmed.count < 3 || number > highConfirmed[2])
                 && !highConfirmed.contains(number)
             {
@@ -339,7 +357,7 @@ public final class MessageTransport {
     }
 
     private func lose(_ number: UInt32, _ attempt: Attempt, _ now: TimeInterval, timeout: Bool) {
-        losses += 1
+        suspectedLosses.insert(number)
         attempts[number]?.expires = nil
         let key = attempt.key
         guard let msg = message(key) else {
@@ -391,24 +409,56 @@ public final class MessageTransport {
             progressAt = nil
             probeAt = nil
         }
-        if let start = progressAt, probeAt == nil, now >= start + 2 * rto {
+        if let start = progressAt, probeAt == nil, now >= start + probeDelay {
             probeAt = now
             probeInterval = rto
-            rate = max(64_000, rate * 0.8)
+            probeReducedRate = false
+        }
+        if probeAt != nil && !probeReducedRate && queuedBytes >= 2 * datagramLimit {
+            probeReducedRate = true
+            reduceRate()
         }
         if now >= sampleAt + 0.25 {
             let queued = statistics.estimatedQueueDelay > 0
             let inflated = rtt.map { $0 > (baselineRTT ?? $0) * 1.25 + 0.005 } ?? false
-            if losses >= 2 || (queued && inflated) {
-                rate = max(64_000, rate * 0.8)
-            } else if queued && confirmations > 0 && losses == 0 && probeAt == nil {
-                rate = min(100_000_000, rate * pow(1.05, 0.25))
+            // Timing variation on sparse traffic does not measure link capacity.
+            let utilized = Double(windowBytes) * 8 >= rate * (now - sampleAt) * 0.5
+            let losses = agingLosses.count
+            let congested = (agingWindowUtilized && losses >= 2) || (utilized && queued && inflated)
+            let healthy =
+                now - sampleAt <= 1.5 && confirmations > 0 && losses == 0
+                && !inflated && probeAt == nil
+            if congested && congestedLastWindow {
+                reduceRate()
+            } else if healthy {
+                // An adaptive encoder can empty the queue at its reduced target. Use fresh
+                // ACKs to try a higher pacing rate, bounded by the budget before backoff.
+                healthyFeedbackTime += min(now - sampleAt, 0.5)
+                if recoveryCeiling > rate && healthyFeedbackTime >= 1 {
+                    rate = min(recoveryCeiling, rate * 1.15)
+                    healthyFeedbackTime = 0
+                } else if queued {
+                    rate = min(100_000_000, rate * pow(1.05, 0.25))
+                }
+                if rate >= recoveryCeiling { recoveryCeiling = 0 }
+            } else if congested || probeAt != nil || now - sampleAt > 1.5 {
+                healthyFeedbackTime = 0
             }
+            congestedLastWindow = congested
             baselineRTT = rtt
             confirmations = 0
-            losses = 0
+            windowBytes = 0
+            agingLosses = suspectedLosses
+            suspectedLosses.removeAll(keepingCapacity: true)
+            agingWindowUtilized = utilized
             sampleAt = now
         }
+    }
+
+    private func reduceRate() {
+        recoveryCeiling = max(recoveryCeiling, rate)
+        healthyFeedbackTime = 0
+        rate = max(64_000, rate * 0.8)
     }
 
     private func candidate(_ now: TimeInterval) -> Wire.Fragment? {
@@ -460,6 +510,7 @@ public final class MessageTransport {
             probeInterval = min(0.5, 2 * probeInterval)
         }
         credit -= Double(bytes.count)
+        windowBytes += bytes.count
     }
 
     private func nextDeadline(_ now: TimeInterval) -> TimeInterval {
@@ -474,7 +525,7 @@ public final class MessageTransport {
         if let probeAt {
             if !blocked && probeAt > now { wake = min(wake, probeAt) }
         } else if let start = progressAt {
-            wake = min(wake, start + 2 * rto)
+            wake = min(wake, start + probeDelay)
         }
         return wake
     }

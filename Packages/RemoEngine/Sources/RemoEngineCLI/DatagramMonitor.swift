@@ -59,6 +59,7 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
         switch (buffer[0], buffer[9]) {
         case (0, Message.heartbeat.rawValue): name = "heartbeat"
         case (2, Message.hello.rawValue): name = "hello"
+        case (2, Message.screenHello.rawValue): name = "screen hello"
         default: return nil
         }
         let packet = UInt32(bigEndian: buffer.loadUnaligned(fromByteOffset: 1, as: UInt32.self))

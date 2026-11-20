@@ -6,13 +6,14 @@ let package = Package(
     platforms: [.macOS(.v12), .iOS(.v15)],
     products: [
         .library(name: "RemoEngine", targets: ["RemoEngine"]),
-        .executable(name: "remo-transport", targets: ["RemoTransportCLI"]),
+        .executable(name: "remo-engine", targets: ["RemoEngineCLI"]),
     ],
     dependencies: [.package(path: "../RemoCodec"), .package(path: "../RemoTransport")],
     targets: [
         .target(name: "RemoEngine", dependencies: ["RemoCodec", "RemoTransport"]),
         .executableTarget(
-            name: "RemoTransportCLI", dependencies: ["RemoEngine", "RemoTransport", "RemoCodec"]),
-        .testTarget(name: "RemoEngineTests", dependencies: ["RemoEngine", "RemoCodec"]),
+            name: "RemoEngineCLI", dependencies: ["RemoEngine", "RemoTransport", "RemoCodec"]),
+        .testTarget(
+            name: "RemoEngineTests", dependencies: ["RemoEngine", "RemoCodec", "RemoTransport"]),
     ]
 )

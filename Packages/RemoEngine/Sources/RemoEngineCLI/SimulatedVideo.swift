@@ -3,7 +3,6 @@ import Foundation
 
 /// NV12 checkerboard with a moving vertical bar. The receiver can verify it from its PTS.
 enum SimulatedVideo {
-    static let width = 640, height = 360
     private static let patchWidth = 160, patchHeight = 96
     // Changing texture produces multi-datagram access units even when the bar moves smoothly.
     private static let patches: [[UInt8]] = (1...8).map { seed in
@@ -14,9 +13,11 @@ enum SimulatedVideo {
         }
     }
 
-    static func bar(_ index: UInt64) -> Int { Int(index % 34) * 16 }
+    static func bar(_ index: UInt64, width: Int) -> Int {
+        Int(index % UInt64(max(1, (width - 96) / 16))) * 16
+    }
 
-    static func pixels(_ index: UInt64) throws -> CVPixelBuffer {
+    static func pixels(_ index: UInt64, width: Int, height: Int) throws -> CVPixelBuffer {
         var result: CVPixelBuffer?
         let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary
         guard
@@ -26,21 +27,22 @@ enum SimulatedVideo {
             CVPixelBufferLockBaseAddress(result, []) == kCVReturnSuccess
         else { throw CocoaError(.coderInvalidValue) }
         defer { CVPixelBufferUnlockBaseAddress(result, []) }
-        let left = bar(index)
+        let left = bar(index, width: width)
         let base = CVPixelBufferGetBaseAddressOfPlane(result, 0)!
         for y in 0..<height {
             let row = base.advanced(by: y * CVPixelBufferGetBytesPerRowOfPlane(result, 0))
             for x in stride(from: 0, to: width, by: 32) {
-                memset(row.advanced(by: x), ((x / 32 + y / 32) % 2 == 0) ? 48 : 72, 32)
+                memset(
+                    row.advanced(by: x), ((x / 32 + y / 32) % 2 == 0) ? 48 : 72, min(32, width - x))
             }
-            memset(row.advanced(by: left), 200, 96)
+            memset(row.advanced(by: left), 200, min(96, width))
         }
         let stride = CVPixelBufferGetBytesPerRowOfPlane(result, 0)
         patches[Int(index % UInt64(patches.count))].withUnsafeBytes { patch in
-            for y in 0..<patchHeight {
+            for y in 0..<min(height, patchHeight) {
                 memcpy(
                     base.advanced(by: y * stride), patch.baseAddress!.advanced(by: y * patchWidth),
-                    patchWidth)
+                    min(width, patchWidth))
             }
         }
         memset(
@@ -50,13 +52,15 @@ enum SimulatedVideo {
     }
 
     static func matches(_ pixels: CVPixelBuffer, index: UInt64) -> Bool {
-        guard CVPixelBufferGetWidth(pixels) == width, CVPixelBufferGetHeight(pixels) == height,
+        let width = CVPixelBufferGetWidth(pixels)
+        let height = CVPixelBufferGetHeight(pixels)
+        guard
             CVPixelBufferGetPixelFormatType(pixels)
                 == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             CVPixelBufferLockBaseAddress(pixels, .readOnly) == kCVReturnSuccess
         else { return false }
         defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
-        let left = bar(index)
+        let left = bar(index, width: width)
         let base = CVPixelBufferGetBaseAddressOfPlane(pixels, 0)!.assumingMemoryBound(
             to: UInt8.self)
         let patch = patches[Int(index % UInt64(patches.count))]
@@ -77,6 +81,6 @@ enum SimulatedVideo {
                 }
             }
         }
-        return patchError < 24 * patchSamples
+        return patchSamples == 0 || patchError < 24 * patchSamples
     }
 }

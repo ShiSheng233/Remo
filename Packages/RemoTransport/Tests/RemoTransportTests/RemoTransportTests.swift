@@ -433,3 +433,94 @@ private func packet(
         }
     }
 }
+
+@Test func sparseAcknowledgementsDoNotRatchetDownTheSendingBudget() {
+    let endpoint = Port(Clock())
+    endpoint.endpoint.send(Data([1]), mode: .reliable)
+    endpoint.advance(to: 0.005)
+    endpoint.endpoint.handleEvent(.datagram(Wire.ack(1, 1)))
+    for i in 1...12 {
+        endpoint.advance(to: Double(i))
+        endpoint.endpoint.send(Data([1]), mode: .reliable)
+        let packet = UInt32(endpoint.packets.count)
+        endpoint.advance(to: Double(i) + 0.105)
+        endpoint.endpoint.handleEvent(.datagram(Wire.ack(packet, 1)))
+    }
+    #expect(endpoint.endpoint.statistics.bitsPerSecond == 4_000_000)
+}
+
+@Test(arguments: [false, true])
+func acknowledgedLowRateStreamRegainsBudgetAfterBackoff(lateACKs: Bool) throws {
+    let port = Port(Clock())
+    func acknowledgeLatest() throws {
+        let bytes = try #require(port.packets.last)
+        let number = bytes.withUnsafeBytes {
+            UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self))
+        }
+        let bitmap = UInt64.max >> (64 - min(64, Int(number)))
+        port.endpoint.handleEvent(.datagram(Wire.ack(number, bitmap)))
+    }
+    let original = port.endpoint.statistics.bitsPerSecond
+    let full = Data(count: 1191)
+    for _ in 0..<16 {
+        port.endpoint.send(full, mode: .reliable)
+        for _ in 0..<6 { port.endpoint.send(full, mode: .unreliable(retryBudget: 0.4)) }
+        port.advance(to: port.clock.now + 0.25)
+        for _ in 0..<3 { port.endpoint.send(full, mode: .unreliable(retryBudget: 0)) }
+        for _ in 0..<30 {
+            try acknowledgeLatest()
+            port.advance(to: port.clock.now + 0.01)
+        }
+    }
+    for _ in 0..<1000 {
+        if port.deadline == nil { break }
+        try acknowledgeLatest()
+        port.advance(to: port.clock.now + 0.01)
+    }
+    try #require(port.deadline == nil && !port.endpoint.isClosed)
+    let reduced = port.endpoint.statistics.bitsPerSecond
+    try #require(reduced < 300_000)
+    port.advance(to: port.clock.now + 20)
+    #expect(port.endpoint.statistics.bitsPerSecond == reduced)
+    if lateACKs {
+        // Original DATA arrives, but one ACK in each burst arrives after the RTO.
+        for i in 0..<2400 {
+            port.endpoint.send(Data([1]), mode: .unreliable(retryBudget: 0))
+            port.advance(to: port.clock.now + (i.isMultiple(of: 8) ? 0.095 : 0.005))
+            try acknowledgeLatest()
+            port.advance(to: port.clock.now + 0.025)
+        }
+    } else {
+        // A mostly static desktop has one small frame per half second and no pacing backlog.
+        for _ in 0..<240 {
+            port.endpoint.send(Data([1]), mode: .reliable)
+            port.advance(to: port.clock.now + 0.01)
+            try acknowledgeLatest()
+            port.advance(to: port.clock.now + 0.49)
+        }
+    }
+    #expect(port.endpoint.statistics.estimatedQueueDelay == 0)
+    #expect(port.endpoint.statistics.bitsPerSecond == original)
+}
+
+@Test func persistentPacketLossCutsRateWhileOtherPacketsAreAcknowledged() {
+    let port = Port(Clock())
+    let original = port.endpoint.statistics.bitsPerSecond
+    let full = Data(count: 1191)
+    var inspected = 0
+    for _ in 0..<500 {
+        port.endpoint.send(full, mode: .unreliable(retryBudget: 0))
+        port.advance(to: port.clock.now + 0.0025)
+        for bytes in port.packets.dropFirst(inspected) {
+            let packet = bytes.withUnsafeBytes {
+                UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self))
+            }
+            if !packet.isMultiple(of: 4) {
+                port.endpoint.handleEvent(.datagram(Wire.ack(packet, 1)))
+            }
+        }
+        inspected = port.packets.count
+    }
+    #expect(port.endpoint.statistics.bitsPerSecond < original)
+    #expect(!port.endpoint.isClosed)
+}

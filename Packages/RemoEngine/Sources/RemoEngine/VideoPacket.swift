@@ -29,7 +29,7 @@ extension Data {
 
 enum VideoMessage: UInt8 {
     case frame = 0x40
-    case acknowledgement, refresh
+    case acknowledgement, refresh, keyFrameRequest, keyFrameChunk, keyFrameProgress
 }
 
 /// Big-endian v1 frame header: flags, frame ID, most recent IDR ID, PTS and duration
