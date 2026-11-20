@@ -43,7 +43,7 @@ nonisolated struct WireGuardConfiguration: Sendable {
     }
 }
 
-enum WireGuardKeychain {
+nonisolated enum WireGuardKeychain {
     private static var query: [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
@@ -51,18 +51,15 @@ enum WireGuardKeychain {
         ]
     }
 
-    static func load() -> (privateKey: String, presharedKey: String)? {
+    static func load() -> Data? {
         var item: CFTypeRef?
         var request = query
         request[kSecReturnData as String] = true
-        guard SecItemCopyMatching(request as CFDictionary, &item) == errSecSuccess,
-            let data = item as? Data, data.count == 32 || data.count == 64
-        else { return nil }
-        return (Data(data.prefix(32)).base64EncodedString(), Data(data.dropFirst(32)).base64EncodedString())
+        guard SecItemCopyMatching(request as CFDictionary, &item) == errSecSuccess else { return nil }
+        return item as? Data
     }
 
-    static func save(_ configuration: WireGuardConfiguration) -> Bool {
-        let data = Data(configuration.privateKey + configuration.presharedKey)
+    static func save(_ data: Data) -> Bool {
         let attributes = [kSecValueData as String: data]
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status != errSecItemNotFound { return status == errSecSuccess }

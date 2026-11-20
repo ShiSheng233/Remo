@@ -3,23 +3,14 @@
 //  Copyright (c) 2026 Cyandev. All rights reserved.
 // 
 
-import Network
 import SwiftUI
 
 struct ContentView: View {
-    @AppStorage("serverHost") private var host = ""
-    @AppStorage("serverPort") private var port = "7711"
-    @AppStorage("useWireGuard") private var useWireGuard = false
-    @AppStorage("wireGuardServerHost") private var wireGuardHost = ""
-    @AppStorage("wireGuardServerPort") private var wireGuardPort = "7711"
-    @AppStorage("wireGuardEndpoint") private var wireGuardEndpoint = ""
-    @AppStorage("wireGuardLocalAddress") private var wireGuardLocalAddress = ""
-    @AppStorage("wireGuardPeerPublicKey") private var peerPublicKey = ""
     @Environment(\.scenePhase) private var scenePhase
     @State private var player = StreamPlayer()
-    @State private var privateKey = ""
-    @State private var presharedKey = ""
-    @State private var keychainError = false
+    @State private var settings = ServerConnectionSettings()
+    @State private var settingsLoaded = false
+    @State private var persistenceError = false
 
     var body: some View {
         NavigationStack {
@@ -32,11 +23,10 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { player.disconnect() }
         }
-        .task {
-            if let keys = WireGuardKeychain.load() {
-                privateKey = keys.privateKey
-                presharedKey = keys.presharedKey
-            }
+        .onAppear {
+            guard !settingsLoaded else { return }
+            settings = ServerConnectionSettings.load()
+            settingsLoaded = true
         }
         .onDisappear { player.disconnect() }
     }
@@ -45,8 +35,8 @@ struct ContentView: View {
         Form {
             Section("Server") {
                 TextField(
-                    useWireGuard ? "Server tunnel IPv4 address" : "Hostname or IP address",
-                    text: useWireGuard ? $wireGuardHost : $host)
+                    settings.useWireGuard ? "Server tunnel IPv4 address" : "Hostname or IP address",
+                    text: settings.useWireGuard ? $settings.wireGuard.server.host : $settings.direct.host)
                     .textContentType(.URL)
                     .keyboardType(.URL)
                     .textInputAutocapitalization(.never)
@@ -55,38 +45,41 @@ struct ContentView: View {
                     .onSubmit(connect)
 
                 LabeledContent("UDP port") {
-                    TextField("UDP port", text: useWireGuard ? $wireGuardPort : $port, prompt: Text("7711"))
+                    TextField(
+                        "UDP port",
+                        text: settings.useWireGuard ? $settings.wireGuard.server.port : $settings.direct.port,
+                        prompt: Text("7711"))
                         .keyboardType(.numberPad)
                         .multilineTextAlignment(.trailing)
                 }
             }
 
             Section("Connection") {
-                Toggle("WireGuard", isOn: $useWireGuard)
+                Toggle("WireGuard", isOn: $settings.useWireGuard)
             }
 
-            if useWireGuard {
+            if settings.useWireGuard {
                 Section("WireGuard peer") {
-                    TextField("Endpoint (host:port)", text: $wireGuardEndpoint)
+                    TextField("Endpoint (host:port)", text: $settings.wireGuard.endpoint)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    TextField("Client tunnel IPv4 address", text: $wireGuardLocalAddress)
+                    TextField("Client tunnel IPv4 address", text: $settings.wireGuard.localAddress)
                         .keyboardType(.decimalPad)
-                    TextField("Peer public key", text: $peerPublicKey)
+                    TextField("Peer public key", text: $settings.wireGuard.peerPublicKey)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    SecureField("Client private key", text: $privateKey)
+                    SecureField("Client private key", text: $settings.wireGuard.privateKey)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    SecureField("Preshared key (optional)", text: $presharedKey)
+                    SecureField("Preshared key (optional)", text: $settings.wireGuard.presharedKey)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 }
             }
 
-            if keychainError, useWireGuard {
-                Text("Couldn’t save the WireGuard keys to Keychain.")
+            if persistenceError {
+                Text("Couldn’t save the connection settings.")
                     .foregroundStyle(.red)
             } else if case .failed(let message) = player.phase {
                 Text(message)
@@ -94,7 +87,7 @@ struct ContentView: View {
             }
 
             Button("Connect", action: connect)
-                .disabled(useWireGuard ? wireGuardConfiguration == nil : endpoint == nil)
+                .disabled(settings.useWireGuard ? settings.wireGuard.configuration == nil : settings.direct.endpoint == nil)
         }
         .navigationTitle("Remo")
     }
@@ -117,7 +110,7 @@ struct ContentView: View {
             }
         }
         .ignoresSafeArea(.container, edges: .bottom)
-        .navigationTitle(useWireGuard ? wireGuardHost : host)
+        .navigationTitle(settings.server.host)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -126,52 +119,13 @@ struct ContentView: View {
         }
     }
 
-    private var endpoint: NWEndpoint? {
-        Self.endpoint(
-            host: useWireGuard ? wireGuardHost : host,
-            port: useWireGuard ? wireGuardPort : port, defaultPort: "7711")
-    }
-
-    private var wireGuardConfiguration: WireGuardConfiguration? {
-        guard let endpoint, let separator = wireGuardEndpoint.lastIndex(of: ":") else { return nil }
-        let peerHost = wireGuardEndpoint[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !peerHost.contains(":") || (peerHost.hasPrefix("[") && peerHost.hasSuffix("]")) else {
-            return nil
-        }
-        let peerPort = String(wireGuardEndpoint[wireGuardEndpoint.index(after: separator)...])
-        guard let peer = Self.endpoint(host: peerHost, port: peerPort, defaultPort: "") else { return nil }
-        return WireGuardConfiguration(
-            endpoint: peer, localAddress: wireGuardLocalAddress, remote: endpoint,
-            privateKey: privateKey, peerPublicKey: peerPublicKey, presharedKey: presharedKey)
-    }
-
-    private static func endpoint(host: String, port: String, defaultPort: String) -> NWEndpoint? {
-        var address = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        if address.hasPrefix("["), address.hasSuffix("]") {
-            address = String(address.dropFirst().dropLast())
-        }
-        let portText = port.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !address.isEmpty,
-            address.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
-            address.rangeOfCharacter(from: CharacterSet(charactersIn: "/?#@[]")) == nil,
-            let number = UInt16(portText.isEmpty ? defaultPort : portText),
-            number > 0, let port = NWEndpoint.Port(rawValue: number)
-        else { return nil }
-        return .hostPort(host: NWEndpoint.Host(address), port: port)
-    }
-
     private func connect() {
-        guard let endpoint else { return }
-        keychainError = false
-        if useWireGuard {
-            guard let wireGuardConfiguration else { return }
-            guard WireGuardKeychain.save(wireGuardConfiguration) else {
-                keychainError = true
-                return
-            }
-            player.connect(to: endpoint, wireGuard: wireGuardConfiguration)
-        } else {
-            player.connect(to: endpoint)
+        guard let endpoint = settings.server.endpoint else { return }
+        let wireGuard = settings.useWireGuard ? settings.wireGuard.configuration : nil
+        guard !settings.useWireGuard || wireGuard != nil else { return }
+        persistenceError = !settings.saveConnection()
+        if !persistenceError {
+            player.connect(to: endpoint, wireGuard: wireGuard)
         }
     }
 }
