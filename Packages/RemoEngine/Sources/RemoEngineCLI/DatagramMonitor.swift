@@ -1,6 +1,7 @@
 import Dispatch
 import Foundation
 import Network
+import RemoEngine
 
 struct HeartbeatTrace {
     static let enabled = CommandLine.arguments.contains("--trace-heartbeats")
@@ -57,9 +58,9 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
         guard HeartbeatTrace.enabled, size == 10, buffer.count >= 10 else { return nil }
         let name: String
         switch (buffer[0], buffer[9]) {
-        case (0, Message.heartbeat.rawValue): name = "heartbeat"
-        case (2, Message.hello.rawValue): name = "hello"
-        case (2, Message.screenHello.rawValue): name = "screen hello"
+        case (0, SessionMessage.heartbeat.rawValue): name = "heartbeat"
+        case (2, SessionMessage.hello.rawValue): name = "hello"
+        case (2, SessionMessage.screenHello.rawValue): name = "screen hello"
         default: return nil
         }
         let packet = UInt32(bigEndian: buffer.loadUnaligned(fromByteOffset: 1, as: UInt32.self))

@@ -7,12 +7,7 @@ import RemoCodec
 import RemoEngine
 import RemoTransport
 
-enum Message: UInt8 {
-    case hello = 1
-    case heartbeat, goodbye
-    case control = 5
-    case screenHello, modeMismatch
-
+private extension SessionMessage {
     func packet(sequence: UInt64, size: Int) -> Data {
         var bytes = Data(repeating: rawValue, count: size)
         withUnsafeBytes(of: sequence.bigEndian) { bytes.replaceSubrange(1..<9, with: $0) }
@@ -115,8 +110,8 @@ final class DemoSession {
             do {
                 if role == .client || !screen { try prepareVideo() }
                 if role == .client {
-                    try session.send(
-                        Data([(screen ? Message.screenHello : .hello).rawValue]), mode: .reliable)
+                    let hello: SessionMessage = screen ? .screenHello : .hello
+                    try session.send(Data([hello.rawValue]), mode: .reliable)
                     trace.write(peer, "hello queued")
                     try await runClient(session)
                 } else {
@@ -208,7 +203,7 @@ final class DemoSession {
 
     func requestExit() {
         guard !stopping else { return }
-        try? session?.send(Data([Message.goodbye.rawValue]), mode: .reliable)
+        try? session?.send(Data([SessionMessage.goodbye.rawValue]), mode: .reliable)
         stop("leaving", failed: false)
     }
 
@@ -227,7 +222,7 @@ final class DemoSession {
 
     private func receive(_ channel: MessageTransport.Channel, _ bytes: Data) {
         guard !stopping, video?.receive(channel, bytes) != true, let first = bytes.first,
-            let kind = Message(rawValue: first)
+            let kind = SessionMessage(rawValue: first)
         else {
             return
         }
@@ -235,7 +230,7 @@ final class DemoSession {
         case (.server, .reliable, .hello), (.server, .reliable, .screenHello):
             guard bytes.count == 1 else { return }
             guard !screen || kind == .screenHello else {
-                try? session?.send(Data([Message.modeMismatch.rawValue]), mode: .reliable)
+                try? session?.send(Data([SessionMessage.modeMismatch.rawValue]), mode: .reliable)
                 stop("screen sharing requires client --screen", failed: true)
                 return
             }
@@ -281,7 +276,7 @@ final class DemoSession {
             if active {
                 if now >= nextControl {
                     try session.send(
-                        Message.control.packet(sequence: controls + 1, size: 9), mode: .reliable)
+                        SessionMessage.control.packet(sequence: controls + 1, size: 9), mode: .reliable)
                     controls += 1
                     nextControl = now + 1_000_000_000
                 }
@@ -434,7 +429,8 @@ final class DemoSession {
             if screen && controls > 0 && now - lastVideoTime >= 2_000_000_000 {
                 try video?.requestRefresh()
             }
-            try session.send(Data([Message.heartbeat.rawValue]), mode: .unreliable(retryBudget: 0))
+            try session.send(
+                Data([SessionMessage.heartbeat.rawValue]), mode: .unreliable(retryBudget: 0))
             heartbeats += 1
             trace.write(peer, "heartbeat queued count=\(heartbeats)")
             report(session, now: now)

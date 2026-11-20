@@ -25,7 +25,7 @@ enum Command {
           remo-engine client <host> [port] [--screen] [--wire-stats] [--trace-heartbeats]
 
         Default UDP port: 7711
-        --resolution sets the simulated frame size or fits the screen inside WIDTHxHEIGHT.
+        --resolution sets the simulated frame size or caps the screen capture at WIDTHxHEIGHT pixels.
         Dimensions must be even (2...8192). Defaults: 640x360 simulated, screen longest edge 1920.
         --fps sets the server frame rate (1...240, default 30). Screen capture may run slower.
         --max-video-bitrate sets the video bitrate ceiling in bits per second (default 2000000).

@@ -18,7 +18,7 @@ public protocol ScreenFrameSource: AnyObject {
     @available(macOS 12.3, *)
     public struct ScreenCaptureConfiguration {
         public enum Failure: Error { case noMainDisplay, invalidConfiguration }
-        private let display: SCDisplay
+        private let filter: SCContentFilter
         public let width: Int
         public let height: Int
         public let framesPerSecond: Int32
@@ -46,17 +46,36 @@ public protocol ScreenFrameSource: AnyObject {
                 let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }),
                 display.width > 0, display.height > 0
             else { throw Failure.noMainDisplay }
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let pixelSize: CGSize
+            if #available(macOS 14.0, *) {
+                let rect = filter.contentRect
+                let backingScale = CGFloat(filter.pointPixelScale)
+                pixelSize = CGSize(width: rect.width * backingScale, height: rect.height * backingScale)
+            } else {
+                let mode = CGDisplayCopyDisplayMode(display.displayID)
+                let backingScale: CGFloat
+                if let mode, mode.width > 0, mode.pixelWidth > 0 {
+                    backingScale = CGFloat(mode.pixelWidth) / CGFloat(mode.width)
+                } else {
+                    backingScale = 1
+                }
+                pixelSize = CGSize(
+                    width: CGFloat(display.width) * backingScale,
+                    height: CGFloat(display.height) * backingScale)
+            }
+            guard pixelSize.width.isFinite, pixelSize.height.isFinite,
+                pixelSize.width >= 2, pixelSize.height >= 2
+            else { throw Failure.invalidConfiguration }
             let scale = min(
-                1, Double(maximumWidth) / Double(display.width),
-                Double(maximumHeight) / Double(display.height))
-            func even(_ length: Int) -> Int { max(2, Int(Double(length) * scale) / 2 * 2) }
+                1, CGFloat(maximumWidth) / pixelSize.width, CGFloat(maximumHeight) / pixelSize.height)
+            func even(_ length: CGFloat) -> Int { max(2, Int(length * scale) / 2 * 2) }
             return Self(
-                display: display, width: even(display.width), height: even(display.height),
+                filter: filter, width: even(pixelSize.width), height: even(pixelSize.height),
                 framesPerSecond: framesPerSecond)
         }
 
         public nonisolated(nonsending) func start() async throws -> any ScreenFrameSource {
-            let filter = SCContentFilter(display: display, excludingWindows: [])
             let config = SCStreamConfiguration()
             config.width = width
             config.height = height
