@@ -3,10 +3,17 @@ import Foundation
 /// One direction pair in an already isolated, authenticated datagram session.
 /// Serialize all calls on the same executor. Times are monotonic seconds on the supplied clock.
 public final class MessageTransport {
+    public enum UnreliablePriority: Int {
+        case normal, high
+    }
+
     public enum Mode {
         case reliable
         /// The budget starts at admission. The optional absolute deadline limits first transmissions.
-        case unreliable(retryBudget: TimeInterval, firstSendDeadline: TimeInterval? = nil)
+        /// Priority is local to the sender and applies at each datagram scheduling decision.
+        case unreliable(
+            retryBudget: TimeInterval, firstSendDeadline: TimeInterval? = nil,
+            priority: UnreliablePriority = .normal)
     }
 
     public enum Channel { case reliable, unreliable }
@@ -29,6 +36,8 @@ public final class MessageTransport {
         public let bitsPerSecond: Double
         public let roundTripTime: TimeInterval?
         public let estimatedQueueDelay: TimeInterval
+        /// Admitted messages whose deadline elapsed before any datagram was accepted by I/O.
+        public let expiredBeforeFirstSend: [UnreliablePriority: UInt64]
     }
 
     private final class Message {
@@ -36,13 +45,18 @@ public final class MessageTransport {
         let count: Int
         let capacity: Int
         let deadline: TimeInterval
+        let priority: UnreliablePriority
         var firstDeadline: TimeInterval?
         var cursor = 0
         var retries: Set<Int> = []
         var remaining: Int
         var timeouts = 0
 
-        init(_ data: Data, mtu: Int, deadline: TimeInterval, firstDeadline: TimeInterval?) {
+        init(
+            _ data: Data, mtu: Int, deadline: TimeInterval, firstDeadline: TimeInterval?,
+            priority: UnreliablePriority = .normal
+        ) {
+            self.priority = priority
             self.data = data
             capacity = data.count <= mtu - 9 ? mtu - 9 : mtu - 13
             count = (data.count + capacity - 1) / capacity
@@ -61,7 +75,6 @@ public final class MessageTransport {
 
     private struct Attempt {
         let key: Wire.Fragment
-        let sent: TimeInterval
         var expires: TimeInterval?
         let retry: Bool
     }
@@ -77,6 +90,7 @@ public final class MessageTransport {
     private var u: [UInt32: Message] = [:]
     private var lastR: UInt32 = 0
     private var lastU: UInt32 = 0
+    private var expiredBeforeFirstSend: [UnreliablePriority: UInt64] = [:]
     private var lastPacket: UInt32 = 0
     private var attempts: [UInt32: Attempt] = [:]
     private var highConfirmed: [UInt32] = []
@@ -104,6 +118,19 @@ public final class MessageTransport {
     private var probeInterval = 0.1
     private var sampleAt: TimeInterval
     private var congestedLastWindow = false
+    // Delivery can be confirmed after a fragment expires or another attempt completes it.
+    // Retain only wire metadata, independently of retransmission and payload lifetimes.
+    private struct DeliveryRecord {
+        let number: UInt32
+        let sent: TimeInterval
+        let bytes: Int
+    }
+    private var deliveryRecords = Array<DeliveryRecord?>(repeating: nil, count: 8192)
+    private var deliverySampleAt: TimeInterval
+    private var acknowledgedBytes = 0
+    private var deliveryRate = 0.0
+    // Leave room to probe when the adaptive encoder targets only part of the pacing budget.
+    private var probeCeiling: Double { deliveryRate * 1.4 }
     private var windowBytes = 0
     private var probeReducedRate = false
     // Recovery acts on a timeout immediately. Rate control waits one full observation
@@ -130,6 +157,7 @@ public final class MessageTransport {
         credit = Double(2 * self.datagramLimit)
         creditAt = clock()
         sampleAt = creditAt
+        deliverySampleAt = creditAt
     }
 
     private var queuedBytes: Int {
@@ -139,7 +167,7 @@ public final class MessageTransport {
     public var statistics: Statistics {
         return Statistics(
             bitsPerSecond: rate, roundTripTime: rtt,
-            estimatedQueueDelay: Double(queuedBytes) * 8 / rate)
+            estimatedQueueDelay: Double(queuedBytes) * 8 / rate, expiredBeforeFirstSend: expiredBeforeFirstSend)
     }
 
     /// Attempts admission without waiting for network credit or acknowledgement.
@@ -160,7 +188,7 @@ public final class MessageTransport {
             }
             lastR += 1
             r[lastR] = Message(data, mtu: datagramLimit, deadline: now + 2, firstDeadline: nil)
-        case .unreliable(let budget, let deadline):
+        case .unreliable(let budget, let deadline, let priority):
             guard data.count <= Wire.maxMessage else { return .invalidLength }
             guard budget.isFinite, budget >= 0, deadline?.isFinite != false else {
                 return .invalidTime
@@ -176,7 +204,7 @@ public final class MessageTransport {
             }
             lastU += 1
             u[lastU] = Message(
-                data, mtu: datagramLimit, deadline: now + budget, firstDeadline: deadline)
+                data, mtu: datagramLimit, deadline: now + budget, firstDeadline: deadline, priority: priority)
         }
         drive()
         return .queued
@@ -317,9 +345,18 @@ public final class MessageTransport {
             {
                 highConfirmed = Array((highConfirmed + [number]).sorted(by: >).prefix(3))
             }
+            let slot = Int(number) % deliveryRecords.count
+            if let record = deliveryRecords[slot], record.number == number {
+                deliveryRecords[slot] = nil
+                let elapsed = max(0, now - record.sent)
+                if elapsed <= 2 {
+                    acknowledgedBytes += record.bytes
+                    confirmations += 1
+                    if sample == nil { sample = elapsed }
+                }
+            }
             guard let attempt = attempts[number] else { continue }
             confirmed.insert(attempt.key)
-            if sample == nil { sample = max(0, now - attempt.sent) }
         }
         if let sample {
             if let old = rtt {
@@ -329,9 +366,10 @@ public final class MessageTransport {
                 variation = sample / 2
                 rtt = sample
             }
-            confirmations += confirmed.count
             progressAt = now
             probeAt = nil
+        }
+        if !confirmed.isEmpty {
             for key in confirmed {
                 guard let msg = message(key) else { continue }
                 msg.retries.remove(key.index)
@@ -388,9 +426,10 @@ public final class MessageTransport {
         }
         receiver.expire(now)
         for (id, msg) in u {
-            if msg.firstDeadline.map({ $0 <= now }) == true
-                || (msg.cursor == msg.count && msg.deadline <= now)
-            {
+            if let firstDeadline = msg.firstDeadline, firstDeadline <= now {
+                if msg.cursor == 0 { expiredBeforeFirstSend[msg.priority, default: 0] += 1 }
+                u.removeValue(forKey: id)
+            } else if msg.cursor == msg.count && msg.deadline <= now {
                 u.removeValue(forKey: id)
             } else if now >= msg.deadline {
                 for index in msg.retries {
@@ -418,6 +457,20 @@ public final class MessageTransport {
             probeReducedRate = true
             reduceRate()
         }
+        // Use wall-clock delivery windows, including idle time between ACK bursts.
+        let deliveryInterval = now - deliverySampleAt
+        if deliveryInterval >= 1 {
+            let measured = Double(acknowledgedBytes) * 8 / deliveryInterval
+            if deliveryInterval > 2 {
+                deliveryRate = 0
+            } else if deliveryRate == 0 {
+                deliveryRate = measured
+            } else {
+                deliveryRate = (deliveryRate + measured) / 2
+            }
+            deliverySampleAt = now
+            acknowledgedBytes = 0
+        }
         if now >= sampleAt + 0.25 {
             let queued = statistics.estimatedQueueDelay > 0
             let inflated = rtt.map { $0 > (baselineRTT ?? $0) * 1.25 + 0.005 } ?? false
@@ -432,13 +485,13 @@ public final class MessageTransport {
                 reduceRate()
             } else if healthy {
                 // An adaptive encoder can empty the queue at its reduced target. Use fresh
-                // ACKs to try a higher pacing rate, bounded by the budget before backoff.
+                // ACKs to recover toward a previously demonstrated delivery rate.
                 healthyFeedbackTime += min(now - sampleAt, 0.5)
-                if recoveryCeiling > rate && healthyFeedbackTime >= 1 {
-                    rate = min(recoveryCeiling, rate * 1.15)
+                if min(recoveryCeiling, probeCeiling) > rate && healthyFeedbackTime >= 1 {
+                    rate = min(recoveryCeiling, probeCeiling, rate * 1.15)
                     healthyFeedbackTime = 0
-                } else if queued {
-                    rate = min(100_000_000, rate * pow(1.05, 0.25))
+                } else if (queued || utilized) && probeCeiling > rate {
+                    rate = min(100_000_000, probeCeiling, rate * pow(1.05, 0.25))
                 }
                 if rate >= recoveryCeiling { recoveryCeiling = 0 }
             } else if congested || probeAt != nil || now - sampleAt > 1.5 {
@@ -456,7 +509,7 @@ public final class MessageTransport {
     }
 
     private func reduceRate() {
-        recoveryCeiling = max(recoveryCeiling, rate)
+        recoveryCeiling = max(recoveryCeiling, min(rate, deliveryRate))
         healthyFeedbackTime = 0
         rate = max(64_000, rate * 0.8)
     }
@@ -471,8 +524,11 @@ public final class MessageTransport {
                 }
             }
         }
-        for id in u.keys.sorted() {
-            let msg = u[id]!
+        let ordered = u.sorted {
+            if $0.value.priority == $1.value.priority { return $0.key < $1.key }
+            return $0.value.priority.rawValue > $1.value.priority.rawValue
+        }
+        for (id, msg) in ordered {
             while let index = msg.retries.min() {
                 let key = Wire.Fragment(reliable: false, id: id, index: index)
                 if viable(msg, now) { return key }
@@ -503,7 +559,9 @@ public final class MessageTransport {
         }
         let sent = clock()
         let timeout = min(0.5, rto * Double(1 << msg.timeouts))
-        attempts[lastPacket] = Attempt(key: key, sent: sent, expires: sent + timeout, retry: retry)
+        deliveryRecords[Int(lastPacket) % deliveryRecords.count] = DeliveryRecord(
+            number: lastPacket, sent: sent, bytes: bytes.count)
+        attempts[lastPacket] = Attempt(key: key, expires: sent + timeout, retry: retry)
         if progressAt == nil { progressAt = sent }
         if probeAt != nil {
             probeAt = sent + probeInterval

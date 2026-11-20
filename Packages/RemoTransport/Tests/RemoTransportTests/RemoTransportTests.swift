@@ -323,7 +323,8 @@ private func packet(
     #expect(sentKinds.firstIndex(of: 2) == insertion)
     #expect(insertion > 0 && insertion < sentKinds.count - 1)
     #expect(b.messages == [control, frame])
-    #expect(a.endpoint.statistics.bitsPerSecond > 4_000_000)
+    // One short burst does not establish a sustained delivery rate.
+    #expect(a.endpoint.statistics.bitsPerSecond == 4_000_000)
     #expect(a.deadline == nil && b.deadline == nil && arrivals.isEmpty)
 }
 
@@ -450,7 +451,7 @@ private func packet(
 }
 
 @Test(arguments: [false, true])
-func acknowledgedLowRateStreamRegainsBudgetAfterBackoff(lateACKs: Bool) throws {
+func sparseACKsCannotRestoreAnUnverifiedBudgetAfterBackoff(lateACKs: Bool) throws {
     let port = Port(Clock())
     func acknowledgeLatest() throws {
         let bytes = try #require(port.packets.last)
@@ -460,7 +461,6 @@ func acknowledgedLowRateStreamRegainsBudgetAfterBackoff(lateACKs: Bool) throws {
         let bitmap = UInt64.max >> (64 - min(64, Int(number)))
         port.endpoint.handleEvent(.datagram(Wire.ack(number, bitmap)))
     }
-    let original = port.endpoint.statistics.bitsPerSecond
     let full = Data(count: 1191)
     for _ in 0..<16 {
         port.endpoint.send(full, mode: .reliable)
@@ -500,7 +500,7 @@ func acknowledgedLowRateStreamRegainsBudgetAfterBackoff(lateACKs: Bool) throws {
         }
     }
     #expect(port.endpoint.statistics.estimatedQueueDelay == 0)
-    #expect(port.endpoint.statistics.bitsPerSecond == original)
+    #expect(port.endpoint.statistics.bitsPerSecond == reduced)
 }
 
 @Test func persistentPacketLossCutsRateWhileOtherPacketsAreAcknowledged() {
@@ -523,4 +523,48 @@ func acknowledgedLowRateStreamRegainsBudgetAfterBackoff(lateACKs: Bool) throws {
     }
     #expect(port.endpoint.statistics.bitsPerSecond < original)
     #expect(!port.endpoint.isClosed)
+}
+
+@Test func highPriorityAudioPreemptsVideoAtFragmentBoundaries() {
+    let sender = Port(Clock())
+    let receiver = Port(sender.clock)
+    let video = Data(repeating: 7, count: 12_000)
+    let normal = Data([8])
+    let firstAudio = Data(repeating: 9, count: 120)
+    let secondAudio = Data(repeating: 10, count: 120)
+    let control = Data([11])
+
+    sender.endpoint.send(video, mode: .unreliable(retryBudget: 0))
+    #expect(sender.packets.count == 2)
+    sender.endpoint.send(normal, mode: .unreliable(retryBudget: 0))
+    for audio in [firstAudio, secondAudio] {
+        sender.endpoint.send(audio, mode: .unreliable(retryBudget: 0, priority: .high))
+    }
+    sender.endpoint.send(control, mode: .reliable)
+    #expect(sender.packets.count == 2)
+    sender.advance(to: 0.04)
+    sender.drain(to: receiver)
+    #expect(receiver.messages == [control, firstAudio, secondAudio, video, normal])
+}
+
+@Test func firstSendExpiryCountsOnlyAdmittedMessagesWithNoAcceptedDatagram() {
+    let sender = Port(Clock())
+    sender.writable = false
+    let high = MessageTransport.Mode.unreliable(retryBudget: 0, firstSendDeadline: 0.01, priority: .high)
+    let normal = MessageTransport.Mode.unreliable(retryBudget: 0, firstSendDeadline: 0.01)
+    for mode in [high, normal, high] {
+        #expect(sender.endpoint.send(Data([1]), mode: mode) == .queued)
+    }
+    sender.advance(to: 0.01)
+    #expect(sender.endpoint.send(Data([2]), mode: high) == .invalidTime)
+    sender.writable = true
+    sender.endpoint.handleEvent(.writable)
+    #expect(sender.packets.isEmpty)
+
+    sender.endpoint.send(Data([3]), mode: .unreliable(retryBudget: 0, firstSendDeadline: 0.02, priority: .high))
+    sender.endpoint.send(Data(count: 12_000), mode: .unreliable(retryBudget: 0, firstSendDeadline: 0.01001))
+    #expect(sender.packets.count == 2)
+    sender.advance(to: 0.04)
+    #expect(sender.packets.count == 2)
+    #expect(sender.endpoint.statistics.expiredBeforeFirstSend == [.high: 2, .normal: 1])
 }
