@@ -22,7 +22,7 @@ struct VideoSettings {
 enum Command {
     static let usage = """
         Usage:
-          remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--mouse-control] [--wire-stats] [--trace-heartbeats]
+          remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--audio] [--mouse-control] [--wire-stats] [--trace-heartbeats]
           remo-engine client <host> [port] [--screen] [--wire-stats] [--trace-heartbeats]
 
         Default UDP port: 7711
@@ -31,8 +31,10 @@ enum Command {
         --fps sets the server frame rate (1...240, default 30). Screen capture may run slower.
         --max-video-bitrate sets the video bitrate ceiling in bits per second (default 2000000).
         --screen streams the main display on the server and opens a video window on the client (macOS).
+        --audio includes system playback audio on a screen server (macOS 13 or later).
         --mouse-control enables remote mouse input on a macOS screen server (requires Accessibility access).
         --trace-heartbeats traces heartbeat submission, UDP framing, session delivery, and timeouts.
+        REMO_AUDIO_TRACE_DIR records diagnostic PCM (.f32le) and timing (.csv) in that directory.
         --wire-stats observes outgoing UDP payload bytes, DATA, ACK, and retransmissions.
         """
 
@@ -65,9 +67,10 @@ enum Command {
         var args = Array(CommandLine.arguments.dropFirst())
         let wireStats = args.contains("--wire-stats")
         let screen = args.contains("--screen")
+        let audio = args.contains("--audio")
         let mouseControl = args.contains("--mouse-control")
         args.removeAll {
-            $0 == "--screen" || $0 == "--mouse-control" || $0 == "--wire-stats" || $0 == "--trace-heartbeats"
+            $0 == "--screen" || $0 == "--audio" || $0 == "--mouse-control" || $0 == "--wire-stats" || $0 == "--trace-heartbeats"
         }
         if args == ["--help"] || args == ["-h"] {
             log(usage)
@@ -106,6 +109,10 @@ enum Command {
                 || (args.first == "client" && (2...3).contains(args.count))
         else { fail(usage) }
         let server = args[0] == "server"
+        if audio && (!server || !screen) { fail("--audio requires server --screen.") }
+        if audio {
+            guard #available(macOS 13.0, *) else { fail("--audio requires macOS 13 or later.") }
+        }
         if mouseControl && (!server || !screen) {
             fail("--mouse-control requires server --screen.")
         }
@@ -134,7 +141,7 @@ enum Command {
                             maximumWidth: settings.screenBounds.width,
                             maximumHeight: settings.screenBounds.height,
                             framesPerSecond: settings.fps)
-                        capture = { try await config.start() }
+                        capture = { try await config.start(capturesAudio: audio) }
                         log(
                             "Screen source: main display, \(config.width) × \(config.height) at up to \(settings.fps) fps"
                         )

@@ -30,6 +30,8 @@ final class StreamPlayer {
     @ObservationIgnored private var scrollRemainder: CGFloat = 0
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var transport: NetworkMessageSession?
+    @ObservationIgnored private var playback: ScreenAudioPlayback?
+    @ObservationIgnored private var audioDisabled = false
     @ObservationIgnored private var video: VideoSession?
     @ObservationIgnored private var failure: String?
     @ObservationIgnored private var lastSeen: TimeInterval = 0
@@ -56,6 +58,9 @@ final class StreamPlayer {
         }
         defer {
             setupTimeout.cancel()
+            playback?.stop()
+            playback = nil
+            audioDisabled = false
             video?.close()
             video = nil
             let session = transport
@@ -156,9 +161,20 @@ final class StreamPlayer {
 
     private func receive(_ channel: MessageTransport.Channel, _ data: Data) {
         guard task?.isCancelled == false, video?.receive(channel, data) != true,
-            channel == .reliable, let byte = data.first
+            let byte = data.first
         else { return }
 
+        if channel == .unreliable, byte == SessionMessage.audio.rawValue, !audioDisabled {
+            if playback == nil {
+                playback = ScreenAudioPlayback { [weak self] error in
+                    self?.audioDisabled = true
+                    NSLog("Audio playback failed: %@", error.localizedDescription)
+                }
+            }
+            playback?.receive(data)
+            return
+        }
+        guard channel == .reliable else { return }
         switch SessionMessage(rawValue: byte) {
         case .control where data.count == 9:
             receivedControl = true

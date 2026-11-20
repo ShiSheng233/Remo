@@ -24,6 +24,13 @@ final class DemoSession {
     private let startCapture: StartCapture?
     private let mouse: MouseControlServer?
     private let mousePeer = UUID()
+    private var audioSendTask: Task<Void, Never>?
+    private var playback: ScreenAudioPlayback?
+    private var audioDisabled = false
+    private var audioQueued = 0
+    private var audioBackpressure = 0
+    private var audioSourceGaps: UInt64 = 0
+    private var audioQueuePeakMs = 0.0
     private var source: (any ScreenFrameSource)?
     private var previousCapturePTS = CMTime.invalid
     private var lastCaptureSend: UInt64 = 0
@@ -124,6 +131,8 @@ final class DemoSession {
                 stop("send failed: \(error)", failed: true)
             }
         }
+        audioSendTask?.cancel()
+        playback?.stop()
         if let source {
             try? await source.stop()
             self.source = nil
@@ -262,6 +271,14 @@ final class DemoSession {
         case (.server, _, .mouseInput) where active:
             mouse?.receive(bytes, on: channel, from: mousePeer)
             return
+        case (.client, .unreliable, .audio) where screen && !audioDisabled:
+            if playback == nil {
+                playback = ScreenAudioPlayback { [weak self] error in
+                    self?.audioDisabled = true
+                    log("Audio playback failed: \(error)")
+                }
+            }
+            playback?.receive(bytes)
         case (.client, .reliable, .modeMismatch):
             stop("screen sharing requires client --screen", failed: true)
         case (.client, .reliable, .control) where bytes.count == 9:
@@ -298,6 +315,26 @@ final class DemoSession {
                     source = try await startCapture()
                     if stopping { break }
                     try prepareVideo()
+                    if let capture = source as? any ScreenAudioSource {
+                        audioSendTask = Task {
+                            do {
+                                var nextSequence: UInt64 = 0
+                                for try await packet in capture.audioPackets {
+                                    audioSourceGaps += packet.sequence - nextSequence
+                                    nextSequence = packet.sequence + 1
+                                    audioQueuePeakMs = max(
+                                        audioQueuePeakMs, session.statistics.estimatedQueueDelay * 1000)
+                                    guard !Task.isCancelled, !stopping else { return }
+                                    let now = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+                                    do {
+                                        try session.send(packet.message, mode: .unreliable(
+                                            retryBudget: 0, firstSendDeadline: now + 0.10, priority: .high))
+                                        audioQueued += 1
+                                    } catch NetworkMessageSession.SendError.backpressure { audioBackpressure += 1 }
+                                }
+                            } catch { log("Audio streaming stopped: \(error)") }
+                        }
+                    }
                 }
                 guard let video else { throw VideoSession.Failure.closed }
                 if let source {
@@ -460,7 +497,7 @@ final class DemoSession {
         let mbps = Double(videoBytes - previousBytes) * 8 / seconds / 1e6
         let stats = session.statistics
         let rtt = stats.roundTripTime.map { String(format: "%.1f ms", $0 * 1000) } ?? "pending"
-        let details: String
+        var details: String
         if role == .server {
             details =
                 "generated=\(frames) queued=\(countedFrames) backpressureDrops=\(backpressureDrops) codecDrops=\(codecDrops)"
@@ -473,6 +510,16 @@ final class DemoSession {
                 "frames=\(frames) latest=#\(latestFrame) missingFrames=\(max(latestFrame, frames) - frames)"
                 + (screen ? " displayEnqueued=\(displayEnqueued)" : " verified=\(verifiedFrames)")
                 + " controls=\(controls) latest=#\(latestControl) heartbeatsQueued=\(heartbeats)"
+        }
+        if audioQueued > 0 || audioBackpressure > 0 {
+            details += " audioQueued=\(audioQueued) audioSourceGaps=\(audioSourceGaps) audioBackpressure=\(audioBackpressure)"
+            details += " audioFirstSendExpired=\(stats.expiredBeforeFirstSend[.high, default: 0])"
+            details += String(format: " audioQueuePeak=%.1f ms", audioQueuePeakMs)
+            audioQueuePeakMs = 0
+        }
+        if let playback = playback?.statistics {
+            details += " audioPLC=\(playback.concealedPackets - playback.fadeFallbacks) audioFadeFallback=\(playback.fadeFallbacks)"
+            details += " audioLate=\(playback.latePackets) audioConcealed=\(playback.concealedPackets) audioRebuffers=\(playback.rebufferCount) audioDecodeErrors=\(playback.decodeFailures)"
         }
         let direction = role == .server ? "video queued" : "video received"
         log(

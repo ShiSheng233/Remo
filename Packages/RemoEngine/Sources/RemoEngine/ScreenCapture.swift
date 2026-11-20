@@ -14,10 +14,14 @@ public protocol ScreenFrameSource: AnyObject {
     nonisolated(nonsending) func stop() async throws
 }
 
+public protocol ScreenAudioSource: ScreenFrameSource {
+    var audioPackets: AsyncThrowingStream<CapturedAudioPacket, Error> { get }
+}
+
 #if os(macOS)
     @available(macOS 12.3, *)
     public struct ScreenCaptureConfiguration {
-        public enum Failure: Error { case noMainDisplay, invalidConfiguration }
+        public enum Failure: Error { case noMainDisplay, invalidConfiguration, audioUnavailable }
         private let filter: SCContentFilter
         public let width: Int
         public let height: Int
@@ -75,7 +79,7 @@ public protocol ScreenFrameSource: AnyObject {
                 framesPerSecond: framesPerSecond)
         }
 
-        public nonisolated(nonsending) func start() async throws -> any ScreenFrameSource {
+        public nonisolated(nonsending) func start(capturesAudio: Bool = false) async throws -> any ScreenFrameSource {
             let config = SCStreamConfiguration()
             config.width = width
             config.height = height
@@ -83,18 +87,29 @@ public protocol ScreenFrameSource: AnyObject {
             config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             config.queueDepth = 4
             config.showsCursor = true
-            let output = ScreenOutput()
+            if capturesAudio {
+                guard #available(macOS 13.0, *) else { throw Failure.audioUnavailable }
+                config.capturesAudio = true
+                config.sampleRate = 48_000
+                config.channelCount = 2
+            }
+            let output = try ScreenOutput(capturesAudio: capturesAudio)
             let stream = SCStream(filter: filter, configuration: config, delegate: output)
             try stream.addStreamOutput(
                 output, type: .screen, sampleHandlerQueue: DispatchQueue(label: "RemoEngine.screen")
             )
+            if capturesAudio {
+                guard #available(macOS 13.0, *) else { throw Failure.audioUnavailable }
+                try stream.addStreamOutput(
+                    output, type: .audio, sampleHandlerQueue: DispatchQueue(label: "RemoEngine.audio"))
+            }
             try await stream.startCapture()
             return Capture(stream: stream, output: output, width: width, height: height)
         }
     }
 
     @available(macOS 12.3, *)
-    private final class Capture: ScreenFrameSource {
+    private final class Capture: ScreenAudioSource {
         let stream: SCStream
         let output: ScreenOutput
         let width: Int
@@ -107,14 +122,33 @@ public protocol ScreenFrameSource: AnyObject {
             self.height = height
         }
 
+        var audioPackets: AsyncThrowingStream<CapturedAudioPacket, Error> { output.audioPackets }
         func latestSample() throws -> CMSampleBuffer? { try output.latest().get() }
-        nonisolated(nonsending) func stop() async throws { try await stream.stopCapture() }
+        nonisolated(nonsending) func stop() async throws {
+            defer { output.finishAudio() }
+            try await stream.stopCapture()
+        }
     }
 
     @available(macOS 12.3, *)
     private final class ScreenOutput: NSObject, SCStreamDelegate, SCStreamOutput {
         private let lock = NSLock()
         private var result: Result<CMSampleBuffer?, Error> = .success(nil)
+
+        private let packetizer: ScreenAudioPacketizer?
+        let audioPackets: AsyncThrowingStream<CapturedAudioPacket, Error>
+        private let continuation: AsyncThrowingStream<CapturedAudioPacket, Error>.Continuation
+
+        init(capturesAudio: Bool) throws {
+            packetizer = capturesAudio ? try ScreenAudioPacketizer() : nil
+            var sink: AsyncThrowingStream<CapturedAudioPacket, Error>.Continuation!
+            audioPackets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(3)) { sink = $0 }
+            continuation = sink
+            super.init()
+            if !capturesAudio { finishAudio() }
+        }
+
+        func finishAudio() { continuation.finish() }
 
         func latest() -> Result<CMSampleBuffer?, Error> {
             lock.lock()
@@ -126,12 +160,21 @@ public protocol ScreenFrameSource: AnyObject {
             lock.lock()
             defer { lock.unlock() }
             result = .failure(error)
+            continuation.finish(throwing: error)
         }
 
         func stream(
             _ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer,
             of type: SCStreamOutputType
         ) {
+            if #available(macOS 13.0, *), type == .audio, let packetizer {
+                do {
+                    try packetizer.append(sample) { continuation.yield($0) }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+                return
+            }
             guard type == .screen, CMSampleBufferIsValid(sample),
                 let info = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
                     as? [[SCStreamFrameInfo: Any]],
