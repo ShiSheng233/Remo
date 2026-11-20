@@ -12,6 +12,7 @@ struct VideoSettings {
     var resolution: (width: Int, height: Int)?
     var simulatedSize: (width: Int, height: Int) { resolution ?? (640, 360) }
     var screenBounds: (width: Int, height: Int) { resolution ?? (1920, 1920) }
+    var maxVideoBitRate = 2_000_000
     var fps: Int32 = 30
     var interval: UInt64 { 1_000_000_000 / UInt64(fps) }
 }
@@ -20,13 +21,14 @@ struct VideoSettings {
 enum Command {
     static let usage = """
         Usage:
-          remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--screen] [--wire-stats] [--trace-heartbeats]
+          remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--wire-stats] [--trace-heartbeats]
           remo-engine client <host> [port] [--screen] [--wire-stats] [--trace-heartbeats]
 
         Default UDP port: 7711
         --resolution sets the simulated frame size or fits the screen inside WIDTHxHEIGHT.
         Dimensions must be even (2...8192). Defaults: 640x360 simulated, screen longest edge 1920.
         --fps sets the server frame rate (1...240, default 30). Screen capture may run slower.
+        --max-video-bitrate sets the video bitrate ceiling in bits per second (default 2000000).
         --screen streams the main display on the server and opens a video window on the client (macOS).
         --trace-heartbeats traces heartbeat submission, UDP framing, session delivery, and timeouts.
         --wire-stats observes outgoing UDP payload bytes, DATA, ACK, and retransmissions.
@@ -67,7 +69,7 @@ enum Command {
             return
         }
         var settings = VideoSettings()
-        for option in ["--resolution", "--fps"] {
+        for option in ["--resolution", "--fps", "--max-video-bitrate"] {
             guard let index = args.firstIndex(of: option) else { continue }
             guard args.first == "server" else { fail("\(option) is a server option.") }
             guard index + 1 < args.count else { fail("Missing value for \(option).") }
@@ -77,6 +79,11 @@ enum Command {
                     fail("Expected --fps 1...240.")
                 }
                 settings.fps = fps
+            } else if option == "--max-video-bitrate" {
+                guard let rate = Int32(value), rate > 0 else {
+                    fail("Expected --max-video-bitrate in bits per second (1...2147483647).")
+                }
+                settings.maxVideoBitRate = Int(rate)
             } else {
                 let parts = value.lowercased().split(
                     separator: "x", omittingEmptySubsequences: false)

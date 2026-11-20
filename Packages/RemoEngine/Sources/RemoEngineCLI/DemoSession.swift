@@ -36,9 +36,9 @@ final class DemoSession {
         private var lastResolutionChange: UInt64 = 0
     #endif
     private var screenEncoder: VideoEncoder?
-    private var targetBitRate = 2_000_000
+    private var targetBitRate: Int
     private var lastRateUpdate: UInt64 = 0
-    private var refreshBitRate = 2_000_000
+    private var refreshBitRate: Int
     private var lastQualityRefresh: UInt64 = 0
     private var lastImageChange: UInt64 = 0
     private var refreshWhenStill = false
@@ -77,6 +77,8 @@ final class DemoSession {
         settings: VideoSettings = VideoSettings()
     ) {
         self.settings = settings
+        targetBitRate = settings.maxVideoBitRate
+        refreshBitRate = settings.maxVideoBitRate
         self.screen = screen
         self.startCapture = startCapture
         self.role = role
@@ -140,7 +142,7 @@ final class DemoSession {
             ? try VideoEncoder(
                 width: source?.width ?? settings.simulatedSize.width,
                 height: source?.height ?? settings.simulatedSize.height,
-                framesPerSecond: Int(settings.fps), bitRate: 2_000_000,
+                framesPerSecond: Int(settings.fps), bitRate: targetBitRate,
                 enableLongTermReferences: true) : nil
         if source != nil { screenEncoder = encoder }
         video = VideoSession(
@@ -292,10 +294,10 @@ final class DemoSession {
                 if let source {
                     let stats = session.statistics
                     let budget = stats.bitsPerSecond
-                    let target = max(128_000, min(2_000_000, Int(budget * 0.7)))
+                    let target = min(settings.maxVideoBitRate, max(128_000, Int(budget * 0.7)))
                     if now - lastRateUpdate >= 500_000_000
                         && (abs(target - targetBitRate) > targetBitRate / 8
-                            || (target == 2_000_000 && target != targetBitRate))
+                            || (target == settings.maxVideoBitRate && target != targetBitRate))
                     {
                         try screenEncoder?.setBitRate(target)
                         refreshBitRate = min(refreshBitRate, target)
@@ -325,7 +327,7 @@ final class DemoSession {
                                     && now - lastImageChange >= 1_000_000_000
                                 let improved =
                                     targetBitRate >= refreshBitRate * 3 / 2
-                                    || (targetBitRate == 2_000_000
+                                    || (targetBitRate == settings.maxVideoBitRate
                                         && refreshBitRate < targetBitRate)
                                 if (improved || settled)
                                     && now - lastQualityRefresh >= 5_000_000_000
