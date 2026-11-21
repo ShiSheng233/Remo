@@ -32,6 +32,7 @@ enum MessageKind: UInt8, CaseIterable {
     case keyFrameRequest = 0x43
     case keyFrameChunk = 0x44
     case keyFrameProgress = 0x45
+    case videoRecoveryRequest = 0x46
 
     /// Kinds that `VideoSession` handles.
     var isVideo: Bool { rawValue & 0xc0 == 0x40 }

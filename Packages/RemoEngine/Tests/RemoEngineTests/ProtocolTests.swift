@@ -6,7 +6,7 @@ import Testing
 @Test func onlyVideoKindsGoToTheVideoSession() {
     let video: Set<MessageKind> = [
         .videoFrame, .videoAcknowledgement, .videoRefresh, .keyFrameRequest, .keyFrameChunk,
-        .keyFrameProgress,
+        .keyFrameProgress, .videoRecoveryRequest,
     ]
     for kind in MessageKind.allCases {
         #expect(kind.isVideo == video.contains(kind), "\(kind)")

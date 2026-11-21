@@ -27,6 +27,7 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     let pixels = try #require(buffer)
     var receiver: VideoSession!
     var sender: VideoSession!
+    var lostRecoveryRequest = false
     var lostInitial = false
     var lostDelta = false
     var lostRefresh = false
@@ -59,6 +60,7 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
                 lostRefresh = true
                 return
             }
+            if lostDelta && loseAllLTR && frame.kind == .idr { return }
             receiver.receive(.unreliable, data)
         }, onFrame: { _, _, _ in Issue.record("Unexpected reverse video") },
         onEvent: {
@@ -70,9 +72,16 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
         }, onFailure: { Issue.record("Sender failed: \($0)") })
     receiver = VideoSession(
         send: { data, mode in
-            if data.first == MessageKind.videoAcknowledgement.rawValue {
-                guard case .unreliable(let retries, _, _) = mode else { throw WireFormatError.invalid }
+            let recovery = data.first == MessageKind.videoRecoveryRequest.rawValue
+            if recovery || data.first == MessageKind.videoAcknowledgement.rawValue {
+                guard case .unreliable(let retries, _, _) = mode else {
+                    throw WireFormatError.invalid
+                }
                 #expect(retries == 0)
+                if recovery && !lostRecoveryRequest {
+                    lostRecoveryRequest = true
+                    return
+                }
                 sender.receive(.unreliable, data)
             } else {
                 guard case .reliable = mode else { throw WireFormatError.invalid }
@@ -96,7 +105,7 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
         sender = nil
         receiver = nil
     }
-    for index in 1...90 {
+    for index in 1...260 {
         try #require(CVPixelBufferLockBaseAddress(pixels, []) == kCVReturnSuccess)
         memset(
             CVPixelBufferGetBaseAddressOfPlane(pixels, 0)!, Int32(48 + index),
@@ -112,7 +121,7 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
         try await Task.sleep(nanoseconds: 5_000_000)
         if framesAfterRecovery >= 3 { break }
     }
-    #expect(lostInitial && bootstrapped && confirmed)
+    #expect(lostRecoveryRequest && lostInitial && bootstrapped && confirmed)
     #expect(lostDelta && lostRefresh && recovered)
     #expect(reliableIDR == loseAllLTR)
     #expect(framesAfterRecovery >= 3)
@@ -151,6 +160,8 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     let epoch = frames[0].epoch
     try #require(frames[1].epoch == epoch)
     acknowledge(epoch: epoch, frame: frames[1].id)
+    let staleRecovery = VideoRecoveryRequest(round: frames[1].id, attempt: 7, epoch: epoch, level: .reliableIDR)
+    #expect(!session.receive(.unreliable, staleRecovery.encoded))
     acknowledge(epoch: epoch, frame: frames[0].id)
     acknowledge(epoch: epoch, frame: frames[1].id)
     session.requestKeyFrame()
@@ -162,6 +173,21 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     #expect(accepted == [frames[1].id])
     acknowledge(epoch: newEpoch, frame: frames[2].id)
     #expect(accepted == [frames[1].id, frames[2].id])
+}
+
+@Test func recoveryRequestsRejectStaleRoundsAttemptsAndDowngrades() throws {
+    func request(_ round: UInt64, _ attempt: UInt64, _ level: VideoRecoveryRequest.Level) throws -> VideoRecoveryRequest {
+        let message = VideoRecoveryRequest(round: round, attempt: attempt, epoch: 1, level: level)
+        return try VideoRecoveryRequest(message.encoded)
+    }
+    let current = try request(10, 3, .idr)
+    #expect(try !request(9, 8, .reliableIDR).supersedes(current))
+    #expect(try !request(10, 2, .reliableIDR).supersedes(current))
+    #expect(!current.supersedes(current))
+    #expect(try !request(10, 4, .ltr).supersedes(current))
+    #expect(try request(10, 4, .idr).supersedes(current))
+    #expect(try request(10, 4, .reliableIDR).supersedes(current))
+    #expect(try request(11, 1, .ltr).supersedes(current))
 }
 
 @Test func recoveryChunksRespectCreditAndRetryBackpressure() throws {
@@ -203,15 +229,13 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     var requests: [Data] = []
     let session = VideoSession(
         send: { data, mode in
-            guard case .reliable = mode else { throw WireFormatError.invalid }
+            guard case .unreliable(0, .some, _) = mode else { throw WireFormatError.invalid }
             requests.append(data)
         }, onFrame: { _, _, _ in }, onFailure: { Issue.record("Unexpected failure: \($0)") })
     try session.requestRefresh()
     try session.requestRefresh()
-    var expected = MessageKind.videoRefresh.encoded
-    expected.put(UInt64(0))
-    expected.put(UInt8(0))
-    #expect(requests == [expected])
+    let expected = VideoRecoveryRequest(round: 1, attempt: 1, epoch: 0, level: .idr)
+    #expect(requests == [expected.encoded])
 }
 
 @Test @MainActor func higherBitRateRefreshesAnUnchangedPicture() async throws {

@@ -9,7 +9,7 @@ final class VideoSession {
     enum Failure: Error { case closed, encoderUnavailable, encoderBusy }
     enum Event {
         case acknowledged(frame: UInt64, token: LongTermReferenceToken)
-        case requestedRecovery(after: UInt64, firstAvailable: UInt64)
+        case requestedRecovery(after: UInt64, firstAvailable: UInt64, request: VideoRecoveryRequest)
         case reliableKeyFrame(frame: UInt64, bytes: Int)
         case encodedRefresh(frame: UInt64, reference: LongTermReferenceToken?)
         case decodedRefresh(frame: UInt64, idr: Bool)
@@ -33,7 +33,10 @@ final class VideoSession {
     private var lastDecoded: UInt64 = 0
     private var lastRequest: UInt64?
     private var lastRequestTime = SuspendingClock.Instant.now
-    private var recoveryRequests = 0
+    private var recoveryRequests: UInt64 = 0
+    private var requestedLevel: VideoRecoveryRequest.Level = .ltr
+    private var receivedRecovery: VideoRecoveryRequest?
+    private var confirmedDecodedFrame: UInt64 = 0
     private var wantsCheckpoint = false
     private var outgoing: KeyFrameSender?
     private var incoming: KeyFrameReceiver?
@@ -169,9 +172,24 @@ final class VideoSession {
                 else {
                     return false
                 }
+                confirmedDecodedFrame = max(confirmedDecodedFrame, frame)
                 acknowledged = (frame, token)
                 newAcknowledgement = true
                 onEvent(.acknowledged(frame: frame, token: token))
+            case (.unreliable, .videoRecoveryRequest):
+                let request = try VideoRecoveryRequest(message)
+                guard request.round > confirmedDecodedFrame, request.round <= nextID,
+                    request.supersedes(receivedRecovery)
+                else { return false }
+                receivedRecovery = request
+                guard outgoing == nil && !wantsCheckpoint else { return true }
+                switch request.level {
+                case .ltr where request.epoch == sentEpoch && acknowledged != nil:
+                    if refresh != .keyFrame { refresh = .recover }
+                case .ltr, .idr: refresh = .keyFrame
+                case .reliableIDR: wantsCheckpoint = true
+                }
+            // Older clients send these requests on the reliable channel.
             case (.reliable, .videoRefresh):
                 var body = message.dropFirst()
                 let epoch = try body.take(UInt64.self)
@@ -192,6 +210,7 @@ final class VideoSession {
                 guard body.isEmpty else { throw WireFormatError.invalid }
                 if let outgoing, outgoing.id == id {
                     if try outgoing.advance(to: offset) {
+                        confirmedDecodedFrame = max(confirmedDecodedFrame, id)
                         self.outgoing = nil
                     } else {
                         try outgoing.pump(send: send)
@@ -292,23 +311,24 @@ final class VideoSession {
             }
             if recoveryRequests >= 3 && elapsed < .milliseconds(500) { return }
         }
-        var request = MessageKind.videoRefresh.encoded
-        request.put(receivedEpoch)
-        // Repeated unanswered LTR refreshes must not leave the receiver on the same chain forever.
-        request.put(UInt8(allowLTR && recoveryRequests < 2 ? 1 : 0))
+        let attempt = recoveryRequests + 1
+        if attempt >= 4 {
+            requestedLevel = .reliableIDR
+        } else if !allowLTR || attempt >= 3 {
+            requestedLevel = .idr
+        }
+        // Every successful decode advances the identity of the next recovery round.
+        let request = VideoRecoveryRequest(
+            round: lastDecoded + 1, attempt: attempt, epoch: receivedEpoch, level: requestedLevel)
         lastRequest = id
         lastRequestTime = now
         do {
-            // Older peers ignore the extension and still handle the ordinary refresh request.
-            if recoveryRequests >= 2 {
-                try send(MessageKind.keyFrameRequest.encoded, .reliable)
-            }
-            try send(request, .reliable)
+            try send(request.encoded, .unreliable(sendWithin: .milliseconds(250)))
         } catch NetworkMessageSession.SendError.backpressure {
             return
         }
-        recoveryRequests += 1
-        onEvent(.requestedRecovery(after: lastDecoded, firstAvailable: id))
+        recoveryRequests = attempt
+        onEvent(.requestedRecovery(after: lastDecoded, firstAvailable: id, request: request))
     }
 
     private nonisolated(nonsending) func decode(_ packet: VideoFrameMessage) async throws {
@@ -342,6 +362,7 @@ final class VideoSession {
         guard !closed else { return }
         lastDecoded = packet.id
         recoveryRequests = 0
+        requestedLevel = .ltr
         lastRequest = nil
         if let token = packet.token {
             var ack = MessageKind.videoAcknowledgement.encoded
@@ -372,8 +393,9 @@ extension VideoSession.Event {
     var diagnostic: String? {
         switch self {
         case .acknowledged: nil
-        case .requestedRecovery(let last, let available):
+        case .requestedRecovery(let last, let available, let request):
             "recovery requested lastDecoded=\(last) nextAvailable=\(available)"
+                + " round=\(request.round) attempt=\(request.attempt) level=\(request.level)"
         case .reliableKeyFrame(let id, let bytes): "reliable IDR frame=\(id) bytes=\(bytes)"
         case .encodedRefresh(let id, let reference):
             "recovery encoded frame=\(id) kind=\(reference.map { "LTR-P ackToken=\($0.rawValue)" } ?? "IDR")"
