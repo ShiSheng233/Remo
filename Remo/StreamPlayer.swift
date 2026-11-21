@@ -24,6 +24,8 @@ final class StreamPlayer {
 
     private(set) var surface: VideoSurface?
     private(set) var phase = Phase.idle
+    /// Pixel size of the remote picture once the first frame arrives.
+    private(set) var videoSize: CGSize?
     var mouseAvailable: Bool { mouseDisplaySize != nil }
 
     private var mouseDisplaySize: CGSize?
@@ -86,6 +88,7 @@ final class StreamPlayer {
             lastPixels = nil
             onFinalFrame = nil
             surface = nil
+            videoSize = nil
             phase = failure.map(Phase.failed) ?? .idle
             failure = nil
             receivedControl = false
@@ -217,7 +220,9 @@ final class StreamPlayer {
         switch gesture {
         case let .move(delta):
             guard delta != .zero else { return }
+            // Finger travel follows the picture, so a zoomed view moves the pointer less.
             let scale = min(bounds.width / displaySize.width, bounds.height / displaySize.height)
+                * (surface?.zoom ?? 1)
             mousePosition = CGPoint(
                 x: min(1, max(0, mousePosition.x + delta.x / (displaySize.width * scale))),
                 y: min(1, max(0, mousePosition.y + delta.y / (displaySize.height * scale))))
@@ -250,6 +255,9 @@ final class StreamPlayer {
         do {
             guard try surface.present(frame) else { return }
             lastPixels = frame.pixels
+            let size = CGSize(
+                width: CVPixelBufferGetWidth(frame.pixels), height: CVPixelBufferGetHeight(frame.pixels))
+            if videoSize != size { videoSize = size }
             if phase == .waitingForVideo { phase = .streaming }
         } catch {
             fail("Video display failed. \(error.localizedDescription)")

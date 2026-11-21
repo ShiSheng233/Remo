@@ -18,20 +18,32 @@ struct TrackpadView: View {
     let onInput: (TrackpadGesture) -> Void
     /// Window-space frames of SwiftUI controls drawn over the trackpad.
     var excludedRects: [CGRect] = []
+    /// The wheel only makes sense while the remote mouse can be controlled.
+    var showsWheel = true
+    /// The picture, which this view zooms and pans.
+    let surface: VideoSurface
+    /// Pixel size of the remote picture, which the zoomed view is sized from.
+    var videoSize: CGSize?
 
     @State private var wheelFrame = CGRect.zero
 
     var body: some View {
         // The trackpad’s UIKit view would otherwise take real touches meant for the wheel.
-        TrackpadRegion(onInput: onInput, excludedRects: excludedRects + [wheelFrame])
+        TrackpadRegion(
+            onInput: onInput, excludedRects: excludedRects + (showsWheel ? [wheelFrame] : []),
+            surface: surface, videoSize: videoSize)
             .overlay(alignment: .trailing) {
+                if showsWheel { wheel }
+            }
+    }
+
+    private var wheel: some View {
                 ScrollWheel(onInput: onInput)
                     .containerRelativeFrame(.vertical) { height, _ in min(height * 0.6, 120) }
                     .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
                         wheelFrame = $0
                     }
                     .padding(.trailing, 16)
-            }
     }
 }
 
@@ -187,18 +199,91 @@ private struct Ticks: Shape {
     }
 }
 
-/// Leaves touches inside `excludedRects` (window space) to the SwiftUI controls drawn over it.
+/// The trackpad: one finger drives the remote pointer, two fingers zoom and pan the picture.
 ///
+/// It is a scroll view so UIKit handles pinching, panning, deceleration and bounce. The video
+/// surface is the zoomed view, so zooming is a layer transform rather than a redraw. The scroll
+/// view’s pan needs two fingers, leaving single touches to the pointer gestures.
+///
+/// Touches inside `excludedRects` (window space) are left to the SwiftUI controls drawn over it.
 /// Taps are read from raw touches rather than a `UITapGestureRecognizer`: SwiftUI makes buttons
 /// drawn over this view wait for such a recognizer to fail, which it never does for touches it
 /// isn’t given, so those buttons stopped responding.
-private final class TouchSurface: UIView {
+private final class TouchSurface: UIScrollView {
     var excludedRects: [CGRect] = []
     var onTap: (() -> Void)?
+    var videoSize: CGSize? {
+        didSet { if videoSize != oldValue { resetZoom() } }
+    }
+    /// The picture at its fitted size; zooming scales it.
+    var zoomContent: UIView? {
+        didSet {
+            guard zoomContent !== oldValue else { return }
+            oldValue?.removeFromSuperview()
+            if let zoomContent {
+                // Touches land on the scroll view itself, where the trackpad gestures live.
+                zoomContent.isUserInteractionEnabled = false
+                addSubview(zoomContent)
+            }
+            resetZoom()
+        }
+    }
     private var tapStart: (location: CGPoint, time: TimeInterval)?
+    private var laidOutSize = CGSize.zero
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        minimumZoomScale = 1
+        maximumZoomScale = 4
+        bouncesZoom = true
+        showsHorizontalScrollIndicator = false
+        showsVerticalScrollIndicator = false
+        contentInsetAdjustmentBehavior = .never
+        delaysContentTouches = false
+        panGestureRecognizer.minimumNumberOfTouches = 2
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
     func excludes(windowPoint: CGPoint) -> Bool {
         excludedRects.contains { $0.contains(windowPoint) }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if bounds.size != laidOutSize {
+            laidOutSize = bounds.size
+            resetZoom()
+        }
+    }
+
+    /// Shows the whole picture, fitted and centered.
+    private func resetZoom() {
+        guard let zoomContent else { return }
+        zoomScale = 1
+        var size = bounds.size
+        if let videoSize, videoSize.width > 0, videoSize.height > 0, !bounds.isEmpty {
+            let scale = min(bounds.width / videoSize.width, bounds.height / videoSize.height)
+            size = CGSize(width: videoSize.width * scale, height: videoSize.height * scale)
+        }
+        zoomContent.frame = CGRect(origin: .zero, size: size)
+        contentSize = size
+        centerContent()
+        contentOffset = CGPoint(x: -contentInset.left, y: -contentInset.top)
+    }
+
+    /// Keeps the picture centered on any axis where it is smaller than the view.
+    ///
+    /// This uses content insets, updated from `scrollViewDidZoom`, because the scroll view
+    /// calls that inside its own zoom-bounce animation and so animates the inset change too.
+    /// Moving the view in `layoutSubviews` instead happened outside that animation, and the
+    /// picture jumped to the corner the moment a pinch below the minimum was released.
+    func centerContent() {
+        let size = contentSize
+        let x = max(0, (bounds.width - size.width) / 2)
+        let y = max(0, (bounds.height - size.height) / 2)
+        contentInset = UIEdgeInsets(top: y, left: x, bottom: y, right: x)
     }
 
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
@@ -236,6 +321,8 @@ private final class TouchSurface: UIView {
 private struct TrackpadRegion: UIViewRepresentable {
     let onInput: (TrackpadGesture) -> Void
     let excludedRects: [CGRect]
+    let surface: VideoSurface
+    let videoSize: CGSize?
 
     func makeCoordinator() -> Coordinator { Coordinator(onInput: onInput) }
 
@@ -243,6 +330,7 @@ private struct TrackpadRegion: UIViewRepresentable {
         let view = TouchSurface()
         let coordinator = context.coordinator
         coordinator.surface = view
+        view.delegate = coordinator
         view.onTap = { [weak coordinator] in coordinator?.onInput(.button(.leftClick)) }
         let pan = UIPanGestureRecognizer(target: coordinator, action: #selector(Coordinator.pan))
         pan.maximumNumberOfTouches = 1
@@ -250,6 +338,7 @@ private struct TrackpadRegion: UIViewRepresentable {
             target: coordinator, action: #selector(Coordinator.hold))
         hold.minimumPressDuration = 0.4
         pan.require(toFail: hold)
+        coordinator.pointerPan = pan
         for recognizer in [pan, hold] as [UIGestureRecognizer] {
             recognizer.delegate = coordinator
             view.addGestureRecognizer(recognizer)
@@ -260,11 +349,14 @@ private struct TrackpadRegion: UIViewRepresentable {
     func updateUIView(_ uiView: TouchSurface, context: Context) {
         context.coordinator.onInput = onInput
         uiView.excludedRects = excludedRects
+        uiView.zoomContent = surface
+        uiView.videoSize = videoSize
     }
 
-    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate, UIScrollViewDelegate {
         var onInput: (TrackpadGesture) -> Void
         weak var surface: TouchSurface?
+        weak var pointerPan: UIPanGestureRecognizer?
         private var dragLocation: CGPoint?
         private var touchDown = CGPoint.zero
         private var panIgnored = false
@@ -273,12 +365,45 @@ private struct TrackpadRegion: UIViewRepresentable {
             self.onInput = onInput
         }
 
+        // MARK: Zoom
+
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? { surface?.zoomContent }
+
+        func scrollViewDidZoom(_ scrollView: UIScrollView) { surface?.centerContent() }
+
+        func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+            cancelPointerDrag()
+        }
+
+        func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+            (view as? VideoSurface)?.zoomDidSettle()
+        }
+
+        func scrollViewWillBeginDragging(_ scrollView: UIScrollView) { cancelPointerDrag() }
+
+        /// A second finger turns a pointer drag into a zoom; stop moving the pointer.
+        private func cancelPointerDrag() {
+            guard let pointerPan, pointerPan.state != .possible else { return }
+            pointerPan.isEnabled = false
+            pointerPan.isEnabled = true
+        }
+
+        // MARK: Pointer
+
         // Touches on the controls drawn over the trackpad still reach these recognizers. Refusing
         // them would leave the recognizers pending, and SwiftUI buttons wait on them, so they are
         // taken and later ignored instead.
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
             touchDown = touch.location(in: nil)
             return true
+        }
+
+        /// Lets a pinch start even after a finger has begun moving the pointer.
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool {
+            other === surface?.pinchGestureRecognizer || other === surface?.panGestureRecognizer
         }
 
         private var startedOnControl: Bool {

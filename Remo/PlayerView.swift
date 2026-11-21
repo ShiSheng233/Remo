@@ -18,10 +18,15 @@ struct PlayerView: View {
         // Controls and the trackpad stay inside the safe area; only the backdrop and video reach
         // beyond it, from the background so they can’t stretch this stack to the full screen.
         ZStack {
-            if player.phase == .streaming, player.mouseAvailable {
-                // The trackpad’s UIKit view takes real touches from SwiftUI controls drawn over it.
-                TrackpadView(onInput: player.handleTrackpad, excludedRects: [controlsFrame])
-            }
+            // Hosts the video as the view it zooms, so it stays up from the moment the session
+            // starts: the surface only draws frames while it is in a window. It stays clear of
+            // the sensor housing at the sides but uses the full height, like the picture.
+            // The trackpad’s UIKit view takes real touches from SwiftUI controls drawn over it.
+            TrackpadView(
+                onInput: player.handleTrackpad, excludedRects: [controlsFrame],
+                showsWheel: player.phase == .streaming && player.mouseAvailable,
+                surface: surface, videoSize: player.videoSize)
+                .ignoresSafeArea(edges: .vertical)
 
             if let status {
                 ProgressView(status)
@@ -30,13 +35,6 @@ struct PlayerView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background {
-            // Stay clear of the sensor housing at the sides, but center over the full height
-            // instead of being pushed up by the home indicator’s inset.
-            VideoSurfaceView(surface: surface)
-                .ignoresSafeArea(edges: .vertical)
-                .accessibilityLabel("Remote video")
-        }
         .background(Color.black, ignoresSafeAreaEdges: .all)
         .overlay(alignment: .topLeading) {
             controls

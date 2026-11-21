@@ -7,7 +7,6 @@ import CoreImage
 import Metal
 import QuartzCore
 import RemoCodec
-import SwiftUI
 import UIKit
 
 @MainActor
@@ -19,6 +18,16 @@ final class VideoSurface: UIView {
     private let context: CIContext?
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
 
+    /// The last frame, kept so a resolution change can redraw while the remote screen is still.
+    private var lastImage: CIImage?
+    private var redrawPending = false
+    /// Extra drawable resolution while zoomed in, never beyond the remote picture’s own pixels.
+    private var detail: CGFloat = 1
+
+    /// Magnification applied by the zooming scroll view this view sits in; 1 shows the whole
+    /// remote screen.
+    var zoom: CGFloat { bounds.width > 0 ? frame.width / bounds.width : 1 }
+
     init() {
         let device = MTLCreateSystemDefaultDevice()
         queue = device?.makeCommandQueue()
@@ -29,6 +38,8 @@ final class VideoSurface: UIView {
         display.pixelFormat = .bgra8Unorm
         display.framebufferOnly = false
         display.colorspace = colorSpace
+        isAccessibilityElement = true
+        accessibilityLabel = String(localized: "Remote video")
     }
 
     @available(*, unavailable)
@@ -42,20 +53,51 @@ final class VideoSurface: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         guard let screen = window?.windowScene?.screen, !bounds.isEmpty else { return }
-        let scale = screen.nativeScale
+        let scale = screen.nativeScale * detail
         if contentScaleFactor != scale { contentScaleFactor = scale }
         display.drawableSize = CGSize(
             width: (bounds.width * scale).rounded(), height: (bounds.height * scale).rounded())
+        setNeedsRedraw()
+    }
+
+    /// Re-renders sharper once a zoom settles. While zooming, the layer is simply scaled, which
+    /// is smooth and costs no redraw but magnifies the drawable’s pixels.
+    func zoomDidSettle() {
+        guard let screen = window?.windowScene?.screen, let extent = lastImage?.extent,
+            !bounds.isEmpty
+        else { return }
+        let sourceLimit = max(1, extent.width / (bounds.width * screen.nativeScale))
+        let wanted = min(zoom, sourceLimit)
+        guard abs(wanted - detail) > 0.01 else { return }
+        detail = wanted
+        setNeedsLayout()
+    }
+
+    /// Coalesces redraws into one per run loop turn.
+    private func setNeedsRedraw() {
+        guard !redrawPending else { return }
+        redrawPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self, redrawPending, let lastImage else { return }
+            redrawPending = false
+            _ = try? render(lastImage)
+        }
     }
 
     func present(_ frame: DecodedVideoFrame) throws -> Bool {
+        let image = CIImage(cvPixelBuffer: frame.pixels)
+        lastImage = image
+        redrawPending = false
+        return try render(image)
+    }
+
+    private func render(_ image: CIImage) throws -> Bool {
         guard let queue, let context else { throw CocoaError(.featureUnsupported) }
         guard window != nil, !bounds.isEmpty,
             let drawable = display.nextDrawable(), let commands = queue.makeCommandBuffer()
         else { return false }
 
         let canvas = CGRect(x: 0, y: 0, width: drawable.texture.width, height: drawable.texture.height)
-        let image = CIImage(cvPixelBuffer: frame.pixels)
         let extent = image.extent
         let scale = min(canvas.width / extent.width, canvas.height / extent.height)
         let transform = CGAffineTransform(
@@ -69,11 +111,4 @@ final class VideoSurface: UIView {
         commands.commit()
         return true
     }
-}
-
-struct VideoSurfaceView: UIViewRepresentable {
-    let surface: VideoSurface
-
-    func makeUIView(context: Context) -> VideoSurface { surface }
-    func updateUIView(_ uiView: VideoSurface, context: Context) {}
 }
