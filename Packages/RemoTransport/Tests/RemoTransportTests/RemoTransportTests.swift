@@ -211,10 +211,21 @@ private func packet(
     a.endpoint.handleEvent(.writable)
     #expect(a.packets == [packet(1, 1, 1)])
     a.advance(to: 2)
-    #expect(a.failures == [.reliableDeadline])
+    #expect(a.failures == [.reliableDeadline(
+        firstByte: 1, sequence: 1, firstSent: true, retransmissions: a.packets.count - 1)])
     #expect(a.endpoint.send(Data([2]), mode: .reliable) == .closed)
     a.endpoint.handleEvent(.datagram(packet(1, 1, 2)))
     #expect(a.messages.isEmpty && a.deadline == nil)
+}
+
+@Test func reliableDeadlineReportsOldestUnsentMessage() {
+    let sender = Port(Clock())
+    sender.writable = false
+    sender.endpoint.send(Data([0x41]), mode: .reliable)
+    sender.endpoint.send(Data([0x42]), mode: .reliable)
+    sender.advance(to: 2)
+    #expect(sender.failures == [.reliableDeadline(
+        firstByte: 0x41, sequence: 1, firstSent: false, retransmissions: 0)])
 }
 
 @Test func unreliableFirstAndRetryDeadlines() {
@@ -414,14 +425,19 @@ private func packet(
     let peer = Port(clock)
     sender.endpoint.send(Data([7]), mode: .reliable)
     sender.drain(to: peer)
+    var retransmissions = 0
     while let wake = sender.deadline, wake < 2 {
         sender.advance(to: wake)
+        retransmissions += sender.packets.count
         sender.drain(to: peer)
         peer.packets.removeAll()
     }
     sender.advance(to: 2)
     #expect(peer.messages == [Data([7])])
-    #expect(sender.failures == [.reliableDeadline] && sender.deadline == nil)
+    #expect(retransmissions > 0)
+    #expect(sender.failures == [.reliableDeadline(
+        firstByte: 7, sequence: 1, firstSent: true, retransmissions: retransmissions)])
+    #expect(sender.deadline == nil)
     peer.endpoint.handleEvent(.closed)
     peer.endpoint.handleEvent(.datagram(packet(100, 2, 9)))
     #expect(peer.messages == [Data([7])])

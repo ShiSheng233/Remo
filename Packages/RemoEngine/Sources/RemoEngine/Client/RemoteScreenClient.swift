@@ -259,7 +259,9 @@ public final class RemoteScreenClient {
             self?.receive($0, $1)
         }
         let close: (NetworkMessageSession.CloseReason) -> Void = { [weak self] reason in
-            guard let self, transport != nil else { return }
+            guard let self else { return }
+            configuration.diagnostics.info(nil, "client connection closed: \(reason.diagnosticDescription)")
+            guard transport != nil else { return }
             if case .network(let error) = reason {
                 fail(.network(error))
             } else {

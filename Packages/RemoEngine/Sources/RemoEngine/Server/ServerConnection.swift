@@ -95,7 +95,7 @@ final class ServerConnection {
                     [weak self] channel, bytes in
                     self?.receive(channel, bytes)
                 } closeHandler: { [weak self] reason in
-                    self?.stop("connection closed: \(reason)", failed: true)
+                    self?.stop("connection closed: \(reason.diagnosticDescription)", failed: true)
                 }
             } catch {
                 stop("connection setup: \(error)", failed: true)

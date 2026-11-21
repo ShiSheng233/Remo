@@ -20,7 +20,11 @@ public final class MessageTransport {
     public enum SendResult: Equatable {
         case queued, backpressure, invalidLength, invalidTime, closed
     }
-    public enum Failure: Equatable { case reliableDeadline, sequenceExhausted }
+    public enum Failure: Equatable {
+        /// First transmission and retransmissions count only datagrams accepted by I/O.
+        case reliableDeadline(firstByte: UInt8, sequence: UInt32, firstSent: Bool, retransmissions: Int)
+        case sequenceExhausted
+    }
     public enum Event {
         case datagram(Data)
         case timer, writable, closed
@@ -50,6 +54,7 @@ public final class MessageTransport {
         var cursor = 0
         var retries: Set<Int> = []
         var remaining: Int
+        var retransmissions = 0
         var timeouts = 0
 
         init(
@@ -428,8 +433,10 @@ public final class MessageTransport {
     }
 
     private func expire(_ now: TimeInterval) {
-        if r.values.contains(where: { $0.deadline <= now }) {
-            close(.reliableDeadline)
+        if let (sequence, msg) = r.lazy.filter({ $0.value.deadline <= now }).min(by: { $0.key < $1.key }) {
+            close(.reliableDeadline(
+                firstByte: msg.data[msg.data.startIndex], sequence: sequence,
+                firstSent: msg.cursor > 0, retransmissions: msg.retransmissions))
             return
         }
         receiver.expire(now)
@@ -561,7 +568,9 @@ public final class MessageTransport {
         }
         lastPacket += 1
         let retry = msg.retries.remove(key.index) != nil
-        if !retry {
+        if retry {
+            msg.retransmissions += 1
+        } else {
             msg.cursor += 1
             if msg.cursor == msg.count { msg.firstDeadline = nil }
         }
