@@ -69,7 +69,16 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
             }
         }, onFailure: { Issue.record("Sender failed: \($0)") })
     receiver = VideoSession(
-        send: { data, _ in sender.receive(.reliable, data) },
+        send: { data, mode in
+            if data.first == MessageKind.videoAcknowledgement.rawValue {
+                guard case .unreliable(let retries, _, _) = mode else { throw WireFormatError.invalid }
+                #expect(retries == 0)
+                sender.receive(.unreliable, data)
+            } else {
+                guard case .reliable = mode else { throw WireFormatError.invalid }
+                sender.receive(.reliable, data)
+            }
+        },
         onFrame: { id, frame, _ in
             #expect(id > lastID)
             lastID = id
@@ -107,6 +116,52 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     #expect(lostDelta && lostRefresh && recovered)
     #expect(reliableIDR == loseAllLTR)
     #expect(framesAfterRecovery >= 3)
+}
+
+@Test @MainActor func ltrAcknowledgementsAdvanceOnlyWithinTheCurrentEpoch() async throws {
+    let encoder = try VideoEncoder(
+        width: 320, height: 180, framesPerSecond: 30, bitRate: 300_000, enableLongTermReferences: true)
+    var frames: [VideoFrameMessage] = []
+    var accepted: [UInt64] = []
+    let session = VideoSession(
+        encoder: encoder, send: { data, _ in frames.append(try VideoFrameMessage(data)) },
+        onFrame: { _, _, _ in },
+        onEvent: { if case .acknowledged(let frame, _) = $0 { accepted.append(frame) } },
+        onFailure: { Issue.record("Unexpected failure: \($0)") })
+    defer { session.close() }
+    var buffer: CVPixelBuffer?
+    try #require(CVPixelBufferCreate(
+        nil, 320, 180, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary, &buffer) == kCVReturnSuccess)
+    let pixels = try #require(buffer)
+    func encode(_ index: Int64) async throws {
+        _ = try await session.sendFrame(
+            pixels, presentationTime: CMTime(value: index, timescale: 30),
+            duration: CMTime(value: 1, timescale: 30))
+    }
+    func acknowledge(epoch: UInt64, frame: UInt64) {
+        var message = MessageKind.videoAcknowledgement.encoded
+        message.put(epoch)
+        message.put(frame)
+        message.put(Int64(frame))
+        session.receive(.unreliable, message)
+    }
+    try await encode(0)
+    try await encode(1)
+    let epoch = frames[0].epoch
+    try #require(frames[1].epoch == epoch)
+    acknowledge(epoch: epoch, frame: frames[1].id)
+    acknowledge(epoch: epoch, frame: frames[0].id)
+    acknowledge(epoch: epoch, frame: frames[1].id)
+    session.requestKeyFrame()
+    try await encode(2)
+    let newEpoch = frames[2].epoch
+    try #require(newEpoch > epoch)
+    acknowledge(epoch: epoch, frame: frames[2].id)
+    acknowledge(epoch: newEpoch, frame: frames[2].id + 1)
+    #expect(accepted == [frames[1].id])
+    acknowledge(epoch: newEpoch, frame: frames[2].id)
+    #expect(accepted == [frames[1].id, frames[2].id])
 }
 
 @Test func recoveryChunksRespectCreditAndRetryBackpressure() throws {

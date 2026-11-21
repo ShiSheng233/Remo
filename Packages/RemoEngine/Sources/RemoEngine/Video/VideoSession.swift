@@ -24,7 +24,7 @@ final class VideoSession {
     private var encoding = false
     private var nextID: UInt64 = 1
     private var sentEpoch: UInt64 = 0
-    private var acknowledged: LongTermReferenceToken?
+    private var acknowledged: (frame: UInt64, token: LongTermReferenceToken)?
     private var newAcknowledgement = false
     private var refresh: VideoEncoder.Refresh = .none
     private var decoder: VideoDecoder?
@@ -91,7 +91,7 @@ final class VideoSession {
         let checkpoint = wantsCheckpoint
         let request: VideoEncoder.Refresh = checkpoint ? .keyFrame : refresh
         let tokens =
-            newAcknowledgement || request == .recover ? acknowledged.map { [$0] } ?? [] : []
+            newAcknowledgement || request == .recover ? acknowledged.map { [$0.token] } ?? [] : []
         refresh = .none
         newAcknowledgement = false
         let sample: CMSampleBuffer
@@ -159,15 +159,17 @@ final class VideoSession {
             case (.unreliable, .videoFrame):
                 let packet = try VideoFrameMessage(message)
                 if incoming == nil { ready = packet }
-            case (.reliable, .videoAcknowledgement):
+            case (_, .videoAcknowledgement):
                 var body = message.dropFirst()
                 let epoch = try body.take(UInt64.self)
                 let frame = try body.take(UInt64.self)
                 let token = LongTermReferenceToken(rawValue: try body.take(Int64.self))
-                guard body.isEmpty, epoch == sentEpoch, frame >= epoch, frame < nextID else {
-                    return true
+                guard body.isEmpty, epoch == sentEpoch, frame >= epoch,
+                    frame > (acknowledged?.frame ?? 0), frame < nextID
+                else {
+                    return false
                 }
-                acknowledged = token
+                acknowledged = (frame, token)
                 newAcknowledgement = true
                 onEvent(.acknowledged(frame: frame, token: token))
             case (.reliable, .videoRefresh):
@@ -350,7 +352,7 @@ final class VideoSession {
         }
         if let pendingAck {
             do {
-                try send(pendingAck, .reliable)
+                try send(pendingAck, .unreliable(retryBudget: 0))
                 self.pendingAck = nil
             } catch NetworkMessageSession.SendError.backpressure {
                 // Retry the latest usable reference on the next decoded frame.
