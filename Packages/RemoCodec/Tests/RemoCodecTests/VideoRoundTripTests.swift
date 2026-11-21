@@ -78,7 +78,7 @@ func syntheticVideoRoundTrip(skipSourceFrame: Bool) async throws {
         let sample = try await encoder.encode(
             pixels, presentationTime: pts, duration: duration, forceKeyFrame: index == 8)
         let format = try #require(CMSampleBufferGetFormatDescription(sample))
-        #expect(CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_H264)
+        #expect(CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC)
         #expect(CMSampleBufferGetTotalSampleSize(sample) > 0)
         #expect(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(sample), pts) == 0)
         let attachments =
@@ -112,12 +112,50 @@ private struct Slice {
     let isPredictive: Bool
 }
 
-/// Inspect the first VCL NAL of the picture, skipping AVCC length prefixes and non-VCL units.
+private struct HeaderBits {
+    let bytes: [UInt8]
+    private var offset = 0
+
+    init(_ payload: some Collection<UInt8>) {
+        var rbsp: [UInt8] = []
+        var zeros = 0
+        for byte in payload {
+            if zeros == 2 && byte == 3 {
+                zeros = 0
+                continue
+            }
+            rbsp.append(byte)
+            zeros = byte == 0 ? zeros + 1 : 0
+        }
+        bytes = rbsp
+    }
+
+    mutating func read(_ count: Int) throws -> Int {
+        guard offset + count <= bytes.count * 8 else { throw VideoCodecError.invalidFrame }
+        var value = 0
+        for _ in 0..<count {
+            value = value * 2 + Int((bytes[offset / 8] >> (7 - offset % 8)) & 1)
+            offset += 1
+        }
+        return value
+    }
+
+    mutating func unsignedGolomb() throws -> Int {
+        var zeros = 0
+        while try read(1) == 0 {
+            zeros += 1
+            guard zeros <= 16 else { throw VideoCodecError.invalidFrame }
+        }
+        return try (1 << zeros) - 1 + read(zeros)
+    }
+}
+
+/// Inspect the first VCL NAL of the picture, skipping HEVC length prefixes and non-VCL units.
 private func firstSlice(in sample: CMSampleBuffer) throws -> Slice {
     let format = try #require(CMSampleBufferGetFormatDescription(sample))
     var prefix: Int32 = 0
     try #require(
-        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
             format, parameterSetIndex: 0,
             parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: nil,
             nalUnitHeaderLengthOut: &prefix) == noErr)
@@ -132,23 +170,32 @@ private func firstSlice(in sample: CMSampleBuffer) throws -> Slice {
         let length = bytes[offset..<offset + Int(prefix)].reduce(0) { ($0 << 8) | Int($1) }
         offset += Int(prefix)
         try #require(length > 0 && length <= bytes.count - offset)
-        let header = bytes[offset]
-        if header & 31 == 1 || header & 31 == 5 {
-            try #require(length >= 2)
-            // first_mb_in_slice is zero for the first slice (one leading 1 bit).
-            // The following unsigned Exp-Golomb code is slice_type, in the range 0...9.
-            let fields = Int(bytes[offset + 1])
-            try #require(fields & 0x80 != 0)
-            let code = fields & 0x7f
-            try #require(code != 0)
-            let zeros = UInt8(code << 1).leadingZeroBitCount
-            try #require(zeros <= 3)
-            let suffix = (code >> (6 - 2 * zeros)) & ((1 << zeros) - 1)
-            let sliceType = (1 << zeros) - 1 + suffix
-            try #require(sliceType <= 9)
-            return Slice(
-                isIDR: header & 31 == 5, isReference: header & 0x60 != 0,
-                isPredictive: sliceType % 5 == 0)
+        let type = (bytes[offset] >> 1) & 0x3f
+        if type <= 31 {
+            try #require(length >= 3)
+            let irap = (16...23).contains(type)
+            var pointer: UnsafePointer<UInt8>?
+            var size = 0
+            try #require(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                format, parameterSetIndex: 2, parameterSetPointerOut: &pointer,
+                parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr)
+            let pps = try #require(pointer)
+            try #require(size > 2)
+            var ppsBits = HeaderBits(UnsafeBufferPointer(start: pps + 2, count: size - 2))
+            let ppsID = try ppsBits.unsignedGolomb()
+            _ = try ppsBits.unsignedGolomb()
+            _ = try ppsBits.read(2)
+            let extra = try ppsBits.read(3)
+            var slice = HeaderBits(bytes[(offset + 2)..<(offset + length)])
+            let firstSegment = try slice.read(1)
+            try #require(firstSegment == 1)
+            if irap { _ = try slice.read(1) }
+            let slicePPS = try slice.unsignedGolomb()
+            try #require(slicePPS == ppsID)
+            _ = try slice.read(extra)
+            let predictive = try slice.unsignedGolomb() == 1
+            return Slice(isIDR: type == 19 || type == 20, isReference: irap || type % 2 == 1,
+                isPredictive: predictive)
         }
         offset += length
     }

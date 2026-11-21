@@ -33,7 +33,7 @@ enum VideoMessage: UInt8 {
 }
 
 /// Big-endian v1 frame header: flags, frame ID, most recent IDR ID, PTS and duration
-/// (each value + timescale), optional LTR token, then AVC configuration on IDR and AVCC bytes.
+/// (each value + timescale), optional LTR token, then VPS, SPS and PPS on IDR and length-prefixed HEVC NAL units.
 struct VideoPacket {
     enum Kind: UInt8 { case predicted, idr, ltrRefresh }
     let kind: Kind
@@ -66,10 +66,10 @@ struct VideoPacket {
                 throw PacketError.invalid
             }
             var length: Int32 = 0
-            for index in 0..<2 {
+            for index in 0..<3 {
                 var pointer: UnsafePointer<UInt8>?
                 var size = 0
-                let status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                let status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
                     format,
                     parameterSetIndex: index, parameterSetPointerOut: &pointer,
                     parameterSetSizeOut: &size, parameterSetCountOut: nil,
@@ -117,26 +117,28 @@ struct VideoPacket {
         token =
             flags & 0x80 == 0 ? nil : LongTermReferenceToken(rawValue: try data.take(Int64.self))
         if kind == .idr {
-            let spsSize = try data.take(UInt16.self)
-            let sps = try data.takeBytes(Int(spsSize))
-            let ppsSize = try data.take(UInt16.self)
-            let pps = try data.takeBytes(Int(ppsSize))
-            let length = try data.take(UInt8.self)
-            guard spsSize > 0, ppsSize > 0, [1, 2, 4].contains(length) else {
-                throw PacketError.invalid
-            }
-            var description: CMFormatDescription?
-            let status = sps.withUnsafeBytes { s in
-                pps.withUnsafeBytes { p in
-                    CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                        allocator: nil, parameterSetCount: 2,
-                        parameterSetPointers: [
-                            s.bindMemory(to: UInt8.self).baseAddress!,
-                            p.bindMemory(to: UInt8.self).baseAddress!,
-                        ],
-                        parameterSetSizes: [s.count, p.count], nalUnitHeaderLength: Int32(length),
-                        formatDescriptionOut: &description)
+            // Offsets refer to the original message so all parameter pointers share one lifetime.
+            var offsets: [Int] = []
+            var sizes: [Int] = []
+            for type in 32...34 {
+                let size = Int(try data.take(UInt16.self))
+                offsets.append(message.count - data.count)
+                let parameter = try data.takeBytes(size)
+                guard size >= 2, (parameter[parameter.startIndex] >> 1) & 0x3f == type else {
+                    throw PacketError.invalid
                 }
+                sizes.append(size)
+            }
+            let length = try data.take(UInt8.self)
+            guard [1, 2, 4].contains(length) else { throw PacketError.invalid }
+            var description: CMFormatDescription?
+            let status = message.withUnsafeBytes { buffer in
+                let base = buffer.bindMemory(to: UInt8.self).baseAddress!
+                return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    allocator: nil, parameterSetCount: sizes.count,
+                    parameterSetPointers: offsets.map { base.advanced(by: $0) },
+                    parameterSetSizes: sizes, nalUnitHeaderLength: Int32(length),
+                    extensions: nil, formatDescriptionOut: &description)
             }
             guard status == noErr, let description else { throw PacketError.status(status) }
             format = description

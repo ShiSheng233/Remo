@@ -1,7 +1,7 @@
 import Foundation
 import VideoToolbox
 
-/// A low-latency H.264 encoder. Submit frames in increasing presentation-time order.
+/// A low-latency HEVC encoder. Submit frames in increasing presentation-time order.
 public final class VideoEncoder {
     public enum Refresh {
         case none
@@ -28,7 +28,7 @@ public final class VideoEncoder {
             [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true] as CFDictionary
         try check(
             VTCompressionSessionCreate(
-                allocator: nil, width: w, height: h, codecType: kCMVideoCodecType_H264,
+                allocator: nil, width: w, height: h, codecType: kCMVideoCodecType_HEVC,
                 encoderSpecification: specification, imageBufferAttributes: nil,
                 compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
                 compressionSessionOut: &encoder), "create encoder")
@@ -60,7 +60,7 @@ public final class VideoEncoder {
                 value: bitRate as CFNumber), "set encoder bit rate")
     }
 
-    /// Returns one compressed access unit with its timing and H.264 format description.
+    /// Returns one compressed access unit with its timing and HEVC format description.
     /// Keep the input pixels unchanged until this call completes.
     public nonisolated(nonsending) func encode(
         _ pixels: CVPixelBuffer, presentationTime: CMTime, duration: CMTime = .invalid,

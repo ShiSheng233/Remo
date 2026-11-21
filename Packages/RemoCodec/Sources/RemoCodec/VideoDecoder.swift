@@ -7,12 +7,12 @@ public struct DecodedVideoFrame {
     public let duration: CMTime
 }
 
-/// Create a decoder from the stream's H.264 format description and start at a keyframe.
+/// Create a decoder from the stream's HEVC format description and start at a keyframe.
 public final class VideoDecoder {
     private let session: VTDecompressionSession
 
     public init(format: CMVideoFormatDescription) throws {
-        guard CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_H264 else {
+        guard CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC else {
             throw VideoCodecError.invalidConfiguration
         }
         let attributes =
