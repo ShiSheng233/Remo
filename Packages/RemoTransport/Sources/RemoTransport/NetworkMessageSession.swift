@@ -150,6 +150,18 @@ public final class NetworkMessageSession {
         }
     }
 
+    /// Called on the owning actor when an ACK newly confirms a transmitted data packet.
+    public var onDeliveryConfirmed: (() -> Void)? {
+        get {
+            owner.preconditionIsolated()
+            return transport.onDeliveryConfirmed
+        }
+        set {
+            owner.preconditionIsolated()
+            transport.onDeliveryConfirmed = newValue
+        }
+    }
+
     public var dataSendIdleTime: TimeInterval {
         owner.preconditionIsolated()
         return transport.dataSendIdleTime

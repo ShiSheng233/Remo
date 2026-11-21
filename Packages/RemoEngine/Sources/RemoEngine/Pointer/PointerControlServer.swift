@@ -44,15 +44,16 @@ final class PointerControlServer {
         return message
     }
 
-    func receive(_ bytes: Data, on channel: MessageTransport.Channel, from peer: UUID) {
-        guard owner == peer, let input = try? PointerMessage(decoding: bytes) else { return }
+    @discardableResult
+    func receive(_ bytes: Data, on channel: MessageTransport.Channel, from peer: UUID) -> Bool {
+        guard owner == peer, let input = try? PointerMessage(decoding: bytes) else { return false }
         switch (channel, input) {
         case let (.unreliable, .move(sequence, afterButton, position)):
             receiveMove(Move(sequence: sequence, afterButton: afterButton, position: position))
         case let (.unreliable, .scroll(lines)):
             emit(.scroll(lines: lines))
         case let (.reliable, .button(sequence, action, position)):
-            guard sequence > latestPosition else { return }
+            guard sequence > latestPosition else { return true }
             latestButton = sequence
             latestPosition = sequence
             switch action {
@@ -76,8 +77,9 @@ final class PointerControlServer {
                 self.pendingMove = nil
                 receiveMove(pendingMove)
             }
-        default: break
+        default: return false
         }
+        return true
     }
 
     private func receiveMove(_ move: Move) {

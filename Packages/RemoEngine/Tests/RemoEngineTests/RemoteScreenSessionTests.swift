@@ -7,6 +7,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Network
+import RemoTransport
 import Testing
 
 @testable import RemoEngine
@@ -116,6 +117,41 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     #expect(disconnects.map(\.reason) == ["client left"])
     #expect(disconnects.first?.failed == false)
 
+    server.stop()
+    try await listening.value
+}
+
+@Test @MainActor func deliveryAcksAloneKeepClientAliveUntilSilent() async throws {
+    var port: UInt16?
+    var reason: String?
+    let server = try await RemoteScreenServer(
+        configuration: .init(source: .custom { SteppingSource(delay: .seconds(30)) })
+    ) { event in
+        switch event {
+        case .listening(let value): port = value
+        case .clientDisconnected(_, let value, _): reason = value
+        default: break
+        }
+    }
+    let listening = Task { try await server.listen(on: 0) }
+    defer { server.stop() }
+    while port == nil { try await Task.sleep(for: .milliseconds(10)) }
+
+    let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .init(rawValue: port!)!)
+    var controls = 0
+    let client = try await NetworkMessageSession(connection: NWConnection(to: endpoint, using: .udp)) {
+        _, data in
+        if (try? ControlMessage(decoding: data)) != nil { controls += 1 }
+    } closeHandler: { _ in }
+    try client.send(MessageKind.screenHello.encoded, mode: .reliable)
+    try await Task.sleep(for: .seconds(5))
+    #expect(reason == nil)
+    #expect(controls >= 4)
+    client.cancel()
+    try await Task.sleep(for: .seconds(2))
+    #expect(reason == nil)
+    for _ in 0..<40 where reason == nil { try await Task.sleep(for: .milliseconds(100)) }
+    #expect(reason == "client timed out")
     server.stop()
     try await listening.value
 }

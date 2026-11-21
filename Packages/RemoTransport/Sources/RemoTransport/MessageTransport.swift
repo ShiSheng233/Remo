@@ -85,6 +85,7 @@ public final class MessageTransport {
     private let clock: () -> TimeInterval
     private let dataHandler: (Channel, Data) -> Void
     private let ioHandler: (IORequest) -> Bool
+    var onDeliveryConfirmed: (() -> Void)?
     private var receiver = Receiver()
     private var r: [UInt32: Message] = [:]
     private var u: [UInt32: Message] = [:]
@@ -338,6 +339,7 @@ public final class MessageTransport {
     }
 
     private func acknowledge(_ largest: UInt32, _ bits: UInt64, _ now: TimeInterval) {
+        var newDelivery = false
         var confirmed: Set<Wire.Fragment> = []
         var sample: TimeInterval?
         for offset in 0..<64 where bits & (UInt64(1) << offset) != 0 {
@@ -352,6 +354,7 @@ public final class MessageTransport {
             let slot = Int(number) % deliveryRecords.count
             if let record = deliveryRecords[slot], record.number == number {
                 deliveryRecords[slot] = nil
+                newDelivery = true
                 let elapsed = max(0, now - record.sent)
                 if elapsed <= 2 {
                     acknowledgedBytes += record.bytes
@@ -362,6 +365,7 @@ public final class MessageTransport {
             guard let attempt = attempts[number] else { continue }
             confirmed.insert(attempt.key)
         }
+        if newDelivery || !confirmed.isEmpty { onDeliveryConfirmed?() }
         if let sample {
             if let old = rtt {
                 variation = variation * 0.75 + abs(old - sample) * 0.25

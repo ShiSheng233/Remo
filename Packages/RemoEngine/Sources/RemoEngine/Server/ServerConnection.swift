@@ -111,6 +111,9 @@ final class ServerConnection {
         self.setup = nil
 
         if let session, !stopping {
+            session.onDeliveryConfirmed = { [weak self] in
+                self?.lastSeen = .now
+            }
             lastSeen = .now
             lastReport = lastSeen
             trace.write(peer, "server ready")
@@ -175,9 +178,17 @@ final class ServerConnection {
     }
 
     private func receive(_ channel: MessageTransport.Channel, _ bytes: Data) {
-        guard !stopping, video?.receive(channel, bytes) != true, let first = bytes.first,
+        guard !stopping, let first = bytes.first,
             let kind = MessageKind(rawValue: first)
         else { return }
+        if video?.receive(channel, bytes) == true {
+            switch kind {
+            case .videoAcknowledgement, .videoRefresh, .keyFrameRequest, .videoRecoveryRequest, .keyFrameProgress:
+                if active && !stopping { lastSeen = .now }
+            default: break
+            }
+            return
+        }
         switch (channel, kind) {
         case (.reliable, .hello), (.reliable, .screenHello):
             guard bytes.count == 1 else { return }
@@ -196,6 +207,7 @@ final class ServerConnection {
         case (.reliable, .goodbye) where bytes.count == 1:
             stop("client left", failed: false)
         case (.reliable, .pointerHello) where active && bytes.count == 1:
+            lastSeen = .now
             guard let pointer = context.pointer, let session, let ready = pointer.begin(for: pointerPeer)
             else { return }
             do {
@@ -204,8 +216,7 @@ final class ServerConnection {
                 pointer.end(for: pointerPeer)
             }
         case (_, .pointerInput) where active:
-            context.pointer?.receive(bytes, on: channel, from: pointerPeer)
-            return
+            guard context.pointer?.receive(bytes, on: channel, from: pointerPeer) == true else { return }
         default: return
         }
         lastSeen = .now

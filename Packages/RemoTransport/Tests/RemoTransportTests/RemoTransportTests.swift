@@ -90,6 +90,23 @@ private func packet(
     #expect(port.packets.last == packet(2, 1, 0xab))
 }
 
+@Test func onlyFreshDeliveryConfirmationsSignalPeerActivity() {
+    let port = Port(Clock())
+    var confirmations = 0
+    port.endpoint.onDeliveryConfirmed = { confirmations += 1 }
+    port.endpoint.send(Data([1]), mode: .unreliable(retryBudget: 0))
+    port.endpoint.send(Data([2]), mode: .unreliable(retryBudget: 0))
+    port.advance(to: 3)
+    port.endpoint.handleEvent(.datagram(Wire.ack(3, 1)))
+    #expect(confirmations == 0)
+    port.endpoint.handleEvent(.datagram(Wire.ack(2, 1)))
+    port.endpoint.handleEvent(.datagram(Wire.ack(2, 1)))
+    #expect(confirmations == 1)
+    port.endpoint.handleEvent(.datagram(Wire.ack(2, 3)))
+    port.endpoint.handleEvent(.datagram(Wire.ack(1, 1)))
+    #expect(confirmations == 2)
+}
+
 @Test func unorderedFragmentRecovery() {
     let clock = Clock()
     let a = Port(clock, mtu: 64)

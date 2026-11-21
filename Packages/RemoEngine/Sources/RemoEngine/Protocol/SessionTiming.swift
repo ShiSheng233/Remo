@@ -7,8 +7,8 @@
 enum SessionTiming {
     /// The client keeps the session alive at this interval.
     static let heartbeatInterval = Duration.milliseconds(400)
-    /// The server drops a client after missing about five heartbeats.
-    static let clientTimeout = Duration.seconds(2)
+    /// The server drops a client after this much silence from messages and delivery confirmations.
+    static let clientTimeout = Duration.seconds(4)
     /// The server sends a disposable control after this much outbound data silence.
     static let controlInterval = Duration.seconds(1)
     /// The client gives up after this much server silence.
