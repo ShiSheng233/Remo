@@ -3,6 +3,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 /// The remote screen with system chrome hidden and a compact control pill that fades while streaming.
 struct PlayerView: View {
@@ -43,6 +44,10 @@ struct PlayerView: View {
         }
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
+        // Watching or driving the remote screen doesn’t touch the phone’s own screen often enough
+        // to keep it awake, so auto-lock is off for as long as the player is up.
+        .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+        .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
         .task(id: player.phase) {
             withAnimation { controlsDimmed = false }
             guard player.phase == .streaming, !voiceOver else { return }
