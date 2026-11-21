@@ -1,6 +1,6 @@
 import CoreMedia
 import CoreVideo
-import RemoCodec
+@testable import RemoCodec
 import Testing
 
 private let width = 320
@@ -312,4 +312,71 @@ func recoveryAfterLostReference(acknowledge: Bool) async throws {
     #expect(sizes[1] > 0)
     #expect(sizes[1] * 2 < sizes[0])
     #expect(sizes[1] * 2 < sizes[2])
+}
+
+@Test func predictedFrameQPFloorAllowsKeyFrameRefresh() async throws {
+    guard #available(macOS 13.0, iOS 16.0, *) else { return }
+    let encoder = try VideoEncoder(
+        width: width, height: height, framesPerSecond: 30, bitRate: 1_000_000)
+    let duration = CMTime(value: 1, timescale: 30)
+    for index in 0..<4 {
+        let pixels = try makePixels()
+        try fill(pixels, index: index)
+        let sample = try await encoder.encode(
+            pixels, presentationTime: CMTime(value: Int64(index), timescale: 30),
+            duration: duration, forceKeyFrame: index == 2)
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
+            as? [[CFString: Any]]
+        let predicted = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
+        #expect(predicted == (index == 1 || index == 3))
+    }
+}
+
+@Test func motionFloorActivatesOnChangeAndReleasesAfterQuietPeriod() throws {
+    let pixels = try makePixels()
+    var detector = FrameChangeDetector()
+    func moving(at time: Double) -> Bool { detector.isMoving(pixels, at: time) }
+    try fill(pixels, index: 0)
+    #expect(!moving(at: 0))
+    try #require(CVPixelBufferLockBaseAddress(pixels, []) == kCVReturnSuccess)
+    let base = CVPixelBufferGetBaseAddressOfPlane(pixels, 0)!
+    let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0)
+    for y in 0..<12 {
+        memset(base + y * stride, 200, 12)
+    }
+    CVPixelBufferUnlockBaseAddress(pixels, [])
+    #expect(!moving(at: 1))
+    try fill(pixels, index: 5)
+    #expect(moving(at: 2))
+    #expect(moving(at: 2.08))
+    try fill(pixels, index: 10)
+    #expect(moving(at: 2.10))
+    #expect(moving(at: 2.18))
+    #expect(!moving(at: 2.23))
+    try fill(pixels, index: 0)
+    #expect(moving(at: 3))
+}
+
+@Test func dynamicQPResumesMotionAfterSettling() async throws {
+    guard #available(macOS 13.0, iOS 16.0, *) else { return }
+    let encoder = try VideoEncoder(
+        width: width, height: height, framesPerSecond: 30, bitRate: 1_000_000)
+    var decoder: VideoDecoder?
+    for (tick, position) in [(0, 0), (1, 5), (6, 5), (22, 5), (23, 5), (24, 10)] {
+        let pixels = try makePixels()
+        try fill(pixels, index: position)
+        let pts = CMTime(value: Int64(tick), timescale: 30)
+        let sample = try await encoder.encode(
+            pixels, presentationTime: pts, duration: CMTime(value: 1, timescale: 30))
+        if decoder == nil {
+            let format = try #require(CMSampleBufferGetFormatDescription(sample))
+            decoder = try VideoDecoder(format: format)
+        } else {
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
+                as? [[CFString: Any]]
+            #expect(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool == true)
+        }
+        let frame = try await #require(decoder).decode(sample)
+        #expect(frame.presentationTime == pts)
+    }
 }

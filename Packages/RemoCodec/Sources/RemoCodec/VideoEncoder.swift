@@ -10,6 +10,10 @@ public final class VideoEncoder {
         case recover
     }
 
+    private var changeDetector = FrameChangeDetector()
+    private let defaultMinimumQP: Int
+    private var appliedMinimumQP: Int?
+    private var hasEncodedFrame = false
     private let longTermReferences: Bool
     private let session: VTCompressionSession
     private let width: Int
@@ -48,6 +52,21 @@ public final class VideoEncoder {
             VTSessionSetProperties(encoder, propertyDictionary: properties as CFDictionary),
             "configure encoder")
         try check(VTCompressionSessionPrepareToEncodeFrames(encoder), "prepare encoder")
+        // A negative initial value denotes automatic control. Restore a valid floor
+        // explicitly when motion settles so the encoder can refine fine detail.
+        var floor = 0
+        if #available(macOS 13.0, iOS 16.0, *) {
+            var value: Unmanaged<CFTypeRef>?
+            if VTSessionCopyProperty(
+                encoder, key: kVTCompressionPropertyKey_MinAllowedFrameQP,
+                allocator: nil, valueOut: &value) == noErr,
+                let number = value?.takeRetainedValue() as? NSNumber
+            {
+                floor = max(0, number.intValue)
+                appliedMinimumQP = floor
+            }
+        }
+        defaultMinimumQP = floor
     }
 
     deinit { VTCompressionSessionInvalidate(session) }
@@ -98,7 +117,22 @@ public final class VideoEncoder {
                 NSNumber(value: $0.rawValue)
             }
         }
-        return try await withCheckedThrowingContinuation { continuation in
+        if #available(macOS 13.0, iOS 16.0, *), let appliedMinimumQP {
+            let independent = options[kVTEncodeFrameOptionKey_ForceKeyFrame] != nil || !hasEncodedFrame
+            let applyFloor = changeDetector.isMoving(pixels, at: presentationTime.seconds)
+            let minimum = independent || !applyFloor ? defaultMinimumQP : max(34, defaultMinimumQP)
+            if minimum != appliedMinimumQP {
+                let status = VTSessionSetProperty(
+                    session, key: kVTCompressionPropertyKey_MinAllowedFrameQP, value: minimum as CFNumber)
+                if status == kVTPropertyNotSupportedErr || status == kVTPropertyReadOnlyErr {
+                    self.appliedMinimumQP = nil
+                } else {
+                    try check(status, "set minimum predicted frame QP")
+                    self.appliedMinimumQP = minimum
+                }
+            }
+        }
+        let sample: CMSampleBuffer = try await withCheckedThrowingContinuation { continuation in
             let status = VTCompressionSessionEncodeFrame(
                 session, imageBuffer: pixels,
                 presentationTimeStamp: presentationTime, duration: duration,
@@ -122,5 +156,7 @@ public final class VideoEncoder {
                         operation: "submit to encoder", status: status))
             }
         }
+        hasEncodedFrame = true
+        return sample
     }
 }
