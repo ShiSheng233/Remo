@@ -4,7 +4,10 @@
 //
 
 import CoreGraphics
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import Foundation
+import ImageIO
 import Network
 import Observation
 import RemoCodec
@@ -37,9 +40,16 @@ final class StreamPlayer {
     @ObservationIgnored private var lastSeen: TimeInterval = 0
     @ObservationIgnored private var lastFrame: TimeInterval = 0
     @ObservationIgnored private var receivedControl = false
+    @ObservationIgnored private var lastPixels: CVPixelBuffer?
+    @ObservationIgnored private var onFinalFrame: ((Data) -> Void)?
 
-    func connect(to endpoint: NWEndpoint, wireGuard: WireGuardConfiguration? = nil) {
+    /// Starts a session; `onFinalFrame` receives a JPEG of the last frame shown once it ends.
+    func connect(
+        to endpoint: NWEndpoint, wireGuard: WireGuardConfiguration? = nil,
+        onFinalFrame: ((Data) -> Void)? = nil
+    ) {
         guard task == nil else { return }
+        self.onFinalFrame = onFinalFrame
         surface = VideoSurface()
         phase = .connecting
         task = Task { await run(endpoint, wireGuard: wireGuard) }
@@ -69,6 +79,13 @@ final class StreamPlayer {
                 try? session.send(Data([SessionMessage.goodbye.rawValue]), mode: .reliable)
                 session.cancel()
             }
+            if let pixels = lastPixels, let onFinalFrame {
+                Task {
+                    if let jpeg = await Self.thumbnail(of: pixels) { onFinalFrame(jpeg) }
+                }
+            }
+            lastPixels = nil
+            onFinalFrame = nil
             surface = nil
             phase = failure.map(Phase.failed) ?? .idle
             failure = nil
@@ -235,10 +252,28 @@ final class StreamPlayer {
         lastFrame = ProcessInfo.processInfo.systemUptime
         lastSeen = lastFrame
         do {
-            if try surface.present(frame), phase == .waitingForVideo { phase = .streaming }
+            guard try surface.present(frame) else { return }
+            lastPixels = frame.pixels
+            if phase == .waitingForVideo { phase = .streaming }
         } catch {
             fail("Video display failed. \(error.localizedDescription)")
         }
+    }
+
+    @concurrent
+    private nonisolated static func thumbnail(of pixels: CVPixelBuffer) async -> Data? {
+        let image = CIImage(cvPixelBuffer: pixels)
+        let longest = max(image.extent.width, image.extent.height)
+        guard longest > 0, let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let scale = CIFilter.lanczosScaleTransform()
+        scale.inputImage = image
+        scale.scale = Float(min(1, 1280 / longest))
+        scale.aspectRatio = 1
+        guard let output = scale.outputImage else { return nil }
+        let options = [
+            CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.8
+        ]
+        return CIContext().jpegRepresentation(of: output, colorSpace: colorSpace, options: options)
     }
 
     private func fail(_ message: String) {

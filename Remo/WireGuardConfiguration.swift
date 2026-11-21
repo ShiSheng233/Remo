@@ -4,7 +4,6 @@
 
 import Foundation
 import Network
-import Security
 
 nonisolated struct WireGuardConfiguration: Sendable {
     let endpoint: NWEndpoint
@@ -40,32 +39,5 @@ nonisolated struct WireGuardConfiguration: Sendable {
             data.count == 32
         else { return nil }
         return Array(data)
-    }
-}
-
-nonisolated enum WireGuardKeychain {
-    private static var query: [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "me.cyandev.Remo.WireGuard",
-        ]
-    }
-
-    static func load() -> Data? {
-        var item: CFTypeRef?
-        var request = query
-        request[kSecReturnData as String] = true
-        guard SecItemCopyMatching(request as CFDictionary, &item) == errSecSuccess else { return nil }
-        return item as? Data
-    }
-
-    static func save(_ data: Data) -> Bool {
-        let attributes = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status != errSecItemNotFound { return status == errSecSuccess }
-        var item = query
-        item[kSecValueData as String] = data
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
     }
 }

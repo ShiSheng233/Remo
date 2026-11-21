@@ -1,131 +1,154 @@
 //
 //  Created by Cyandev on 11/20/26.
 //  Copyright (c) 2026 Cyandev. All rights reserved.
-// 
+//
 
 import SwiftUI
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @State private var store = ServerStore()
     @State private var player = StreamPlayer()
-    @State private var settings = ServerConnectionSettings()
-    @State private var settingsLoaded = false
-    @State private var persistenceError = false
+    @State private var selection: UUID?
+    @State private var newServer: RemoteServer?
+    @State private var editRequest: UUID?
+    @State private var pendingDeletion: RemoteServer?
+    @State private var activeServer: RemoteServer?
+    @State private var deletionFailed = false
+    // The list is the home screen, so keep it beside the detail on the unfolded display.
+    @State private var columnVisibility = NavigationSplitViewVisibility.all
 
     var body: some View {
-        NavigationStack {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            ServerListView(
+                store: store, selection: $selection, onAdd: addServer,
+                onEdit: { server in
+                    selection = server.id
+                    editRequest = server.id
+                },
+                onDelete: { pendingDeletion = $0 })
+        } detail: {
+            detail
+        }
+        .navigationSplitViewStyle(.balanced)
+        .fullScreenCover(isPresented: playerPresented) {
             if let surface = player.surface {
-                playerView(surface)
+                PlayerView(player: player, surface: surface, title: activeServer?.displayName ?? "")
             } else {
-                connectionForm
+                Color.black.ignoresSafeArea()
             }
         }
+        .confirmationDialog(
+            "Delete “\(pendingDeletion?.displayName ?? "")”?",
+            isPresented: Binding(
+                get: { pendingDeletion != nil }, set: { if !$0 { pendingDeletion = nil } }),
+            titleVisibility: .visible, presenting: pendingDeletion
+        ) { server in
+            Button("Delete Server", role: .destructive) { delete(server) }
+        } message: { _ in
+            Text("Its connection settings and preview will be removed from this device.")
+        }
+        .alert("Couldn’t delete the server.", isPresented: $deletionFailed) {}
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { player.disconnect() }
         }
         .onAppear {
-            guard !settingsLoaded else { return }
-            settings = ServerConnectionSettings.load()
-            settingsLoaded = true
+            store.load()
         }
         .onDisappear { player.disconnect() }
     }
 
-    private var connectionForm: some View {
-        Form {
-            Section("Server") {
-                TextField(
-                    settings.useWireGuard ? "Server tunnel IPv4 address" : "Hostname or IP address",
-                    text: settings.useWireGuard ? $settings.wireGuard.server.host : $settings.direct.host)
-                    .textContentType(.URL)
-                    .keyboardType(.URL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.go)
-                    .onSubmit(connect)
-
-                LabeledContent("UDP port") {
-                    TextField(
-                        "UDP port",
-                        text: settings.useWireGuard ? $settings.wireGuard.server.port : $settings.direct.port,
-                        prompt: Text("7711"))
-                        .keyboardType(.numberPad)
-                        .multilineTextAlignment(.trailing)
-                }
-            }
-
-            Section("Connection") {
-                Toggle("WireGuard", isOn: $settings.useWireGuard)
-            }
-
-            if settings.useWireGuard {
-                Section("WireGuard peer") {
-                    TextField("Endpoint (host:port)", text: $settings.wireGuard.endpoint)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    TextField("Client tunnel IPv4 address", text: $settings.wireGuard.localAddress)
-                        .keyboardType(.decimalPad)
-                    TextField("Peer public key", text: $settings.wireGuard.peerPublicKey)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    SecureField("Client private key", text: $settings.wireGuard.privateKey)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    SecureField("Preshared key (optional)", text: $settings.wireGuard.presharedKey)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                }
-            }
-
-            if persistenceError {
-                Text("Couldn’t save the connection settings.")
-                    .foregroundStyle(.red)
-            } else if case .failed(let message) = player.phase {
-                Text(message)
-                    .foregroundStyle(.red)
-            }
-
-            Button("Connect", action: connect)
-                .disabled(settings.useWireGuard ? settings.wireGuard.configuration == nil : settings.direct.endpoint == nil)
-        }
-        .navigationTitle("Remo")
-    }
-
-    private func playerView(_ surface: VideoSurface) -> some View {
-        ZStack {
-            VideoSurfaceView(surface: surface)
-                .accessibilityLabel("Remote video")
-            if player.phase == .streaming, player.mouseAvailable {
-                TrackpadView(onInput: player.handleTrackpad)
-            }
-            if player.phase == .connecting {
-                ProgressView("Connecting…")
-                    .tint(.white)
-                    .foregroundStyle(.white)
-            } else if player.phase == .waitingForVideo {
-                ProgressView("Waiting for video…")
-                    .tint(.white)
-                    .foregroundStyle(.white)
-            }
-        }
-        .ignoresSafeArea(.container, edges: .bottom)
-        .navigationTitle(settings.server.host)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Disconnect") { player.disconnect() }
-            }
+    @ViewBuilder private var detail: some View {
+        if let id = selection, let server = store.server(id) {
+            ServerDetailView(
+                server: server, thumbnail: store.thumbnails[id], isNew: false,
+                failure: activeServer?.id == id ? failure : nil, canConnect: player.surface == nil,
+                editRequest: $editRequest, onSave: store.save, onConnect: connect, onCancelNew: {},
+                onDelete: { pendingDeletion = $0 }
+            )
+            .id(id)
+        } else if let draft = newServer, selection == draft.id {
+            // Once saved, the server comes from the store and the branch above takes over.
+            ServerDetailView(
+                server: draft, thumbnail: nil, isNew: true, failure: nil, canConnect: false,
+                editRequest: $editRequest, onSave: store.save, onConnect: connect,
+                onCancelNew: {
+                    newServer = nil
+                    selection = nil
+                },
+                onDelete: { _ in })
+        } else if !store.servers.isEmpty {
+            ContentUnavailableView("Select a Server", systemImage: "display")
         }
     }
 
-    private func connect() {
-        guard let endpoint = settings.server.endpoint else { return }
-        let wireGuard = settings.useWireGuard ? settings.wireGuard.configuration : nil
-        guard !settings.useWireGuard || wireGuard != nil else { return }
-        persistenceError = !settings.saveConnection()
-        if !persistenceError {
-            player.connect(to: endpoint, wireGuard: wireGuard)
+    private var failure: String? {
+        if case .failed(let message) = player.phase { message } else { nil }
+    }
+
+    private var playerPresented: Binding<Bool> {
+        Binding(get: { player.surface != nil }, set: { if !$0 { player.disconnect() } })
+    }
+
+    private func addServer() {
+        let server = RemoteServer()
+        newServer = server
+        selection = server.id
+    }
+
+    private func connect(_ server: RemoteServer) {
+        guard let endpoint = server.address.endpoint else { return }
+        let wireGuard = server.useWireGuard ? server.wireGuard.configuration : nil
+        guard !server.useWireGuard || wireGuard != nil else { return }
+        activeServer = server
+        let id = server.id
+        player.connect(to: endpoint, wireGuard: wireGuard) { [store] frame in
+            store.recordSession(id, finalFrame: frame)
+        }
+    }
+
+    private func delete(_ server: RemoteServer) {
+        guard store.delete(server.id) else {
+            deletionFailed = true
+            return
+        }
+        if selection == server.id { selection = nil }
+    }
+}
+
+private struct PlayerView: View {
+    let player: StreamPlayer
+    let surface: VideoSurface
+    let title: String
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                VideoSurfaceView(surface: surface)
+                    .accessibilityLabel("Remote video")
+                if player.phase == .streaming, player.mouseAvailable {
+                    TrackpadView(onInput: player.handleTrackpad)
+                }
+                if player.phase == .connecting {
+                    ProgressView("Connecting…")
+                        .tint(.white)
+                        .foregroundStyle(.white)
+                } else if player.phase == .waitingForVideo {
+                    ProgressView("Waiting for video…")
+                        .tint(.white)
+                        .foregroundStyle(.white)
+                }
+            }
+            .background(.black)
+            .ignoresSafeArea(.container, edges: .bottom)
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Disconnect", systemImage: "xmark") { player.disconnect() }
+                        .labelStyle(.iconOnly)
+                }
+            }
         }
     }
 }
