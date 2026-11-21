@@ -40,18 +40,31 @@ fn wireguard_handshake_and_udp_datagrams() {
         assert!(!remo_wg_is_ready(client));
 
         let initiation = expect_bytes(remo_wg_handshake(client), RemoWireGuardOperation::Send);
-        let response = expect_bytes(
-            remo_wg_receive(server, initiation.as_ptr(), initiation.len()),
-            RemoWireGuardOperation::Send,
-        );
-        let confirmation = expect_bytes(
-            remo_wg_receive(client, response.as_ptr(), response.len()),
-            RemoWireGuardOperation::Send,
-        );
+        let received = remo_wg_receive(server, initiation.as_ptr(), initiation.len());
+        assert_eq!(CStr::from_ptr(received.receive_reason), c"controlHandshakeInit");
+        assert_eq!(received.index_event, RemoWireGuardIndexEvent::SessionEstablished);
+        let server_index = received.local_receiver_index;
+        let response = expect_bytes(received, RemoWireGuardOperation::Send);
+        let received = remo_wg_receive(client, response.as_ptr(), response.len());
+        assert_eq!(CStr::from_ptr(received.receive_reason), c"controlHandshakeResponse");
+        assert_eq!(received.index_event, RemoWireGuardIndexEvent::SessionEstablished);
+        let client_index = received.local_receiver_index;
+        assert_eq!(client_index.to_le_bytes(), initiation[4..8]);
+        assert_eq!(server_index.to_le_bytes(), response[4..8]);
+        let confirmation = expect_bytes(received, RemoWireGuardOperation::Send);
         assert!(remo_wg_is_ready(client));
         let keepalive = remo_wg_receive(server, confirmation.as_ptr(), confirmation.len());
         assert!(matches!(keepalive.operation, RemoWireGuardOperation::Idle));
+        assert_eq!(CStr::from_ptr(keepalive.receive_reason), c"controlKeepalive");
+        assert_eq!(keepalive.index_event, RemoWireGuardIndexEvent::DataAccepted);
+        assert_eq!(keepalive.local_receiver_index, server_index);
         assert!(remo_wg_is_ready(server));
+        let drain = remo_wg_receive(server, ptr::null(), 0);
+        assert!(drain.receive_reason.is_null());
+        let oversized = [0; MAX_WIRE + 1];
+        let rejected = remo_wg_receive(server, oversized.as_ptr(), oversized.len());
+        assert_eq!(CStr::from_ptr(rejected.receive_reason), c"outerOversize");
+
 
         for (sender, receiver, datagram) in [
             (client, server, vec![1, 2, 3]),
@@ -62,13 +75,23 @@ fn wireguard_handshake_and_udp_datagrams() {
                 RemoWireGuardOperation::Send,
             );
             assert_eq!((encrypted.len() - 32) % 16, 0);
-            let decrypted = expect_bytes(
-                remo_wg_receive(receiver, encrypted.as_ptr(), encrypted.len()),
-                RemoWireGuardOperation::Deliver,
-            );
+            let received = remo_wg_receive(receiver, encrypted.as_ptr(), encrypted.len());
+            let expected_index = if receiver == client { client_index } else { server_index };
+            assert_eq!(received.index_event, RemoWireGuardIndexEvent::DataAccepted);
+            assert_eq!(received.local_receiver_index, expected_index);
+            let decrypted = expect_bytes(received, RemoWireGuardOperation::Deliver);
             assert_eq!(decrypted, datagram);
             let replay = remo_wg_receive(receiver, encrypted.as_ptr(), encrypted.len());
             assert!(matches!(replay.operation, RemoWireGuardOperation::Idle));
+            assert_eq!(CStr::from_ptr(replay.receive_reason), c"wgDuplicateCounter");
+            assert_eq!(replay.index_event, RemoWireGuardIndexEvent::None);
+
+            let mut unknown = encrypted;
+            let missing_index = expected_index ^ 1;
+            unknown[4..8].copy_from_slice(&missing_index.to_le_bytes());
+            let missing = remo_wg_receive(receiver, unknown.as_ptr(), unknown.len());
+            assert_eq!(missing.index_event, RemoWireGuardIndexEvent::MissingSession);
+            assert_eq!(missing.local_receiver_index, missing_index);
         }
         remo_wg_free(client);
         remo_wg_free(server);
@@ -85,22 +108,22 @@ fn udp_checksums_and_address_filters() {
     };
     let mut packet = [0; MAX_INNER];
     let size = flow.encode(&[1, 2, 3], &mut packet);
-    assert_eq!(flow.decode(&packet[..size]), Some(&[1, 2, 3][..]));
+    assert_eq!(flow.decode(&packet[..size]), Ok(&[1, 2, 3][..]));
     assert_eq!(
         UdpFlow {
             destination_port: 7712,
             ..flow
         }
         .decode(&packet[..size]),
-        None
+        Err(c"innerDestinationPort")
     );
-    assert_eq!(flow.reversed().decode(&packet[..size]), None);
-    assert_eq!(flow.decode(&packet[..HEADERS + 2]), None);
+    assert_eq!(flow.reversed().decode(&packet[..size]), Err(c"innerSourceIp"));
+    assert_eq!(flow.decode(&packet[..HEADERS + 2]), Err(c"innerIpTruncated"));
 
     packet[HEADERS] ^= 1;
-    assert_eq!(flow.decode(&packet[..size]), None);
+    assert_eq!(flow.decode(&packet[..size]), Err(c"innerUdpChecksum"));
     packet[26..28].fill(0); // An IPv4 sender may omit the UDP checksum.
-    assert_eq!(flow.decode(&packet[..size]), Some(&[0, 2, 3][..]));
+    assert_eq!(flow.decode(&packet[..size]), Ok(&[0, 2, 3][..]));
     packet[8] ^= 1;
-    assert_eq!(flow.decode(&packet[..size]), None);
+    assert_eq!(flow.decode(&packet[..size]), Err(c"innerIpChecksum"));
 }

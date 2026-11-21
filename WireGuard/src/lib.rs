@@ -2,6 +2,8 @@
 
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use boringtun::noise::errors::WireGuardError;
+use std::ffi::{CStr, c_char};
 use std::ptr;
 use std::slice;
 
@@ -60,32 +62,56 @@ impl UdpFlow {
         padded
     }
 
-    fn decode(self, packet: &[u8]) -> Option<&[u8]> {
-        if packet.len() < HEADERS || packet[0] >> 4 != 4 || packet[9] != 17 {
-            return None;
+    fn decode(self, packet: &[u8]) -> Result<&[u8], &'static CStr> {
+        if packet.len() < HEADERS {
+            return Err(c"innerTooShort");
+        }
+        if packet[0] >> 4 != 4 {
+            return Err(c"innerIpVersion");
+        }
+        if packet[9] != 17 {
+            return Err(c"innerNotUdp");
         }
         let header_size = usize::from(packet[0] & 0x0f) * 4;
         let total_size = usize::from(read_u16(&packet[2..4]));
-        if header_size < IPV4_HEADER
-            || total_size < header_size + UDP_HEADER
-            || total_size > packet.len()
-            || read_u16(&packet[6..8]) & 0xbfff != 0
-            || packet[12..16] != self.source_ip
-            || packet[16..20] != self.destination_ip
-            || checksum(&[&packet[..header_size]]) != 0
-        {
-            return None;
+        if header_size < IPV4_HEADER {
+            return Err(c"innerIpHeaderLength");
+        }
+        if total_size < header_size + UDP_HEADER {
+            return Err(c"innerIpTotalTooSmall");
+        }
+        if total_size > packet.len() {
+            return Err(c"innerIpTruncated");
+        }
+        if read_u16(&packet[6..8]) & 0xbfff != 0 {
+            return Err(c"innerIpFlagsOrFragment");
+        }
+        if packet[12..16] != self.source_ip {
+            return Err(c"innerSourceIp");
+        }
+        if packet[16..20] != self.destination_ip {
+            return Err(c"innerDestinationIp");
+        }
+        if checksum(&[&packet[..header_size]]) != 0 {
+            return Err(c"innerIpChecksum");
         }
         let udp = &packet[header_size..total_size];
-        if read_u16(&udp[..2]) != self.source_port
-            || read_u16(&udp[2..4]) != self.destination_port
-            || usize::from(read_u16(&udp[4..6])) != udp.len()
-            || udp.len() > UDP_HEADER + MAX_DATAGRAM
-            || (read_u16(&udp[6..8]) != 0 && udp_checksum(self, udp) != 0)
-        {
-            return None;
+        if read_u16(&udp[..2]) != self.source_port {
+            return Err(c"innerSourcePort");
         }
-        Some(&udp[UDP_HEADER..])
+        if read_u16(&udp[2..4]) != self.destination_port {
+            return Err(c"innerDestinationPort");
+        }
+        if usize::from(read_u16(&udp[4..6])) != udp.len() {
+            return Err(c"innerUdpLength");
+        }
+        if udp.len() > UDP_HEADER + MAX_DATAGRAM {
+            return Err(c"innerUdpOversize");
+        }
+        if read_u16(&udp[6..8]) != 0 && udp_checksum(self, udp) != 0 {
+            return Err(c"innerUdpChecksum");
+        }
+        Ok(&udp[UDP_HEADER..])
     }
 }
 
@@ -137,8 +163,20 @@ pub enum RemoWireGuardOperation {
 }
 
 #[repr(C)]
+#[derive(Debug, PartialEq)]
+pub enum RemoWireGuardIndexEvent {
+    None,
+    SessionEstablished,
+    DataAccepted,
+    MissingSession,
+}
+
+#[repr(C)]
 pub struct RemoWireGuardResult {
     operation: RemoWireGuardOperation,
+    index_event: RemoWireGuardIndexEvent,
+    local_receiver_index: u32,
+    receive_reason: *const c_char,
     bytes: *const u8,
     length: usize,
 }
@@ -147,26 +185,27 @@ impl RemoWireGuardResult {
     fn idle() -> Self {
         Self {
             operation: RemoWireGuardOperation::Idle,
+            index_event: RemoWireGuardIndexEvent::None,
+            local_receiver_index: 0,
+            receive_reason: ptr::null(),
             bytes: ptr::null(),
             length: 0,
         }
     }
 
-    fn from_tunnel(result: TunnResult<'_>, inbound_flow: Option<UdpFlow>) -> Self {
-        let (operation, bytes) = match result {
-            TunnResult::WriteToNetwork(bytes) => (RemoWireGuardOperation::Send, &*bytes),
-            TunnResult::WriteToTunnelV4(packet, _) => {
-                let Some(datagram) = inbound_flow.and_then(|flow| flow.decode(packet)) else {
-                    return Self::idle();
-                };
-                (RemoWireGuardOperation::Deliver, datagram)
-            }
-            _ => return Self::idle(),
-        };
-        Self {
-            operation,
-            bytes: bytes.as_ptr(),
-            length: bytes.len(),
+    fn with_reason(mut self, reason: &'static CStr) -> Self {
+        self.receive_reason = reason.as_ptr();
+        self
+    }
+
+    fn output(operation: RemoWireGuardOperation, bytes: &[u8]) -> Self {
+        Self { operation, bytes: bytes.as_ptr(), length: bytes.len(), ..Self::idle() }
+    }
+
+    fn from_tunnel(result: TunnResult<'_>) -> Self {
+        match result {
+            TunnResult::WriteToNetwork(bytes) => Self::output(RemoWireGuardOperation::Send, bytes),
+            _ => Self::idle(),
         }
     }
 }
@@ -221,7 +260,6 @@ pub unsafe extern "C" fn remo_wg_handshake(state: *mut RemoWireGuard) -> RemoWir
         state
             .tunnel
             .format_handshake_initiation(&mut state.output, false),
-        None,
     )
 }
 
@@ -240,7 +278,7 @@ pub unsafe extern "C" fn remo_wg_is_ready(state: *const RemoWireGuard) -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn remo_wg_tick(state: *mut RemoWireGuard) -> RemoWireGuardResult {
     let state = unsafe { &mut *state };
-    RemoWireGuardResult::from_tunnel(state.tunnel.update_timers(&mut state.output), None)
+    RemoWireGuardResult::from_tunnel(state.tunnel.update_timers(&mut state.output))
 }
 
 /// # Safety
@@ -262,7 +300,6 @@ pub unsafe extern "C" fn remo_wg_send(
         state
             .tunnel
             .encapsulate(&state.inner[..length], &mut state.output),
-        None,
     )
 }
 
@@ -276,7 +313,7 @@ pub unsafe extern "C" fn remo_wg_receive(
     length: usize,
 ) -> RemoWireGuardResult {
     if length > MAX_WIRE {
-        return RemoWireGuardResult::idle();
+        return RemoWireGuardResult::idle().with_reason(c"outerOversize");
     }
     let state = unsafe { &mut *state };
     // An empty input drains packets queued by BoringTun during a handshake.
@@ -285,10 +322,75 @@ pub unsafe extern "C" fn remo_wg_receive(
     } else {
         unsafe { slice::from_raw_parts(bytes, length) }
     };
-    RemoWireGuardResult::from_tunnel(
-        state.tunnel.decapsulate(None, packet, &mut state.output),
-        Some(state.flow.reversed()),
-    )
+    let result = state.tunnel.decapsulate(None, packet, &mut state.output);
+    if packet.is_empty() {
+        return RemoWireGuardResult::from_tunnel(result);
+    }
+    // These headers have already been validated by BoringTun. A handshake response
+    // names the responder at offset 4 and the initiator at offset 8.
+    use RemoWireGuardIndexEvent as IndexEvent;
+    let index = match (&result, packet[0]) {
+        (TunnResult::WriteToNetwork(reply), 1) if reply.first() == Some(&2) =>
+            Some((IndexEvent::SessionEstablished, &reply[4..8])),
+        (TunnResult::WriteToNetwork(reply), 2) if reply.first() == Some(&4) =>
+            Some((IndexEvent::SessionEstablished, &packet[8..12])),
+        (TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) | TunnResult::Done, 4) =>
+            Some((IndexEvent::DataAccepted, &packet[4..8])),
+        (TunnResult::Err(WireGuardError::NoCurrentSession), 4) =>
+            Some((IndexEvent::MissingSession, &packet[4..8])),
+        _ => None,
+    }.map(|(event, bytes)| (event, u32::from_le_bytes(bytes.try_into().unwrap())));
+    let mut received = match result {
+        TunnResult::Err(error) => RemoWireGuardResult::idle().with_reason(error_name(error)),
+        TunnResult::WriteToTunnelV4(ip, _) => match state.flow.reversed().decode(ip) {
+            Ok(data) => RemoWireGuardResult::output(RemoWireGuardOperation::Deliver, data),
+            Err(reason) => RemoWireGuardResult::idle().with_reason(reason),
+        },
+        TunnResult::WriteToTunnelV6(_, _) => RemoWireGuardResult::idle().with_reason(c"innerIPv6"),
+        TunnResult::WriteToNetwork(bytes) => {
+            let reason: &CStr = match bytes.first() {
+                Some(3) => c"controlCookieChallenge",
+                _ => match packet[0] {
+                    1 => c"controlHandshakeInit",
+                    2 => c"controlHandshakeResponse",
+                    _ => c"controlReply",
+                },
+            };
+            RemoWireGuardResult::output(RemoWireGuardOperation::Send, bytes).with_reason(reason)
+        }
+        TunnResult::Done => RemoWireGuardResult::idle().with_reason(match packet[0] {
+            3 => c"controlCookieReply",
+            4 => c"controlKeepalive",
+            _ => c"controlDone",
+        }),
+    };
+    if let Some((event, index)) = index {
+        received.index_event = event;
+        received.local_receiver_index = index;
+    }
+    received
+}
+
+fn error_name(error: WireGuardError) -> &'static CStr {
+    match error {
+        WireGuardError::DestinationBufferTooSmall => c"wgDestinationBufferTooSmall",
+        WireGuardError::IncorrectPacketLength => c"wgIncorrectPacketLength",
+        WireGuardError::UnexpectedPacket => c"wgUnexpectedPacket",
+        WireGuardError::WrongPacketType => c"wgWrongPacketType",
+        WireGuardError::WrongIndex => c"wgWrongIndex",
+        WireGuardError::WrongKey => c"wgWrongKey",
+        WireGuardError::InvalidTai64nTimestamp => c"wgInvalidTai64nTimestamp",
+        WireGuardError::WrongTai64nTimestamp => c"wgWrongTai64nTimestamp",
+        WireGuardError::InvalidMac => c"wgInvalidMac",
+        WireGuardError::InvalidAeadTag => c"wgInvalidAeadTag",
+        WireGuardError::InvalidCounter => c"wgInvalidCounter",
+        WireGuardError::DuplicateCounter => c"wgDuplicateCounter",
+        WireGuardError::InvalidPacket => c"wgInvalidPacket",
+        WireGuardError::NoCurrentSession => c"wgNoCurrentSession",
+        WireGuardError::LockFailed => c"wgLockFailed",
+        WireGuardError::ConnectionExpired => c"wgConnectionExpired",
+        WireGuardError::UnderLoad => c"wgUnderLoad",
+    }
 }
 
 #[cfg(test)]

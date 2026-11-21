@@ -15,8 +15,19 @@ typedef enum {
     RemoWireGuardDeliver = 2,
 } RemoWireGuardOperation;
 
+typedef enum {
+    RemoWireGuardIndexNone = 0,
+    RemoWireGuardSessionEstablished,
+    RemoWireGuardDataAccepted,
+    RemoWireGuardMissingSession,
+} RemoWireGuardIndexEvent;
+
 typedef struct {
     RemoWireGuardOperation operation;
+    RemoWireGuardIndexEvent index_event;
+    uint32_t local_receiver_index;
+    // Static log label for external receive outcomes other than delivery.
+    const char * _Nullable receive_reason;
     // Borrowed until the next mutating call on this handle.
     const uint8_t * _Nullable bytes;
     size_t length;

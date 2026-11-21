@@ -53,7 +53,7 @@ final class StreamPlayer {
         log?.write("Remo \(version) connecting to \(endpoint)\(wireGuard == nil ? "" : " through WireGuard")")
         task = Task {
             let failure = await client.run(
-                wireGuard.map { .datagrams(WireGuardDatagramConnection($0)) } ?? .udp(endpoint))
+                wireGuard.map { .datagrams(WireGuardDatagramConnection($0, log: log)) } ?? .udp(endpoint))
             log?.write(failure.map { "ended: \($0)" } ?? "disconnected")
             log?.close()
             self.log = nil

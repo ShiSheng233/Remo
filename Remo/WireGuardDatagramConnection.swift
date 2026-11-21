@@ -9,6 +9,7 @@ import RemoTransport
 
 nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchecked Sendable {
     private let connection: NWConnection
+    private let log: SessionLog?
     private let tunnel: OpaquePointer
     private let queue = DispatchQueue(label: "Remo.WireGuard", qos: .userInitiated)
 
@@ -20,7 +21,15 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
     private var receiving = false
     private var wantsDatagram = false
 
-    init(_ configuration: WireGuardConfiguration) {
+    private var reportTimer: (any DispatchSourceTimer)?
+    private var outerRx = 0
+    private var deliveredRx = 0
+    private var lastSuccessfulDataIndex: UInt32?
+    private var loggedMissingSession = false
+    private var receiveReasons: [String: Int] = [:]
+
+    init(_ configuration: WireGuardConfiguration, log: SessionLog?) {
+        self.log = log
         connection = NWConnection(to: configuration.endpoint, using: .udp)
         let peer = configuration.peerPublicKey
         let local = Array(configuration.localAddress.rawValue)
@@ -39,6 +48,26 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
     func start(events: AsyncStream<ConnectionEvent>.Continuation) {
         queue.async { [self] in
             self.events = events
+            if let log {
+                let timer = DispatchSource.makeTimerSource(queue: queue)
+                timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
+                timer.setEventHandler { [weak self] in
+                    guard let self else { return }
+                    var line = "WireGuard outerUdpRx=\(self.outerRx) remoDatagramsRx=\(self.deliveredRx)"
+                    if let index = self.lastSuccessfulDataIndex {
+                        line += String(format: " lastSuccessfulDataReceiverIndex=0x%08X", index)
+                    }
+                    for (reason, count) in self.receiveReasons.sorted(by: { $0.key < $1.key }) {
+                        line += " \(reason)=\(count)"
+                    }
+                    log.write(line)
+                    self.receiveReasons.removeAll(keepingCapacity: true)
+                    self.outerRx = 0
+                    self.deliveredRx = 0
+                }
+                reportTimer = timer
+                timer.activate()
+            }
             self.connection.stateUpdateHandler = { [weak self] in self?.update($0) }
             self.connection.start(queue: self.queue)
         }
@@ -68,6 +97,8 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
 
     func cancel() {
         queue.async {
+            self.reportTimer?.cancel()
+            self.reportTimer = nil
             self.events = nil
             self.timer?.cancel()
             self.timer = nil
@@ -109,8 +140,13 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
                 events.yield(.failed(error))
                 return
             }
-            if complete, let data, !data.isEmpty {
-                self.process(data)
+            if complete, let data {
+                self.outerRx += 1
+                if data.isEmpty {
+                    self.receiveReasons["outerEmpty", default: 0] += 1
+                } else {
+                    self.process(data)
+                }
             }
             if complete, context?.isFinal == true {
                 events.yield(.received(nil, final: true))
@@ -124,9 +160,30 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
         let result = data.withUnsafeBytes { bytes in
             remo_wg_receive(tunnel, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count)
         }
+        switch result.index_event {
+        case RemoWireGuardSessionEstablished:
+            log?.write(String(format: "WireGuard session established localReceiverIndex=0x%08X", result.local_receiver_index))
+        case RemoWireGuardDataAccepted:
+            lastSuccessfulDataIndex = result.local_receiver_index
+        case RemoWireGuardMissingSession where !loggedMissingSession:
+            loggedMissingSession = true
+            let previous = lastSuccessfulDataIndex.map { String(format: "0x%08X", $0) } ?? "none"
+            log?.write(String(format: "WireGuard first NoCurrentSession receiverIndex=0x%08X", result.local_receiver_index)
+                + " lastSuccessfulDataReceiverIndex=\(previous)")
+        default: break
+        }
+        if let reason = result.receive_reason {
+            receiveReasons[String(cString: reason), default: 0] += 1
+        }
         if result.operation == RemoWireGuardDeliver, wantsDatagram, let bytes = result.bytes {
             wantsDatagram = false
-            events?.yield(.received(Data(bytes: bytes, count: result.length)))
+            if case .enqueued = events?.yield(.received(Data(bytes: bytes, count: result.length))) {
+                deliveredRx += 1
+            } else {
+                receiveReasons["deliveryNotEnqueued", default: 0] += 1
+            }
+        } else if result.operation == RemoWireGuardDeliver {
+            receiveReasons["deliveryNotRequested", default: 0] += 1
         } else if result.operation == RemoWireGuardSend {
             sendControl(result)
             var queued = remo_wg_receive(tunnel, nil, 0)
