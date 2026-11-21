@@ -4,11 +4,14 @@
 
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// Shows a server and edits it in place.
 struct ServerDetailView: View {
     let server: RemoteServer
     let thumbnail: UIImage?
+    /// The most recent session's log, once there has been a session.
+    let sessionLog: URL?
     let isNew: Bool
     let failure: String?
     let canConnect: Bool
@@ -27,13 +30,15 @@ struct ServerDetailView: View {
     private static let wideLayoutWidth: CGFloat = 520
 
     init(
-        server: RemoteServer, thumbnail: UIImage?, isNew: Bool, failure: String?, canConnect: Bool,
+        server: RemoteServer, thumbnail: UIImage?, sessionLog: URL?, isNew: Bool, failure: String?,
+        canConnect: Bool,
         editRequest: Binding<UUID?>, onSave: @escaping (RemoteServer) -> Bool,
         onConnect: @escaping (RemoteServer) -> Void, onCancelNew: @escaping () -> Void,
         onDelete: @escaping (RemoteServer) -> Void
     ) {
         self.server = server
         self.thumbnail = thumbnail
+        self.sessionLog = sessionLog
         self.isNew = isNew
         self.failure = failure
         self.canConnect = canConnect
@@ -119,6 +124,18 @@ struct ServerDetailView: View {
                 .padding(.horizontal, 16)
                 .background(
                     Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 26))
+
+                if let sessionLog {
+                    let file = SessionLogFile(
+                        url: sessionLog, name: "Remo \(server.displayName) \(logDate).log")
+                    ShareLink(item: file, preview: SharePreview(file.name)) {
+                        Label("Export Last Session Log", systemImage: "doc.text")
+                            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+                            .padding(.horizontal, 16)
+                    }
+                    .background(
+                        Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 26))
+                }
             }
             .padding(20)
         }
@@ -126,6 +143,17 @@ struct ServerDetailView: View {
         .onGeometryChange(for: Bool.self) { $0.size.width >= Self.wideLayoutWidth } action: {
             isWide = $0
         }
+    }
+
+    /// When the logged session started, in local time, for the exported file's name.
+    private var logDate: String {
+        let started = sessionLog.flatMap {
+            try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate
+        }
+        let style = Date.VerbatimFormatStyle(
+            format: "\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits) \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased))\(minute: .twoDigits)",
+            timeZone: .current, calendar: .current)
+        return (started ?? .now).formatted(style)
     }
 
     private var heading: some View {
@@ -239,5 +267,16 @@ struct ServerDetailView: View {
             return
         }
         withAnimation { isEditing = false }
+    }
+}
+
+/// A session log shared under a readable name instead of the server's identifier.
+private struct SessionLogFile: Transferable {
+    let url: URL
+    let name: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .log) { SentTransferredFile($0.url) }
+            .suggestedFileName { $0.name }
     }
 }

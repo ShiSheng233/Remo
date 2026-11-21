@@ -30,23 +30,33 @@ final class StreamPlayer {
     @ObservationIgnored private var client: RemoteScreenClient?
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var lastPixels: CVPixelBuffer?
+    @ObservationIgnored private var log: SessionLog?
 
     /// Starts a session; `onFinalFrame` receives a JPEG of the last frame shown once it ends.
+    /// `log` receives the same diagnostics and statistics the CLI prints.
     func connect(
-        to endpoint: NWEndpoint, wireGuard: WireGuardConfiguration? = nil,
+        to endpoint: NWEndpoint, wireGuard: WireGuardConfiguration? = nil, log: SessionLog? = nil,
         onFinalFrame: ((Data) -> Void)? = nil
     ) {
         guard task == nil else { return }
         let surface = VideoSurface()
         self.surface = surface
+        self.log = log
         phase = .connecting
+        let diagnostics = Diagnostics(handler: log.map { log in { log.write($0.description) } })
         let client = RemoteScreenClient(
+            configuration: .init(diagnostics: diagnostics),
             onFrame: { [weak self] in try self?.present($0, on: surface) },
             onEvent: { [weak self] in self?.handle($0) })
         self.client = client
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        log?.write("Remo \(version) connecting to \(endpoint)\(wireGuard == nil ? "" : " through WireGuard")")
         task = Task {
             let failure = await client.run(
                 wireGuard.map { .datagrams(WireGuardDatagramConnection($0)) } ?? .udp(endpoint))
+            log?.write(failure.map { "ended: \($0)" } ?? "disconnected")
+            log?.close()
+            self.log = nil
             if let pixels = lastPixels, let onFinalFrame {
                 Task {
                     if let jpeg = await Self.thumbnail(of: pixels) { onFinalFrame(jpeg) }
@@ -69,10 +79,17 @@ final class StreamPlayer {
     private func handle(_ event: RemoteScreenClient.Event) {
         switch event {
         case .state(.connecting): phase = .connecting
-        case .state(.waitingForVideo): phase = .waitingForVideo
-        case .state(.streaming): phase = .streaming
-        case .state(.idle), .statistics: break
-        case .pointerAvailable(let size): mouseDisplaySize = size
+        case .state(.waitingForVideo):
+            phase = .waitingForVideo
+            log?.write("connected; waiting for video")
+        case .state(.streaming):
+            phase = .streaming
+            log?.write("streaming")
+        case .state(.idle): break
+        case .statistics(let statistics): log?.write(statistics.description)
+        case .pointerAvailable(let size):
+            mouseDisplaySize = size
+            log?.write("pointer control granted for a \(Int(size.width))x\(Int(size.height)) display")
         }
     }
 

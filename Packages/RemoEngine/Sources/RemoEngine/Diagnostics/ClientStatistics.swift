@@ -23,3 +23,20 @@ public struct ClientStatistics: Sendable {
     /// Frames the server numbered but this client never decoded.
     public var missingFrames: UInt64 { max(latestFrame, framesDecoded) - framesDecoded }
 }
+
+extension ClientStatistics: CustomStringConvertible {
+    /// One line in the CLI's format.
+    public var description: String {
+        var details =
+            "frames=\(framesDecoded) latest=#\(latestFrame) missingFrames=\(missingFrames)"
+            + " controls=\(controlsReceived) latest=#\(latestControl) heartbeatsQueued=\(heartbeatsSent)"
+        if let audio {
+            details +=
+                " audioPLC=\(audio.concealedPackets - audio.fadeFallbacks) audioFadeFallback=\(audio.fadeFallbacks)"
+                + " audioLate=\(audio.latePackets) audioConcealed=\(audio.concealedPackets) audioRebuffers=\(audio.rebufferCount) audioDecodeErrors=\(audio.decodeFailures)"
+        }
+        return "video received "
+            + String(format: "%.1f fps %.2f Mbps", framesPerSecond, videoBitsPerSecond / 1e6)
+            + "  \(details)  \(link)"
+    }
+}

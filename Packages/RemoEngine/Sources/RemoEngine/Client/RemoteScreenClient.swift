@@ -386,3 +386,20 @@ public final class RemoteScreenClient {
         onEvent(.statistics(statistics))
     }
 }
+
+extension RemoteScreenClient.Failure: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .setupTimedOut: "connection setup timed out"
+        case .connectionFailed(let error): "connection setup: \(error)"
+        case .connectionClosed: "connection closed"
+        case .network(let error): "connection closed: \(error)"
+        case .serverNotResponding: "server timed out"
+        case .noVideo: "server responded but no video arrived"
+        case .sendFailed(let error): "send failed: \(error)"
+        case .videoFailed(let error): "video failed: \(error)"
+        case .presentationFailed(let error): "frame handler failed: \(error)"
+        case .pointerInputFailed(let error): "pointer input failed: \(error)"
+        }
+    }
+}

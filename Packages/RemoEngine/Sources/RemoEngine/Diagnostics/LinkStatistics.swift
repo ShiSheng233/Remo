@@ -16,3 +16,19 @@ public struct LinkStatistics: Sendable {
         audioExpiredBeforeFirstSend = statistics.expiredBeforeFirstSend[.high, default: 0]
     }
 }
+
+extension LinkStatistics: CustomStringConvertible {
+    public var description: String {
+        "RTT=\(roundTripTime.map(\.logDescription) ?? "pending")"
+            + String(format: " txBudget=%.2f Mbps", bitsPerSecond / 1e6)
+            + " txQueue=\(queueDelay.logDescription)"
+    }
+}
+
+extension Duration {
+    /// Milliseconds with one decimal, as statistics lines print them.
+    var logDescription: String {
+        formatted(
+            .units(allowed: [.milliseconds], width: .abbreviated, fractionalPart: .show(length: 1)))
+    }
+}

@@ -7,11 +7,14 @@ import Observation
 import Security
 import UIKit
 
-/// Saved servers, one Keychain item each, plus the last frame of each server’s previous session.
+/// Saved servers, one Keychain item each, plus the last frame and log of each server’s previous
+/// session.
 @Observable
 final class ServerStore {
     private(set) var servers: [RemoteServer] = []
     private(set) var thumbnails: [UUID: UIImage] = [:]
+    /// Servers whose most recent session left a log.
+    private(set) var sessionLogs: Set<UUID> = []
     private(set) var loadFailed = false
 
     @ObservationIgnored private var loaded = false
@@ -40,6 +43,7 @@ final class ServerStore {
         servers = loadedServers.sorted(by: RemoteServer.displayOrder)
         for server in servers {
             thumbnails[server.id] = Thumbnails.load(server.id)
+            if SessionLogs.exists(server.id) { sessionLogs.insert(server.id) }
         }
     }
 
@@ -60,7 +64,21 @@ final class ServerStore {
         servers.removeAll { $0.id == id }
         thumbnails[id] = nil
         Thumbnails.remove(id)
+        sessionLogs.remove(id)
+        SessionLogs.remove(id)
         return true
+    }
+
+    /// Starts the server’s session log, replacing the previous session’s.
+    func beginSessionLog(_ id: UUID) -> SessionLog? {
+        do {
+            let log = try SessionLog(url: SessionLogs.url(for: id))
+            sessionLogs.insert(id)
+            return log
+        } catch {
+            NSLog("Couldn’t start the session log: %@", error.localizedDescription)
+            return nil
+        }
     }
 
     /// Records a finished session and keeps its final frame as the server’s preview.

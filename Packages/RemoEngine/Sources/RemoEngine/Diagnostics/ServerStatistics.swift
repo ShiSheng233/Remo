@@ -28,3 +28,22 @@ public struct ServerStatistics: Sendable {
     public let audio: Audio?
     public let link: LinkStatistics
 }
+
+extension ServerStatistics: CustomStringConvertible {
+    /// One line in the CLI's format.
+    public var description: String {
+        var details =
+            "generated=\(framesGenerated) queued=\(framesQueued) backpressureDrops=\(backpressureDrops) codecDrops=\(codecDrops)"
+            + " encoderBps=\(encoderBitRate) captureSkips=\(captureSkips) checkpointSkips=\(checkpointSkips)"
+            + " ltrAcks=\(acknowledgedReferences) controlsQueued=\(controlsSent) heartbeatsRx=\(heartbeatsReceived)"
+        if let audio, audio.packetsQueued > 0 || audio.backpressureDrops > 0 {
+            details +=
+                " audioQueued=\(audio.packetsQueued) audioSourceGaps=\(audio.sourceGaps) audioBackpressure=\(audio.backpressureDrops)"
+                + " audioFirstSendExpired=\(link.audioExpiredBeforeFirstSend)"
+                + " audioQueuePeak=\(audio.peakQueueDelay.logDescription)"
+        }
+        return "video queued "
+            + String(format: "%.1f fps %.2f Mbps", framesPerSecond, videoBitsPerSecond / 1e6)
+            + "  \(details)  \(link)"
+    }
+}

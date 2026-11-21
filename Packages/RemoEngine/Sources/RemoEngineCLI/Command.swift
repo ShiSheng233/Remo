@@ -141,7 +141,7 @@ enum Command {
                 case .clientConnected: break
                 case .streamingStarted(let peer): log("[\(peer)] streaming started")
                 case .clientDisconnected(let peer, let reason, _): log("[\(peer)] \(reason)")
-                case .statistics(let peer, let statistics): log(format(statistics, peer: peer))
+                case .statistics(let peer, let statistics): log("[\(peer)] \(statistics)")
                 }
             }
         } catch {
@@ -205,12 +205,9 @@ enum Command {
                 switch event {
                 case .state(.waitingForVideo): log("[\(endpoint)] connected; press Ctrl-C to exit")
                 case .statistics(let statistics):
-                    log(
-                        format(
-                            statistics, peer: "\(endpoint)",
-                            frames: screen
-                                ? "displayEnqueued=\(displayEnqueued)"
-                                : "verified=\(verifier.verified)"))
+                    let frames =
+                        screen ? "displayEnqueued=\(displayEnqueued)" : "verified=\(verifier.verified)"
+                    log("[\(endpoint)] \(statistics)  \(frames)")
                 default: break
                 }
             })
@@ -223,23 +220,8 @@ enum Command {
         }
         defer { signals.forEach { $0.cancel() } }
         guard let failure = await viewer.run(.udp(endpoint)) else { return true }
-        log("[\(endpoint)] \(describe(failure, screen: screen))")
+        log("[\(endpoint)] \(failure)")
         return false
-    }
-
-    static func describe(_ failure: RemoteScreenClient.Failure, screen: Bool) -> String {
-        switch failure {
-        case .setupTimedOut: "connection setup timed out"
-        case .connectionFailed(let error): "connection setup: \(error)"
-        case .connectionClosed: "connection closed"
-        case .network(let error): "connection closed: \(error)"
-        case .serverNotResponding: "server timed out"
-        case .noVideo: "server responded but no video arrived"
-        case .sendFailed(let error): "send failed: \(error)"
-        case .videoFailed(let error): "video failed: \(error)"
-        case .presentationFailed(let error): "\(screen ? "video display failed" : "verification failed"): \(error)"
-        case .pointerInputFailed(let error): "mouse input failed: \(error)"
-        }
     }
 
     @MainActor
@@ -266,56 +248,5 @@ func log(_ line: String) {
 }
 
 func logDiagnostic(_ diagnostic: Diagnostic) {
-    let prefix = diagnostic.peer.map { "[\($0)] " } ?? ""
-    log(prefix + (diagnostic.kind == .trace ? "trace " : "") + diagnostic.message)
-}
-
-func format(_ duration: Duration) -> String {
-    duration.formatted(
-        .units(allowed: [.milliseconds], width: .abbreviated, fractionalPart: .show(length: 1)))
-}
-
-func format(_ link: LinkStatistics) -> String {
-    "RTT=\(link.roundTripTime.map(format) ?? "pending")"
-        + String(format: " txBudget=%.2f Mbps", link.bitsPerSecond / 1e6)
-        + " txQueue=\(format(link.queueDelay))"
-}
-
-func format(_ statistics: ServerStatistics, peer: String) -> String {
-    var details =
-        "generated=\(statistics.framesGenerated) queued=\(statistics.framesQueued) backpressureDrops=\(statistics.backpressureDrops) codecDrops=\(statistics.codecDrops)"
-    details +=
-        " encoderBps=\(statistics.encoderBitRate) captureSkips=\(statistics.captureSkips) checkpointSkips=\(statistics.checkpointSkips)"
-    details +=
-        " ltrAcks=\(statistics.acknowledgedReferences) controlsQueued=\(statistics.controlsSent) heartbeatsRx=\(statistics.heartbeatsReceived)"
-    if let audio = statistics.audio, audio.packetsQueued > 0 || audio.backpressureDrops > 0 {
-        details +=
-            " audioQueued=\(audio.packetsQueued) audioSourceGaps=\(audio.sourceGaps) audioBackpressure=\(audio.backpressureDrops)"
-        details += " audioFirstSendExpired=\(statistics.link.audioExpiredBeforeFirstSend)"
-        details += " audioQueuePeak=\(format(audio.peakQueueDelay))"
-    }
-    return "[\(peer)] video queued "
-        + String(
-            format: "%.1f fps %.2f Mbps", statistics.framesPerSecond,
-            statistics.videoBitsPerSecond / 1e6)
-        + "  \(details)  \(format(statistics.link))"
-}
-
-func format(_ statistics: ClientStatistics, peer: String, frames: String) -> String {
-    var details =
-        "frames=\(statistics.framesDecoded) latest=#\(statistics.latestFrame) missingFrames=\(statistics.missingFrames)"
-    details += " \(frames)"
-    details +=
-        " controls=\(statistics.controlsReceived) latest=#\(statistics.latestControl) heartbeatsQueued=\(statistics.heartbeatsSent)"
-    if let audio = statistics.audio {
-        details +=
-            " audioPLC=\(audio.concealedPackets - audio.fadeFallbacks) audioFadeFallback=\(audio.fadeFallbacks)"
-        details +=
-            " audioLate=\(audio.latePackets) audioConcealed=\(audio.concealedPackets) audioRebuffers=\(audio.rebufferCount) audioDecodeErrors=\(audio.decodeFailures)"
-    }
-    return "[\(peer)] video received "
-        + String(
-            format: "%.1f fps %.2f Mbps", statistics.framesPerSecond,
-            statistics.videoBitsPerSecond / 1e6)
-        + "  \(details)  \(format(statistics.link))"
+    log(diagnostic.description)
 }

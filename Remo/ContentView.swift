@@ -61,7 +61,9 @@ struct ContentView: View {
     @ViewBuilder private var detail: some View {
         if let id = selection, let server = store.server(id) {
             ServerDetailView(
-                server: server, thumbnail: store.thumbnails[id], isNew: false,
+                server: server, thumbnail: store.thumbnails[id],
+                sessionLog: store.sessionLogs.contains(id) ? SessionLogs.url(for: id) : nil,
+                isNew: false,
                 failure: activeServer?.id == id ? failure : nil, canConnect: player.surface == nil,
                 editRequest: $editRequest, onSave: store.save, onConnect: connect, onCancelNew: {},
                 onDelete: { pendingDeletion = $0 }
@@ -70,7 +72,7 @@ struct ContentView: View {
         } else if let draft = newServer, selection == draft.id {
             // Once saved, the server comes from the store and the branch above takes over.
             ServerDetailView(
-                server: draft, thumbnail: nil, isNew: true, failure: nil, canConnect: false,
+                server: draft, thumbnail: nil, sessionLog: nil, isNew: true, failure: nil, canConnect: false,
                 editRequest: $editRequest, onSave: store.save, onConnect: connect,
                 onCancelNew: {
                     newServer = nil
@@ -102,7 +104,8 @@ struct ContentView: View {
         guard !server.useWireGuard || wireGuard != nil else { return }
         activeServer = server
         let id = server.id
-        player.connect(to: endpoint, wireGuard: wireGuard) { [store] frame in
+        player.connect(to: endpoint, wireGuard: wireGuard, log: store.beginSessionLog(id)) {
+            [store] frame in
             store.recordSession(id, finalFrame: frame)
         }
     }
