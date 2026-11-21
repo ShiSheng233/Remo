@@ -270,12 +270,15 @@ func logDiagnostic(_ diagnostic: Diagnostic) {
     log(prefix + (diagnostic.kind == .trace ? "trace " : "") + diagnostic.message)
 }
 
+func format(_ duration: Duration) -> String {
+    duration.formatted(
+        .units(allowed: [.milliseconds], width: .abbreviated, fractionalPart: .show(length: 1)))
+}
+
 func format(_ link: LinkStatistics) -> String {
-    let rtt = link.roundTripTime.map { String(format: "%.1f ms", $0 * 1000) } ?? "pending"
-    return "RTT=\(rtt)"
-        + String(
-            format: " txBudget=%.2f Mbps txQueue=%.1f ms", link.bitsPerSecond / 1e6,
-            link.queueDelay * 1000)
+    "RTT=\(link.roundTripTime.map(format) ?? "pending")"
+        + String(format: " txBudget=%.2f Mbps", link.bitsPerSecond / 1e6)
+        + " txQueue=\(format(link.queueDelay))"
 }
 
 func format(_ statistics: ServerStatistics, peer: String) -> String {
@@ -289,7 +292,7 @@ func format(_ statistics: ServerStatistics, peer: String) -> String {
         details +=
             " audioQueued=\(audio.packetsQueued) audioSourceGaps=\(audio.sourceGaps) audioBackpressure=\(audio.backpressureDrops)"
         details += " audioFirstSendExpired=\(statistics.link.audioExpiredBeforeFirstSend)"
-        details += String(format: " audioQueuePeak=%.1f ms", audio.peakQueueDelay * 1000)
+        details += " audioQueuePeak=\(format(audio.peakQueueDelay))"
     }
     return "[\(peer)] video queued "
         + String(

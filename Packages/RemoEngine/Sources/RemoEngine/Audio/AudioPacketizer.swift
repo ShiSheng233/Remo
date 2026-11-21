@@ -3,40 +3,9 @@ import CoreMedia
 import Foundation
 import RemoCodec
 
-struct CapturedAudioPacket: Sendable {
-    let sequence: UInt64
-    /// Capture PTS in 48 kHz sample ticks.
-    let timestamp: Int64
-    let opus: Data
-
-    var message: Data {
-        var data = Data([SessionMessage.audio.rawValue])
-        data.put(sequence)
-        data.put(timestamp)
-        data.append(opus)
-        return data
-    }
-
-    init?(message: Data) {
-        var bytes = message
-        guard (18...1292).contains(bytes.count),
-            (try? bytes.take(UInt8.self)) == SessionMessage.audio.rawValue,
-            let sequence = try? bytes.take(UInt64.self), sequence < UInt64.max,
-            let timestamp = try? bytes.take(Int64.self)
-        else { return nil }
-        self.init(sequence: sequence, timestamp: timestamp, opus: bytes)
-    }
-
-    init(sequence: UInt64, timestamp: Int64, opus: Data) {
-        self.sequence = sequence
-        self.timestamp = timestamp
-        self.opus = opus
-    }
-}
-
 /// Used on the serial audio capture queue.
-final class ScreenAudioPacketizer {
-    private let trace: AudioPCMTrace?
+final class AudioPacketizer {
+    private let trace: AudioTrace?
     private let encoder: OpusEncoder
     private let partial = AVAudioPCMBuffer(pcmFormat: OpusFormat.pcm, frameCapacity: OpusFormat.frames)!
     private var nextTimestamp: Int64?
@@ -44,10 +13,10 @@ final class ScreenAudioPacketizer {
 
     init(traceDirectory: URL? = nil) throws {
         encoder = try OpusEncoder()
-        trace = AudioPCMTrace.open("before-encode", in: traceDirectory)
+        trace = AudioTrace.open("before-encode", in: traceDirectory)
     }
 
-    func append(_ sample: CMSampleBuffer, emit: (CapturedAudioPacket) -> Void) throws {
+    func append(_ sample: CMSampleBuffer, emit: (AudioMessage) -> Void) throws {
         guard let description = sample.formatDescription else { throw OpusFormat.Failure.unsupportedFormat }
         let format = AVAudioFormat(cmAudioFormatDescription: description)
         let pts = CMTimeConvertScale(sample.presentationTimeStamp, timescale: 48_000, method: .default)
@@ -81,7 +50,7 @@ final class ScreenAudioPacketizer {
             if partial.frameLength == OpusFormat.frames {
                 let timestamp = pts.value + Int64(offset) - 960
                 trace?.record(partial, sequence: sequence, timestamp: timestamp, kind: "capture")
-                emit(CapturedAudioPacket(sequence: sequence, timestamp: timestamp, opus: try encoder.encode(partial)))
+                emit(AudioMessage(sequence: sequence, timestamp: timestamp, opus: try encoder.encode(partial)))
                 sequence += 1
                 partial.frameLength = 0
             }

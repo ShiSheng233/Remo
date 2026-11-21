@@ -19,8 +19,8 @@ private func valid(_ length: Int) -> Bool {
 @MainActor
 public final class RemoteScreenServer {
     public enum Source: Sendable {
-        /// The main display, scaled to fit within the given pixel size. Requires macOS 12.3,
-        /// and macOS 13 to include system audio.
+        /// The main display, scaled to fit within the given pixel size, optionally with system
+        /// audio. macOS only.
         case mainDisplay(maximumWidth: Int = 1920, maximumHeight: Int = 1920, capturesAudio: Bool = false)
         /// Starts a source for each client once it asks for video.
         case custom(@MainActor @Sendable () async throws -> any ScreenFrameSource)
@@ -53,7 +53,6 @@ public final class RemoteScreenServer {
         case invalidSize
         case invalidSource
         case screenCaptureUnavailable
-        case audioCaptureUnavailable
         case screenDiscoveryFailed(any Error)
         case pointerControlUnavailable
         case accessibilityAccessRequired
@@ -64,8 +63,7 @@ public final class RemoteScreenServer {
             case .invalidBitRate: "The video bit rate must be positive."
             case .invalidSize: "Video dimensions must be even, from 2 to 8192."
             case .invalidSource: "The frame source must have even dimensions, from 2 to 8192."
-            case .screenCaptureUnavailable: "Screen capture requires macOS 12.3 or later."
-            case .audioCaptureUnavailable: "Audio capture requires macOS 13 or later."
+            case .screenCaptureUnavailable: "Screen capture requires macOS."
             case .screenDiscoveryFailed(let error):
                 "Screen discovery failed: \(error.localizedDescription). Check Screen Recording access in System Settings → Privacy & Security."
             case .pointerControlUnavailable: "Pointer control requires a macOS main display source."
@@ -100,7 +98,7 @@ public final class RemoteScreenServer {
             throw SetupError.invalidFrameRate
         }
         guard configuration.maximumVideoBitRate > 0 else { throw SetupError.invalidBitRate }
-        var mouse: MouseControlServer?
+        var pointer: PointerControlServer?
         if configuration.allowsPointerControl {
             #if os(macOS)
                 guard case .mainDisplay = configuration.source else {
@@ -109,15 +107,15 @@ public final class RemoteScreenServer {
                 guard CGPreflightPostEventAccess() else {
                     throw SetupError.accessibilityAccessRequired
                 }
-                mouse = MouseControlServer(displayID: CGMainDisplayID())
+                pointer = PointerControlServer(displayID: CGMainDisplayID())
             #else
                 throw SetupError.pointerControlUnavailable
             #endif
         }
-        let startCapture: ServerConnection.StartCapture
+        let startSource: ServerConnection.StartSource
         switch configuration.source {
         case .custom(let start):
-            startCapture = {
+            startSource = {
                 let source = try await start()
                 guard valid(source.width), valid(source.height) else {
                     try? await source.stop()
@@ -129,22 +127,16 @@ public final class RemoteScreenServer {
         case .mainDisplay(let maximumWidth, let maximumHeight, let capturesAudio):
             guard valid(maximumWidth), valid(maximumHeight) else { throw SetupError.invalidSize }
             #if os(macOS)
-                guard #available(macOS 12.3, *) else { throw SetupError.screenCaptureUnavailable }
-                if capturesAudio {
-                    guard #available(macOS 13.0, *) else {
-                        throw SetupError.audioCaptureUnavailable
-                    }
-                }
-                let capture: ScreenCaptureConfiguration
+                let capture: DisplayCapture.Configuration
                 do {
-                    capture = try await ScreenCaptureConfiguration.mainDisplay(
+                    capture = try await DisplayCapture.Configuration.mainDisplay(
                         maximumWidth: maximumWidth, maximumHeight: maximumHeight,
                         framesPerSecond: configuration.framesPerSecond)
                 } catch {
                     throw SetupError.screenDiscoveryFailed(error)
                 }
                 let traceDirectory = configuration.diagnostics.audioTraceDirectory
-                startCapture = {
+                startSource = {
                     try await capture.start(
                         capturesAudio: capturesAudio, audioTraceDirectory: traceDirectory)
                 }
@@ -156,7 +148,7 @@ public final class RemoteScreenServer {
         context = ServerConnection.Context(
             framesPerSecond: configuration.framesPerSecond,
             maximumVideoBitRate: configuration.maximumVideoBitRate,
-            startCapture: startCapture, mouse: mouse, diagnostics: configuration.diagnostics,
+            startSource: startSource, pointer: pointer, diagnostics: configuration.diagnostics,
             onEvent: onEvent)
     }
 
@@ -203,7 +195,7 @@ public final class RemoteScreenServer {
         for (connection, _) in connections.values {
             connection.stop("server stopped", failed: false)
         }
-        context.mouse?.stop()
+        context.pointer?.stop()
     }
 
     private func accept(_ connection: NWConnection) {

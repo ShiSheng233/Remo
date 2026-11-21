@@ -23,15 +23,15 @@ public final class RemoteScreenClient {
 
     public struct Configuration: Sendable {
         /// How long opening the link may take, including any tunnel handshake.
-        public var setupTimeout: TimeInterval = 8
+        public var setupTimeout = Duration.seconds(8)
         /// How long the server may answer without sending a single frame.
-        public var noVideoTimeout: TimeInterval = 15
+        public var noVideoTimeout = Duration.seconds(15)
         /// Asks the server for pointer control. A server grants it to one client at a time.
         public var requestsPointerControl = true
         public var diagnostics = Diagnostics()
 
         public init(
-            setupTimeout: TimeInterval = 8, noVideoTimeout: TimeInterval = 15,
+            setupTimeout: Duration = .seconds(8), noVideoTimeout: Duration = .seconds(15),
             requestsPointerControl: Bool = true, diagnostics: Diagnostics = Diagnostics()
         ) {
             self.setupTimeout = setupTimeout
@@ -68,7 +68,7 @@ public final class RemoteScreenClient {
 
     public private(set) var state = State.idle
     /// The remote display's size in pixels while this client controls its pointer.
-    public var pointerDisplaySize: CGSize? { mouse.displaySize }
+    public var pointerDisplaySize: CGSize? { pointer.displaySize }
 
     private let configuration: Configuration
     private let onFrame: (VideoFrame) throws -> Void
@@ -78,11 +78,11 @@ public final class RemoteScreenClient {
     private var failure: Failure?
     private var transport: NetworkMessageSession?
     private var video: VideoSession?
-    private var playback: ScreenAudioPlayback?
+    private var playback: AudioPlayback?
     private var audioDisabled = false
-    private var mouse = MouseControlClient()
-    private var lastSeen: TimeInterval = 0
-    private var lastFrame: TimeInterval = 0
+    private var pointer = PointerControlClient()
+    private var lastSeen = Instant.now
+    private var lastFrame = Instant.now
     private var receivedControl = false
     private var counters = Counters()
 
@@ -95,7 +95,7 @@ public final class RemoteScreenClient {
         var heartbeats = 0
         var previousFrames: UInt64 = 0
         var previousBytes = 0
-        var lastReport = DispatchTime.now().uptimeNanoseconds
+        var lastReport = Instant.now
     }
 
     /// `onFrame` receives each decoded picture; throwing ends the session.
@@ -137,7 +137,7 @@ public final class RemoteScreenClient {
         sendPointer { $0.move(by: delta) }
     }
 
-    public func pressPointer(_ button: MouseButton) {
+    public func pressPointer(_ button: PointerButton) {
         sendPointer { $0.press(button) }
     }
 
@@ -146,11 +146,11 @@ public final class RemoteScreenClient {
         sendPointer { $0.scroll(lines: lines) }
     }
 
-    private func sendPointer(_ make: (inout MouseControlClient) -> MouseMessage?) {
-        guard isRunning, state == .streaming, let transport, let message = make(&mouse) else {
+    private func sendPointer(_ make: (inout PointerControlClient) -> PointerMessage?) {
+        guard isRunning, state == .streaming, let transport, let message = make(&pointer) else {
             return
         }
-        let mode = message.mode(now: uptime())
+        let mode = message.mode
         do {
             try transport.send(message.encoded, mode: mode)
         } catch {
@@ -178,7 +178,7 @@ public final class RemoteScreenClient {
 
     private func session(_ link: Link) async {
         audioDisabled = false
-        mouse = MouseControlClient()
+        pointer = PointerControlClient()
         receivedControl = false
         counters = Counters()
         setState(.connecting)
@@ -192,9 +192,10 @@ public final class RemoteScreenClient {
         if let session = transport {
             // Without the goodbye, the server holds the capture and pointer until it times out.
             // Keep the link open long enough to send and retry it; nothing else is processed.
-            if (try? session.send(SessionMessage.goodbye.encoded, mode: .reliable)) != nil {
-                let roundTrip = session.statistics.roundTripTime ?? 0.1
-                await linger(min(0.25, max(0.05, roundTrip * 2)))
+            if (try? session.send(MessageKind.goodbye.encoded, mode: .reliable)) != nil {
+                let roundTrip = session.statistics.roundTripTime.map(Duration.seconds)
+                await linger(
+                    min(.milliseconds(250), max(.milliseconds(50), (roundTrip ?? .milliseconds(100)) * 2)))
             }
             transport = nil
             session.cancel()
@@ -203,15 +204,14 @@ public final class RemoteScreenClient {
     }
 
     /// Waits even though the session task is already cancelled.
-    private func linger(_ seconds: TimeInterval) async {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { continuation.resume() }
-        }
+    private func linger(_ duration: Duration) async {
+        // A new task, so the session task's cancellation doesn't cut it short.
+        await Task { try? await Task.sleep(for: duration) }.value
     }
 
     private func stream(_ link: Link) async {
         let setupTimeout = Task { [weak self, configuration] in
-            try await Task.sleep(nanoseconds: UInt64(configuration.setupTimeout * 1e9))
+            try await Task.sleep(for: configuration.setupTimeout)
             self?.fail(.setupTimedOut)
         }
         defer { setupTimeout.cancel() }
@@ -246,7 +246,7 @@ public final class RemoteScreenClient {
                     configuration.diagnostics.info(nil, line)
                 },
                 onFailure: { [weak self] error in self?.fail(.videoFailed(error)) })
-            try session.send(SessionMessage.screenHello.encoded, mode: .reliable)
+            try session.send(MessageKind.screenHello.encoded, mode: .reliable)
             trace.write(nil, "hello queued")
             setState(.waitingForVideo)
             try await keepAlive(session)
@@ -281,13 +281,13 @@ public final class RemoteScreenClient {
     }
 
     private func keepAlive(_ session: NetworkMessageSession) async throws {
-        let started = uptime()
+        let started = Instant.now
         lastSeen = started
         lastFrame = started
-        counters.lastReport = DispatchTime.now().uptimeNanoseconds
-        var nextMouseHello = started
+        counters.lastReport = started
+        var nextPointerHello = started
         while isRunning {
-            let now = uptime()
+            let now = Instant.now
             if now - lastSeen >= SessionTiming.serverTimeout {
                 fail(.serverNotResponding)
                 return
@@ -300,21 +300,21 @@ public final class RemoteScreenClient {
                 try video?.requestRefresh()
             }
             do {
-                if configuration.requestsPointerControl, mouse.displaySize == nil,
-                    now >= nextMouseHello
+                if configuration.requestsPointerControl, pointer.displaySize == nil,
+                    now >= nextPointerHello
                 {
-                    nextMouseHello = now + SessionTiming.mouseHelloRetry
-                    try session.send(SessionMessage.mouseHello.encoded, mode: .reliable)
+                    nextPointerHello = now + SessionTiming.pointerHelloRetry
+                    try session.send(MessageKind.pointerHello.encoded, mode: .reliable)
                 }
                 try session.send(
-                    SessionMessage.heartbeat.encoded, mode: .unreliable(retryBudget: 0))
+                    MessageKind.heartbeat.encoded, mode: .unreliable(retryBudget: 0))
                 counters.heartbeats += 1
                 trace.write(nil, "heartbeat queued count=\(counters.heartbeats)")
             } catch NetworkMessageSession.SendError.backpressure {
                 // The next heartbeat replaces this one.
             }
             report(session)
-            try await Task.sleep(nanoseconds: SessionTiming.heartbeatInterval)
+            try await Task.sleep(for: SessionTiming.heartbeatInterval)
         }
     }
 
@@ -323,9 +323,9 @@ public final class RemoteScreenClient {
         guard isRunning, video?.receive(channel, data) != true, let byte = data.first else {
             return
         }
-        if channel == .unreliable, byte == SessionMessage.audio.rawValue, !audioDisabled {
+        if channel == .unreliable, byte == MessageKind.audio.rawValue, !audioDisabled {
             if playback == nil {
-                playback = ScreenAudioPlayback(
+                playback = AudioPlayback(
                     traceDirectory: configuration.diagnostics.audioTraceDirectory
                 ) { [weak self] error in
                     guard let self else { return }
@@ -337,15 +337,15 @@ public final class RemoteScreenClient {
             return
         }
         guard channel == .reliable else { return }
-        switch SessionMessage(rawValue: byte) {
+        switch MessageKind(rawValue: byte) {
         case .control:
-            guard let sequence = SessionMessage.controlSequence(in: data) else { return }
+            guard let control = try? ControlMessage(decoding: data) else { return }
             counters.controls += 1
-            counters.latestControl = sequence
+            counters.latestControl = control.sequence
             receivedControl = true
-            lastSeen = uptime()
-        case .mouseReady:
-            if mouse.receiveReady(data), let size = mouse.displaySize {
+            lastSeen = .now
+        case .pointerReady:
+            if pointer.receiveReady(data), let size = pointer.displaySize {
                 onEvent(.pointerAvailable(displaySize: size))
             }
         default: break
@@ -354,7 +354,7 @@ public final class RemoteScreenClient {
 
     private func present(_ frame: VideoFrame, id: UInt64, bytes: Int) {
         guard isRunning else { return }
-        lastFrame = uptime()
+        lastFrame = .now
         lastSeen = lastFrame
         counters.framesDecoded += 1
         counters.latestFrame = max(counters.latestFrame, id)
@@ -367,10 +367,10 @@ public final class RemoteScreenClient {
     }
 
     private func report(_ session: NetworkMessageSession) {
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = Instant.now
         let elapsed = now - counters.lastReport
         guard elapsed >= SessionTiming.reportInterval else { return }
-        let seconds = Double(elapsed) / 1e9
+        let seconds = elapsed / .seconds(1)
         let statistics = ClientStatistics(
             framesPerSecond: Double(counters.framesDecoded - counters.previousFrames) / seconds,
             videoBitsPerSecond: Double(counters.videoBytes - counters.previousBytes) * 8 / seconds,

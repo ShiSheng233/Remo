@@ -6,12 +6,12 @@
 import Foundation
 import RemoTransport
 
-/// Serializes remote mouse input from one controlling peer at a time.
+/// Serializes remote pointer input from one controlling peer at a time.
 @MainActor
-final class MouseControlServer {
+final class PointerControlServer {
     enum Event: Equatable {
         case move(CGPoint, dragging: Bool)
-        case button(MouseMessage.Button, CGPoint)
+        case button(PointerButton, CGPoint)
         case scroll(lines: Int32)
     }
 
@@ -21,7 +21,7 @@ final class MouseControlServer {
         let position: CGPoint
     }
 
-    private let initialState: () -> MouseMessage?
+    private let initialState: () -> PointerMessage?
     private let emit: (Event) -> Void
     private var owner: UUID?
     private var position = CGPoint.zero
@@ -30,12 +30,12 @@ final class MouseControlServer {
     private var latestButton: UInt64 = 0
     private var pendingMove: Move?
 
-    init(initialState: @escaping () -> MouseMessage?, emit: @escaping (Event) -> Void) {
+    init(initialState: @escaping () -> PointerMessage?, emit: @escaping (Event) -> Void) {
         self.initialState = initialState
         self.emit = emit
     }
 
-    func begin(for peer: UUID) -> MouseMessage? {
+    func begin(for peer: UUID) -> PointerMessage? {
         guard owner == nil, let message = initialState(),
             case .ready(let position, _, _) = message
         else { return nil }
@@ -45,7 +45,7 @@ final class MouseControlServer {
     }
 
     func receive(_ bytes: Data, on channel: MessageTransport.Channel, from peer: UUID) {
-        guard owner == peer, let input = try? MouseMessage(decoding: bytes) else { return }
+        guard owner == peer, let input = try? PointerMessage(decoding: bytes) else { return }
         switch (channel, input) {
         case let (.unreliable, .move(sequence, afterButton, position)):
             receiveMove(Move(sequence: sequence, afterButton: afterButton, position: position))
@@ -109,7 +109,7 @@ final class MouseControlServer {
 #if os(macOS)
     import CoreGraphics
 
-    extension MouseControlServer {
+    extension PointerControlServer {
         convenience init(displayID: CGDirectDisplayID) {
             let source = CGEventSource(stateID: .hidSystemState)
             self.init(initialState: {

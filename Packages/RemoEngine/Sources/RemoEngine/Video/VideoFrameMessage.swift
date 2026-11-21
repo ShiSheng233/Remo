@@ -2,39 +2,9 @@ import CoreMedia
 import Foundation
 import RemoCodec
 
-enum PacketError: Error {
-    case invalid
-    case status(OSStatus)
-}
-
-extension Data {
-    mutating func put<T: FixedWidthInteger>(_ value: T) {
-        Swift.withUnsafeBytes(of: value.bigEndian) { append(contentsOf: $0) }
-    }
-
-    mutating func take<T: FixedWidthInteger>(_ type: T.Type) throws -> T {
-        guard count >= MemoryLayout<T>.size else { throw PacketError.invalid }
-        let value = withUnsafeBytes { T(bigEndian: $0.loadUnaligned(as: T.self)) }
-        self = dropFirst(MemoryLayout<T>.size)
-        return value
-    }
-
-    mutating func takeBytes(_ count: Int) throws -> Data {
-        guard count <= self.count else { throw PacketError.invalid }
-        let result = prefix(count)
-        self = dropFirst(count)
-        return result
-    }
-}
-
-enum VideoMessage: UInt8 {
-    case frame = 0x40
-    case acknowledgement, refresh, keyFrameRequest, keyFrameChunk, keyFrameProgress
-}
-
 /// Big-endian v1 frame header: flags, frame ID, most recent IDR ID, PTS and duration
 /// (each value + timescale), optional LTR token, then VPS, SPS and PPS on IDR and length-prefixed HEVC NAL units.
-struct VideoPacket {
+struct VideoFrameMessage {
     enum Kind: UInt8 { case predicted, idr, ltrRefresh }
     let kind: Kind
     let id: UInt64
@@ -48,22 +18,22 @@ struct VideoPacket {
     static func serialize(_ sample: CMSampleBuffer, id: UInt64, epoch: UInt64, kind: Kind) throws
         -> Data
     {
-        guard let block = CMSampleBufferGetDataBuffer(sample) else { throw PacketError.invalid }
+        guard let block = CMSampleBufferGetDataBuffer(sample) else { throw WireFormatError.invalid }
         let token = LongTermReferenceToken(requestedBy: sample)
-        var data = Data([VideoMessage.frame.rawValue, kind.rawValue | (token == nil ? 0 : 0x80)])
+        var data = Data([MessageKind.videoFrame.rawValue, kind.rawValue | (token == nil ? 0 : 0x80)])
         data.put(id)
         data.put(epoch)
         for time in [
             CMSampleBufferGetPresentationTimeStamp(sample), CMSampleBufferGetDuration(sample),
         ] {
-            guard time.isNumeric, time.epoch == 0 else { throw PacketError.invalid }
+            guard time.isNumeric, time.epoch == 0 else { throw WireFormatError.invalid }
             data.put(time.value)
             data.put(time.timescale)
         }
         if let token { data.put(token.rawValue) }
         if kind == .idr {
             guard let format = CMSampleBufferGetFormatDescription(sample) else {
-                throw PacketError.invalid
+                throw WireFormatError.invalid
             }
             var length: Int32 = 0
             for index in 0..<3 {
@@ -76,7 +46,7 @@ struct VideoPacket {
                     nalUnitHeaderLengthOut: &length)
                 guard status == noErr, let pointer, let count = UInt16(exactly: size), count > 0
                 else {
-                    throw PacketError.invalid
+                    throw WireFormatError.invalid
                 }
                 data.put(count)
                 data.append(pointer, count: size)
@@ -91,25 +61,25 @@ struct VideoPacket {
                 block, atOffset: 0, dataLength: size,
                 destination: buffer.baseAddress!.advanced(by: offset))
         }
-        guard status == noErr else { throw PacketError.status(status) }
+        guard status == noErr else { throw WireFormatError.status(status) }
         return data
     }
 
     init(_ message: Data) throws {
         var data = message
-        guard try data.take(UInt8.self) == VideoMessage.frame.rawValue else {
-            throw PacketError.invalid
+        guard try data.take(UInt8.self) == MessageKind.videoFrame.rawValue else {
+            throw WireFormatError.invalid
         }
         let flags = try data.take(UInt8.self)
-        guard let kind = Kind(rawValue: flags & 0x7f) else { throw PacketError.invalid }
+        guard let kind = Kind(rawValue: flags & 0x7f) else { throw WireFormatError.invalid }
         self.kind = kind
         id = try data.take(UInt64.self)
         epoch = try data.take(UInt64.self)
-        guard epoch > 0, kind == .idr ? id == epoch : id > epoch else { throw PacketError.invalid }
+        guard epoch > 0, kind == .idr ? id == epoch : id > epoch else { throw WireFormatError.invalid }
         func time(_ data: inout Data) throws -> CMTime {
             let value = try data.take(Int64.self)
             let scale = try data.take(Int32.self)
-            guard scale > 0 else { throw PacketError.invalid }
+            guard scale > 0 else { throw WireFormatError.invalid }
             return CMTime(value: value, timescale: scale)
         }
         pts = try time(&data)
@@ -125,12 +95,12 @@ struct VideoPacket {
                 offsets.append(message.count - data.count)
                 let parameter = try data.takeBytes(size)
                 guard size >= 2, (parameter[parameter.startIndex] >> 1) & 0x3f == type else {
-                    throw PacketError.invalid
+                    throw WireFormatError.invalid
                 }
                 sizes.append(size)
             }
             let length = try data.take(UInt8.self)
-            guard [1, 2, 4].contains(length) else { throw PacketError.invalid }
+            guard [1, 2, 4].contains(length) else { throw WireFormatError.invalid }
             var description: CMFormatDescription?
             let status = message.withUnsafeBytes { buffer in
                 let base = buffer.bindMemory(to: UInt8.self).baseAddress!
@@ -140,12 +110,12 @@ struct VideoPacket {
                     parameterSetSizes: sizes, nalUnitHeaderLength: Int32(length),
                     extensions: nil, formatDescriptionOut: &description)
             }
-            guard status == noErr, let description else { throw PacketError.status(status) }
+            guard status == noErr, let description else { throw WireFormatError.status(status) }
             format = description
         } else {
             format = nil
         }
-        guard !data.isEmpty else { throw PacketError.invalid }
+        guard !data.isEmpty else { throw WireFormatError.invalid }
         bytes = data
     }
 
@@ -155,13 +125,13 @@ struct VideoPacket {
             allocator: nil, memoryBlock: nil,
             blockLength: bytes.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
             offsetToData: 0, dataLength: bytes.count, flags: 0, blockBufferOut: &block)
-        guard status == noErr, let block else { throw PacketError.status(status) }
+        guard status == noErr, let block else { throw WireFormatError.status(status) }
         status = bytes.withUnsafeBytes {
             CMBlockBufferReplaceDataBytes(
                 with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0,
                 dataLength: $0.count)
         }
-        guard status == noErr else { throw PacketError.status(status) }
+        guard status == noErr else { throw WireFormatError.status(status) }
         var timing = CMSampleTimingInfo(
             duration: duration, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
         var size = bytes.count
@@ -171,7 +141,7 @@ struct VideoPacket {
             sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
             sampleSizeEntryCount: 1,
             sampleSizeArray: &size, sampleBufferOut: &sample)
-        guard status == noErr, let sample else { throw PacketError.status(status) }
+        guard status == noErr, let sample else { throw WireFormatError.status(status) }
         return sample
     }
 }

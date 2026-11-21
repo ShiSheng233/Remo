@@ -2,18 +2,18 @@ import AVFAudio
 import Foundation
 
 /// Optional per-session recordings. PCM is interleaved float32, with format and frame offsets in the CSV.
-final class AudioPCMTrace: Sendable {
+final class AudioTrace: Sendable {
     private let pcm: FileHandle
     private let index: FileHandle
-    private let writer = DispatchQueue(label: "RemoEngine.PCMTrace", qos: .utility)
+    private let writer = DispatchQueue(label: "RemoEngine.AudioTrace", qos: .utility)
     private let slots = DispatchSemaphore(value: 96)
 
-    static func open(_ stage: String, in directory: URL?) -> AudioPCMTrace? {
+    static func open(_ stage: String, in directory: URL?) -> AudioTrace? {
         guard let directory else { return nil }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let base = directory.appendingPathComponent("\(stage)-\(UUID().uuidString)")
-            return try AudioPCMTrace(base: base)
+            return try AudioTrace(base: base)
         } catch {
             NSLog("Cannot open %@ audio diagnostics: %@", stage, error.localizedDescription)
             return nil

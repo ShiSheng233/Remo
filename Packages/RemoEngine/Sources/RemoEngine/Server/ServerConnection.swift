@@ -4,7 +4,6 @@
 //
 
 import CoreMedia
-import Dispatch
 import Foundation
 import Network
 import RemoCodec
@@ -13,24 +12,24 @@ import RemoTransport
 /// One client of a `RemoteScreenServer`, from connection setup until it leaves or times out.
 @MainActor
 final class ServerConnection {
-    typealias StartCapture = @MainActor () async throws -> any ScreenFrameSource
+    typealias StartSource = @MainActor () async throws -> any ScreenFrameSource
 
     /// Shared by every connection of one server.
     struct Context {
         let framesPerSecond: Int32
         let maximumVideoBitRate: Int
-        let startCapture: StartCapture
-        let mouse: MouseControlServer?
+        let startSource: StartSource
+        let pointer: PointerControlServer?
         let diagnostics: Diagnostics
         let onEvent: @MainActor (RemoteScreenServer.Event) -> Void
 
-        var frameInterval: UInt64 { 1_000_000_000 / UInt64(framesPerSecond) }
+        var frameInterval: Duration { .seconds(1) / Int(framesPerSecond) }
     }
 
     private let peer: String
     private let context: Context
     private let trace: HeartbeatTrace
-    private let mousePeer = UUID()
+    private let pointerPeer = UUID()
     private var session: NetworkMessageSession?
     private var setup: Task<Void, Never>?
     private var video: VideoSession?
@@ -38,18 +37,19 @@ final class ServerConnection {
     private var stopping = false
     private var stopReason = ""
     private var failed = false
-    private var lastSeen = DispatchTime.now().uptimeNanoseconds
+    private let started = Instant.now
+    private var lastSeen = Instant.now
 
     // Source
     private var source: (any ScreenFrameSource)?
     private var encoder: VideoEncoder?
     private var previousCapturePTS = CMTime.invalid
-    private var lastCaptureSend: UInt64 = 0
+    private var lastCaptureSend: Instant?
     private var targetBitRate: Int
-    private var lastRateUpdate: UInt64 = 0
+    private var lastRateUpdate: Instant?
     private var refreshBitRate: Int
-    private var lastQualityRefresh: UInt64 = 0
-    private var lastImageChange: UInt64 = 0
+    private var lastQualityRefresh: Instant?
+    private var lastImageChange = Instant.now
     private var refreshWhenStill = false
 
     // Audio
@@ -57,7 +57,7 @@ final class ServerConnection {
     private var audioQueued = 0
     private var audioBackpressure = 0
     private var audioSourceGaps: UInt64 = 0
-    private var audioQueuePeak: TimeInterval = 0
+    private var audioQueuePeak = Duration.zero
     private var sendsAudio = false
 
     // Statistics
@@ -72,7 +72,7 @@ final class ServerConnection {
     private var videoBytes = 0
     private var previousFrames: UInt64 = 0
     private var previousBytes = 0
-    private var lastReport = DispatchTime.now().uptimeNanoseconds
+    private var lastReport = Instant.now
 
     init(peer: String, context: Context) {
         self.peer = peer
@@ -103,7 +103,7 @@ final class ServerConnection {
         }
         self.setup = setup
         let timeout = Task {
-            try await Task.sleep(nanoseconds: 5_000_000_000)
+            try await Task.sleep(for: SessionTiming.connectionSetupTimeout)
             stop("connection setup timed out", failed: true)
         }
         await setup.value
@@ -111,7 +111,7 @@ final class ServerConnection {
         self.setup = nil
 
         if let session, !stopping {
-            lastSeen = DispatchTime.now().uptimeNanoseconds
+            lastSeen = .now
             lastReport = lastSeen
             trace.write(peer, "server ready")
             do {
@@ -136,12 +136,12 @@ final class ServerConnection {
         stopping = true
         stopReason = reason
         self.failed = failed
-        context.mouse?.end(for: mousePeer)
+        context.pointer?.end(for: pointerPeer)
         setup?.cancel()
-        let idleMs = (DispatchTime.now().uptimeNanoseconds - lastSeen) / 1_000_000
+        let idle = Instant.now - lastSeen
         trace.write(
             peer,
-            "server stop reason=\(reason) idleMs=\(idleMs) active=\(active) heartbeats=\(heartbeats) frames=\(frames) controls=\(controls)"
+            "server stop reason=\(reason) idle=\(idle.formatted(.units(allowed: [.milliseconds], width: .narrow))) active=\(active) heartbeats=\(heartbeats) frames=\(frames) controls=\(controls)"
         )
     }
 
@@ -176,7 +176,7 @@ final class ServerConnection {
 
     private func receive(_ channel: MessageTransport.Channel, _ bytes: Data) {
         guard !stopping, video?.receive(channel, bytes) != true, let first = bytes.first,
-            let kind = SessionMessage(rawValue: first)
+            let kind = MessageKind(rawValue: first)
         else { return }
         switch (channel, kind) {
         case (.reliable, .hello), (.reliable, .screenHello):
@@ -195,27 +195,27 @@ final class ServerConnection {
             trace.write(peer, "heartbeat accepted count=\(heartbeats)")
         case (.reliable, .goodbye) where bytes.count == 1:
             stop("client left", failed: false)
-        case (.reliable, .mouseHello) where active && bytes.count == 1:
-            guard let mouse = context.mouse, let session, let ready = mouse.begin(for: mousePeer)
+        case (.reliable, .pointerHello) where active && bytes.count == 1:
+            guard let pointer = context.pointer, let session, let ready = pointer.begin(for: pointerPeer)
             else { return }
             do {
                 try session.send(ready.encoded, mode: .reliable)
             } catch {
-                mouse.end(for: mousePeer)
+                pointer.end(for: pointerPeer)
             }
-        case (_, .mouseInput) where active:
-            context.mouse?.receive(bytes, on: channel, from: mousePeer)
+        case (_, .pointerInput) where active:
+            context.pointer?.receive(bytes, on: channel, from: pointerPeer)
             return
         default: return
         }
-        lastSeen = DispatchTime.now().uptimeNanoseconds
+        lastSeen = .now
     }
 
     private func stream(_ session: NetworkMessageSession) async throws {
-        var nextFrame = DispatchTime.now().uptimeNanoseconds
+        var nextFrame = Instant.now
         var nextControl = nextFrame
         while !stopping {
-            let now = DispatchTime.now().uptimeNanoseconds
+            let now = Instant.now
             if now - lastSeen >= SessionTiming.clientTimeout {
                 stop("client timed out", failed: false)
                 break
@@ -224,7 +224,7 @@ final class ServerConnection {
                 if now >= nextControl {
                     do {
                         try session.send(
-                            SessionMessage.control(sequence: controls + 1), mode: .reliable)
+                            ControlMessage(sequence: controls + 1).encoded, mode: .reliable)
                         controls += 1
                         nextControl = now + SessionTiming.controlInterval
                     } catch NetworkMessageSession.SendError.backpressure {
@@ -233,11 +233,11 @@ final class ServerConnection {
                 }
                 if source == nil {
                     // Start the source once the client asks for video.
-                    let source = try await context.startCapture()
+                    let source = try await context.startSource()
                     self.source = source
                     if stopping { break }
                     try prepareVideo(source)
-                    if let capture = source as? any ScreenAudioSource {
+                    if let capture = source as? any AudioSource {
                         startAudio(capture, session: session)
                     }
                 }
@@ -246,28 +246,28 @@ final class ServerConnection {
                 report(session, now: now)
             }
             nextFrame += context.frameInterval
-            let sent = DispatchTime.now().uptimeNanoseconds
+            let sent = Instant.now
             if nextFrame <= sent { nextFrame = sent + context.frameInterval }
-            try await Task.sleep(nanoseconds: nextFrame - sent)
+            try await Task.sleep(until: nextFrame, clock: .suspending)
         }
     }
 
-    private func startAudio(_ capture: any ScreenAudioSource, session: NetworkMessageSession) {
+    private func startAudio(_ capture: any AudioSource, session: NetworkMessageSession) {
         sendsAudio = true
         audioSendTask = Task {
             do {
                 var nextSequence: UInt64 = 0
-                for try await packet in capture.audioPackets {
+                for try await packet in capture.audioMessages {
                     audioSourceGaps += packet.sequence - nextSequence
                     nextSequence = packet.sequence + 1
-                    audioQueuePeak = max(audioQueuePeak, session.statistics.estimatedQueueDelay)
+                    audioQueuePeak = max(
+                        audioQueuePeak, .seconds(session.statistics.estimatedQueueDelay))
                     guard !Task.isCancelled, !stopping else { return }
                     do {
                         try session.send(
-                            packet.message,
+                            packet.encoded,
                             mode: .unreliable(
-                                retryBudget: 0, firstSendDeadline: uptime() + 0.10,
-                                priority: .high))
+                                sendWithin: SessionTiming.audioDeadline, priority: .high))
                         audioQueued += 1
                     } catch NetworkMessageSession.SendError.backpressure {
                         audioBackpressure += 1
@@ -279,13 +279,13 @@ final class ServerConnection {
 
     private func send(
         _ source: any ScreenFrameSource, video: VideoSession, session: NetworkMessageSession,
-        now: UInt64
+        now: Instant
     ) async throws {
         let stats = session.statistics
         let budget = stats.bitsPerSecond
         let maximum = context.maximumVideoBitRate
         let target = min(maximum, max(128_000, Int(budget * 0.7)))
-        if now - lastRateUpdate >= 500_000_000
+        if now.hasElapsed(.milliseconds(500), since: lastRateUpdate)
             && (abs(target - targetBitRate) > targetBitRate / 8
                 || (target == maximum && target != targetBitRate))
         {
@@ -302,20 +302,22 @@ final class ServerConnection {
             refreshWhenStill = true
         }
         // Refresh a still desktop periodically so a lost frame can be recovered.
-        guard capturePTS != previousCapturePTS || now - lastCaptureSend >= 500_000_000 else {
+        guard capturePTS != previousCapturePTS
+            || now.hasElapsed(.milliseconds(500), since: lastCaptureSend)
+        else {
             return
         }
-        if stats.estimatedQueueDelay > 0.05 {
+        if Duration.seconds(stats.estimatedQueueDelay) > .milliseconds(50) {
             captureSkips += 1
             return
         }
         let settled =
             Double(targetBitRate) <= budget && refreshWhenStill
-            && now - lastImageChange >= 1_000_000_000
+            && now - lastImageChange >= .seconds(1)
         let improved =
             targetBitRate >= refreshBitRate * 3 / 2
             || (targetBitRate == maximum && refreshBitRate < targetBitRate)
-        if (improved || settled) && now - lastQualityRefresh >= 5_000_000_000 {
+        if (improved || settled) && now.hasElapsed(.seconds(5), since: lastQualityRefresh) {
             video.requestKeyFrame()
             lastQualityRefresh = now
             refreshBitRate = targetBitRate
@@ -324,8 +326,10 @@ final class ServerConnection {
         }
         previousCapturePTS = capturePTS
         lastCaptureSend = now
+        // Stamp frames with the send time; a still picture sent again is a new frame.
         try await submit(
-            frame.pixels, pts: CMTime(value: Int64(now), timescale: 1_000_000_000), video: video)
+            frame.pixels, pts: CMTime(value: (now - started).nanoseconds, timescale: 1_000_000_000),
+            video: video)
     }
 
     private func submit(_ pixels: CVPixelBuffer, pts: CMTime, video: VideoSession) async throws {
@@ -343,17 +347,17 @@ final class ServerConnection {
         }
     }
 
-    private func report(_ session: NetworkMessageSession, now: UInt64) {
+    private func report(_ session: NetworkMessageSession, now: Instant) {
         let elapsed = now - lastReport
         guard elapsed >= SessionTiming.reportInterval else { return }
-        let seconds = Double(elapsed) / 1e9
+        let seconds = elapsed / .seconds(1)
         let queued = frames - backpressureDrops - codecDrops - checkpointSkips
         let audio =
             sendsAudio
             ? ServerStatistics.Audio(
                 packetsQueued: audioQueued, sourceGaps: audioSourceGaps,
                 backpressureDrops: audioBackpressure, peakQueueDelay: audioQueuePeak) : nil
-        audioQueuePeak = 0
+        audioQueuePeak = .zero
         let statistics = ServerStatistics(
             framesPerSecond: Double(queued - previousFrames) / seconds,
             videoBitsPerSecond: Double(videoBytes - previousBytes) * 8 / seconds,

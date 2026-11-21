@@ -1,6 +1,5 @@
 import CoreMedia
 import CoreVideo
-import Dispatch
 import Foundation
 import RemoEngine
 
@@ -105,7 +104,7 @@ final class TestPatternSource: ScreenFrameSource {
     let height: Int
     private let framesPerSecond: Int32
     private let pool: CVPixelBufferPool
-    private let started = DispatchTime.now().uptimeNanoseconds
+    private let started = SuspendingClock.Instant.now
     private var frame: ScreenFrame?
 
     struct InvalidSize: Error, CustomStringConvertible {
@@ -135,8 +134,10 @@ final class TestPatternSource: ScreenFrameSource {
     }
 
     func latestFrame() throws -> ScreenFrame? {
-        let elapsed = DispatchTime.now().uptimeNanoseconds - started
-        let index = elapsed * UInt64(framesPerSecond) / 1_000_000_000 + 1
+        // Count whole frame intervals since the start.
+        let (seconds, attoseconds) = (SuspendingClock.Instant.now - started).components
+        let nanoseconds = UInt64(seconds) * 1_000_000_000 + UInt64(attoseconds) / 1_000_000_000
+        let index = nanoseconds * UInt64(framesPerSecond) / 1_000_000_000 + 1
         let timestamp = CMTime(value: Int64(index), timescale: framesPerSecond)
         if frame?.timestamp != timestamp {
             var pixels: CVPixelBuffer?

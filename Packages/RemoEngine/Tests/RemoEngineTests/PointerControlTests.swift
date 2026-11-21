@@ -9,39 +9,39 @@ import Testing
 
 @testable import RemoEngine
 
-@Test func mouseMessagesRoundTripAndRejectInvalidPositions() throws {
+@Test func pointerMessagesRoundTripAndRejectInvalidPositions() throws {
     let position = CGPoint(x: 0.125, y: 0.875)
-    let messages: [MouseMessage] = [
+    let messages: [PointerMessage] = [
         .ready(position: position, width: 1512, height: 982),
         .move(sequence: 4, afterButton: 3, position: position),
         .button(sequence: 5, action: .rightClick, position: position),
         .scroll(lines: -3),
     ]
     for message in messages {
-        let decoded = try MouseMessage(decoding: message.encoded)
+        let decoded = try PointerMessage(decoding: message.encoded)
         #expect(decoded == message)
-        #expect(throws: PacketError.self) {
-            try MouseMessage(decoding: message.encoded.dropLast())
+        #expect(throws: WireFormatError.self) {
+            try PointerMessage(decoding: message.encoded.dropLast())
         }
     }
-    let invalid = MouseMessage.button(
+    let invalid = PointerMessage.button(
         sequence: 1, action: .leftClick, position: CGPoint(x: CGFloat.nan, y: 0))
-    #expect(throws: PacketError.self) { try MouseMessage(decoding: invalid.encoded) }
+    #expect(throws: WireFormatError.self) { try PointerMessage(decoding: invalid.encoded) }
 }
 
-@Test @MainActor func mouseMovesRespectButtonOrderAndReliableClickPositions() {
+@Test @MainActor func pointerMovesRespectButtonOrderAndReliableClickPositions() {
     let start = CGPoint(x: 0.1, y: 0.2)
     let dragged = CGPoint(x: 0.5, y: 0.6)
     let end = CGPoint(x: 0.7, y: 0.8)
     let clicked = CGPoint(x: 0.95, y: 0.9)
     let id = UUID()
-    var events: [MouseControlServer.Event] = []
-    let server = MouseControlServer(
+    var events: [PointerControlServer.Event] = []
+    let server = PointerControlServer(
         initialState: { .ready(position: start, width: 1512, height: 982) },
         emit: { events.append($0) })
     #expect(server.begin(for: id) != nil)
 
-    func send(_ input: MouseMessage, _ channel: MessageTransport.Channel) {
+    func send(_ input: PointerMessage, _ channel: MessageTransport.Channel) {
         server.receive(input.encoded, on: channel, from: id)
     }
     send(.move(sequence: 4, afterButton: 2, position: dragged), .unreliable)
@@ -62,17 +62,17 @@ import Testing
     ])
 }
 
-@Test @MainActor func closingMouseSessionReleasesDragAndAllowsNewOwner() {
+@Test @MainActor func closingPointerSessionReleasesDragAndAllowsNewOwner() {
     let position = CGPoint(x: 0.2, y: 0.3)
     let owner = UUID()
     let viewer = UUID()
-    var events: [MouseControlServer.Event] = []
-    let server = MouseControlServer(
+    var events: [PointerControlServer.Event] = []
+    let server = PointerControlServer(
         initialState: { .ready(position: .zero, width: 1512, height: 982) },
         emit: { events.append($0) })
     #expect(server.begin(for: owner) != nil)
     #expect(server.begin(for: viewer) == nil)
-    let input = MouseMessage.button(sequence: 1, action: .leftDown, position: position).encoded
+    let input = PointerMessage.button(sequence: 1, action: .leftDown, position: position).encoded
     server.receive(input, on: .reliable, from: viewer)
     #expect(events.isEmpty)
     server.receive(input, on: .reliable, from: owner)
@@ -88,13 +88,13 @@ import Testing
 }
 
 @Test @MainActor func pointerClientOrdersInputForTheServer() throws {
-    var client = MouseControlClient()
+    var client = PointerControlClient()
     let early = [client.move(by: CGVector(dx: 10, dy: 10)), client.press(.leftClick)]
     #expect(early == [nil, nil])
 
     let start = CGPoint(x: 0.5, y: 0.5)
-    var events: [MouseControlServer.Event] = []
-    let server = MouseControlServer(
+    var events: [PointerControlServer.Event] = []
+    let server = PointerControlServer(
         initialState: { .ready(position: start, width: 1000, height: 500) },
         emit: { events.append($0) })
     let id = UUID()
@@ -103,10 +103,10 @@ import Testing
     #expect(granted == [true, false])
     #expect(client.displaySize == CGSize(width: 1000, height: 500))
 
-    func send(_ message: MouseMessage?) throws {
+    func send(_ message: PointerMessage?) throws {
         let message = try #require(message)
         let channel: MessageTransport.Channel =
-            if case .reliable = message.mode(now: 0) { .reliable } else { .unreliable }
+            if case .reliable = message.mode { .reliable } else { .unreliable }
         server.receive(message.encoded, on: channel, from: id)
     }
     try send(client.move(by: CGVector(dx: 100, dy: -50)))

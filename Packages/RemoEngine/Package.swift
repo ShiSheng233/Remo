@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "RemoEngine",
-    platforms: [.macOS(.v12), .iOS(.v15)],
+    platforms: [.macOS(.v13), .iOS(.v16)],
     products: [
         .library(name: "RemoEngine", targets: ["RemoEngine"]),
         .executable(name: "remo-engine", targets: ["RemoEngineCLI"]),

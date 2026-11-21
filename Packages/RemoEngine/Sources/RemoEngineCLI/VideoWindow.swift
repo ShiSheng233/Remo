@@ -15,7 +15,7 @@
         private let window: NSWindow
         private let onClose: () -> Void
         private var loggedFirstFrame = false
-        private var lastMetricsTime: TimeInterval = 0
+        private var lastMetrics: SuspendingClock.Instant?
 
         init(title: String, onClose: @escaping () -> Void) {
             self.onClose = onClose
@@ -71,9 +71,9 @@
                 )
                 loggedFirstFrame = true
             }
-            let now = ProcessInfo.processInfo.systemUptime
-            if #available(macOS 14.4, *), now - lastMetricsTime >= 5 {
-                lastMetricsTime = now
+            let now = SuspendingClock.Instant.now
+            if #available(macOS 14.4, *), lastMetrics.map({ now - $0 >= .seconds(5) }) ?? true {
+                lastMetrics = now
                 Task { @MainActor in
                     if let metrics = await layer.sampleBufferRenderer.videoPerformanceMetrics {
                         log(

@@ -32,14 +32,14 @@ final class VideoSession {
     private var receivedEpoch: UInt64 = 0
     private var lastDecoded: UInt64 = 0
     private var lastRequest: UInt64?
-    private var lastRequestTime: TimeInterval = 0
+    private var lastRequestTime = SuspendingClock.Instant.now
     private var recoveryRequests = 0
     private var wantsCheckpoint = false
-    private var outgoing: RecoverySender?
-    private var incoming: RecoveryReceiver?
+    private var outgoing: KeyFrameSender?
+    private var incoming: KeyFrameReceiver?
     private var progress: Data?
     private var pendingAck: Data?
-    private var queue: [VideoPacket] = []
+    private var queue: [VideoFrameMessage] = []
     private var decoding = false
 
     init(
@@ -73,7 +73,8 @@ final class VideoSession {
     /// Encode one source frame at a time, in PTS order.
     nonisolated(nonsending) func sendFrame(
         _ pixels: CVPixelBuffer, presentationTime: CMTime,
-        duration: CMTime, retryBudget: TimeInterval = 0.08, firstSendDeadline: TimeInterval? = nil
+        duration: CMTime, retryFor retryBudget: Duration = .milliseconds(80),
+        sendWithin firstSendLimit: Duration? = nil
     ) async throws -> Int {
         guard !closed else { throw Failure.closed }
         guard let encoder else { throw Failure.encoderUnavailable }
@@ -110,23 +111,23 @@ final class VideoSession {
             CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
             as? [[String: Any]]
         let sync = attachments?.first?[kCMSampleAttachmentKey_NotSync as String] as? Bool != true
-        let kind: VideoPacket.Kind = sync ? .idr : request == .recover ? .ltrRefresh : .predicted
+        let kind: VideoFrameMessage.Kind = sync ? .idr : request == .recover ? .ltrRefresh : .predicted
         if sync {
             sentEpoch = id
             acknowledged = nil
             newAcknowledgement = false
         }
-        let packet = try VideoPacket.serialize(sample, id: id, epoch: sentEpoch, kind: kind)
+        let packet = try VideoFrameMessage.serialize(sample, id: id, epoch: sentEpoch, kind: kind)
         if checkpoint {
-            guard sync else { throw PacketError.invalid }
-            let transfer = try RecoverySender(id: id, bytes: packet)
+            guard sync else { throw WireFormatError.invalid }
+            let transfer = try KeyFrameSender(id: id, bytes: packet)
             outgoing = transfer
             wantsCheckpoint = false
             onEvent(.reliableKeyFrame(frame: id, bytes: packet.count))
             try transfer.pump(send: send)
         } else {
             try send(
-                packet, .unreliable(retryBudget: retryBudget, firstSendDeadline: firstSendDeadline))
+                packet, .unreliable(retryFor: retryBudget, sendWithin: firstSendLimit))
         }
         if request != .none {
             onEvent(.encodedRefresh(frame: id, reference: sync ? nil : tokens.first))
@@ -139,7 +140,7 @@ final class VideoSession {
         _ channel: MessageTransport.Channel, _ message: Data,
         isolation: isolated any Actor = #isolation
     ) -> Bool {
-        let type = message.first.flatMap(VideoMessage.init(rawValue:))
+        let type = message.first.flatMap(MessageKind.init(rawValue:)).flatMap { $0.isVideo ? $0 : nil }
         guard !closed else { return type != nil }
         do {
             try flushProgress()
@@ -148,18 +149,18 @@ final class VideoSession {
                 // An active screen session also receives periodic application controls when
                 // every U frame, including a refresh, is lost before reassembly.
                 if let lastRequest, incoming == nil,
-                    ProcessInfo.processInfo.systemUptime - lastRequestTime >= 1
+                    SuspendingClock.Instant.now - lastRequestTime >= .seconds(1)
                 {
                     try requestRecovery(lastRequest, allowLTR: decoder != nil, repeatRequest: true)
                 }
                 return false
             }
-            var ready: VideoPacket?
+            var ready: VideoFrameMessage?
             switch (channel, type) {
-            case (.unreliable, .frame):
-                let packet = try VideoPacket(message)
+            case (.unreliable, .videoFrame):
+                let packet = try VideoFrameMessage(message)
                 if incoming == nil { ready = packet }
-            case (.reliable, .acknowledgement):
+            case (.reliable, .videoAcknowledgement):
                 var body = message.dropFirst()
                 let epoch = try body.take(UInt64.self)
                 let frame = try body.take(UInt64.self)
@@ -170,24 +171,24 @@ final class VideoSession {
                 acknowledged = token
                 newAcknowledgement = true
                 onEvent(.acknowledged(frame: frame, token: token))
-            case (.reliable, .refresh):
+            case (.reliable, .videoRefresh):
                 var body = message.dropFirst()
                 let epoch = try body.take(UInt64.self)
                 let allowLTR = try body.take(UInt8.self)
-                guard body.isEmpty, allowLTR <= 1 else { throw PacketError.invalid }
+                guard body.isEmpty, allowLTR <= 1 else { throw WireFormatError.invalid }
                 guard outgoing == nil && !wantsCheckpoint else { return true }
                 refresh =
                     epoch == sentEpoch && allowLTR == 1 && acknowledged != nil
                         && refresh != .keyFrame
                     ? .recover : .keyFrame
             case (.reliable, .keyFrameRequest):
-                guard message.count == 1 else { throw PacketError.invalid }
+                guard message.count == 1 else { throw WireFormatError.invalid }
                 if outgoing == nil { wantsCheckpoint = true }
             case (.reliable, .keyFrameProgress):
                 var body = message.dropFirst()
                 let id = try body.take(UInt64.self)
                 let offset = Int(try body.take(UInt32.self))
-                guard body.isEmpty else { throw PacketError.invalid }
+                guard body.isEmpty else { throw WireFormatError.invalid }
                 if let outgoing, outgoing.id == id {
                     if try outgoing.advance(to: offset) {
                         self.outgoing = nil
@@ -200,29 +201,29 @@ final class VideoSession {
                 let id = try body.take(UInt64.self)
                 let total = Int(try body.take(UInt32.self))
                 let offset = Int(try body.take(UInt32.self))
-                guard (1...RecoveryReceiver.limit).contains(total) else {
-                    throw PacketError.invalid
+                guard (1...KeyFrameReceiver.limit).contains(total) else {
+                    throw WireFormatError.invalid
                 }
                 if offset == 0 {
-                    guard incoming == nil else { throw PacketError.invalid }
-                    incoming = RecoveryReceiver(id: id, total: total)
+                    guard incoming == nil else { throw WireFormatError.invalid }
+                    incoming = KeyFrameReceiver(id: id, total: total)
                     queue.removeAll()
                 }
                 guard incoming?.id == id, incoming?.total == total else {
-                    throw PacketError.invalid
+                    throw WireFormatError.invalid
                 }
                 try incoming!.append(body, offset: offset)
                 let count = offset + body.count
                 if count == total {
-                    let packet = try VideoPacket(incoming!.bytes)
+                    let packet = try VideoFrameMessage(incoming!.bytes)
                     guard packet.kind == .idr, packet.id == id, id > lastDecoded else {
-                        throw PacketError.invalid
+                        throw WireFormatError.invalid
                     }
                     ready = packet
                 } else {
                     try acknowledgeProgress(id, count)
                 }
-            default: throw PacketError.invalid
+            default: throw WireFormatError.invalid
             }
             if let packet = ready {
                 guard packet.id > lastDecoded else { return true }
@@ -264,7 +265,7 @@ final class VideoSession {
     }
 
     private func acknowledgeProgress(_ id: UInt64, _ offset: Int) throws {
-        var message = Data([VideoMessage.keyFrameProgress.rawValue])
+        var message = MessageKind.keyFrameProgress.encoded
         message.put(id)
         message.put(UInt32(offset))
         progress = message
@@ -281,14 +282,16 @@ final class VideoSession {
 
     private func requestRecovery(_ id: UInt64, allowLTR: Bool, repeatRequest: Bool = false) throws {
         // Retry on subsequent frame arrivals if a U refresh frame itself was lost.
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = SuspendingClock.Instant.now
         if let lastRequest {
             guard id > lastRequest || repeatRequest else { return }
             let elapsed = now - lastRequestTime
-            if elapsed < 0.08 || (id - lastRequest < 8 && elapsed < 0.5) { return }
-            if recoveryRequests >= 3 && elapsed < 0.5 { return }
+            if elapsed < .milliseconds(80) || (id - lastRequest < 8 && elapsed < .milliseconds(500)) {
+                return
+            }
+            if recoveryRequests >= 3 && elapsed < .milliseconds(500) { return }
         }
-        var request = Data([VideoMessage.refresh.rawValue])
+        var request = MessageKind.videoRefresh.encoded
         request.put(receivedEpoch)
         // Repeated unanswered LTR refreshes must not leave the receiver on the same chain forever.
         request.put(UInt8(allowLTR && recoveryRequests < 2 ? 1 : 0))
@@ -297,7 +300,7 @@ final class VideoSession {
         do {
             // Older peers ignore the extension and still handle the ordinary refresh request.
             if recoveryRequests >= 2 {
-                try send(Data([VideoMessage.keyFrameRequest.rawValue]), .reliable)
+                try send(MessageKind.keyFrameRequest.encoded, .reliable)
             }
             try send(request, .reliable)
         } catch NetworkMessageSession.SendError.backpressure {
@@ -307,7 +310,7 @@ final class VideoSession {
         onEvent(.requestedRecovery(after: lastDecoded, firstAvailable: id))
     }
 
-    private nonisolated(nonsending) func decode(_ packet: VideoPacket) async throws {
+    private nonisolated(nonsending) func decode(_ packet: VideoFrameMessage) async throws {
         guard packet.id > lastDecoded else { return }
         let recovering = lastRequest != nil || (lastDecoded != 0 && packet.id != lastDecoded + 1)
         if let description = packet.format {
@@ -340,7 +343,7 @@ final class VideoSession {
         recoveryRequests = 0
         lastRequest = nil
         if let token = packet.token {
-            var ack = Data([VideoMessage.acknowledgement.rawValue])
+            var ack = MessageKind.videoAcknowledgement.encoded
             ack.put(packet.epoch)
             ack.put(packet.id)
             ack.put(token.rawValue)

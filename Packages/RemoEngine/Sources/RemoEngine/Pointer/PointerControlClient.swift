@@ -4,13 +4,12 @@
 //
 
 import Foundation
-import RemoTransport
 
-/// The controlling peer's half of the pointer protocol, which `MouseControlServer` orders.
+/// The controlling peer's half of the pointer protocol, which `PointerControlServer` orders.
 ///
 /// Moves and scrolls are unreliable and may overtake a reliable button change, so every move
 /// carries the sequence of the last button it follows.
-struct MouseControlClient {
+struct PointerControlClient {
     /// The remote display's size in pixels, once the server has granted control.
     private(set) var displaySize: CGSize?
     private var position = CGPoint.zero
@@ -20,7 +19,7 @@ struct MouseControlClient {
     /// Accepts the server's grant. Returns false for anything else or a repeated grant.
     mutating func receiveReady(_ message: Data) -> Bool {
         guard displaySize == nil,
-            case let .ready(position, width, height) = try? MouseMessage(decoding: message)
+            case let .ready(position, width, height) = try? PointerMessage(decoding: message)
         else { return false }
         self.position = position
         displaySize = CGSize(width: Int(width), height: Int(height))
@@ -28,7 +27,7 @@ struct MouseControlClient {
     }
 
     /// Moves by a distance in remote display pixels, stopping at the display's edges.
-    mutating func move(by delta: CGVector) -> MouseMessage? {
+    mutating func move(by delta: CGVector) -> PointerMessage? {
         guard let displaySize, delta != .zero, delta.dx.isFinite, delta.dy.isFinite else {
             return nil
         }
@@ -39,24 +38,16 @@ struct MouseControlClient {
         return .move(sequence: sequence, afterButton: buttonSequence, position: position)
     }
 
-    mutating func press(_ button: MouseButton) -> MouseMessage? {
+    mutating func press(_ button: PointerButton) -> PointerMessage? {
         guard displaySize != nil else { return nil }
         sequence += 1
         buttonSequence = sequence
         return .button(sequence: sequence, action: button, position: position)
     }
 
-    func scroll(lines: Int) -> MouseMessage? {
+    func scroll(lines: Int) -> PointerMessage? {
         guard displaySize != nil, lines != 0 else { return nil }
         // The server rejects larger steps.
         return .scroll(lines: Int32(min(100, max(-100, lines))))
-    }
-}
-
-extension MouseMessage {
-    /// Button changes must arrive. A late move or scroll is only noise.
-    func mode(now: TimeInterval) -> MessageTransport.Mode {
-        if case .button = self { return .reliable }
-        return .unreliable(retryBudget: 0, firstSendDeadline: now + SessionTiming.pointerDeadline)
     }
 }

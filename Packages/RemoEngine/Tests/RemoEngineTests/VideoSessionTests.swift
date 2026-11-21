@@ -9,7 +9,7 @@ import Testing
 
 @Test func malformedVideoMessages() {
     for data in [Data(), Data([0x40]), Data([0x40, 0xff]), Data(repeating: 0x40, count: 42)] {
-        #expect(throws: (any Error).self) { try VideoPacket(data) }
+        #expect(throws: (any Error).self) { try VideoFrameMessage(data) }
     }
 }
 
@@ -45,7 +45,7 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
                 receiver.receive(.reliable, data)
                 return
             }
-            let frame = try VideoPacket(data)
+            let frame = try VideoFrameMessage(data)
             expectedPTS[frame.id] = submittedPTS
             if !lostInitial && frame.kind == .idr {
                 lostInitial = true
@@ -111,21 +111,21 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
 
 @Test func recoveryChunksRespectCreditAndRetryBackpressure() throws {
     let data = Data((0..<16_385).map { UInt8(truncatingIfNeeded: $0) })
-    let sender = try RecoverySender(id: 37, bytes: data)
-    var receiver = RecoveryReceiver(id: 37, total: data.count)
+    let sender = try KeyFrameSender(id: 37, bytes: data)
+    var receiver = KeyFrameReceiver(id: 37, total: data.count)
     var paused = true
     var confirmed = 0
     var firstPass = true
     while confirmed < data.count {
         try sender.pump { chunk, mode in
-            guard case .reliable = mode else { throw PacketError.invalid }
+            guard case .reliable = mode else { throw WireFormatError.invalid }
             guard chunk.count <= 55 else { throw NetworkMessageSession.SendError.invalidLength }
             if paused {
                 paused = false
                 throw NetworkMessageSession.SendError.backpressure
             }
             var body = chunk
-            try #require(try body.take(UInt8.self) == VideoMessage.keyFrameChunk.rawValue)
+            try #require(try body.take(UInt8.self) == MessageKind.keyFrameChunk.rawValue)
             try #require(try body.take(UInt64.self) == receiver.id)
             try #require(try body.take(UInt32.self) == UInt32(data.count))
             let offset = try body.take(UInt32.self)
@@ -148,12 +148,12 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     var requests: [Data] = []
     let session = VideoSession(
         send: { data, mode in
-            guard case .reliable = mode else { throw PacketError.invalid }
+            guard case .reliable = mode else { throw WireFormatError.invalid }
             requests.append(data)
         }, onFrame: { _, _, _ in }, onFailure: { Issue.record("Unexpected failure: \($0)") })
     try session.requestRefresh()
     try session.requestRefresh()
-    var expected = Data([VideoMessage.refresh.rawValue])
+    var expected = MessageKind.videoRefresh.encoded
     expected.put(UInt64(0))
     expected.put(UInt8(0))
     #expect(requests == [expected])
@@ -161,9 +161,9 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
 
 @Test @MainActor func higherBitRateRefreshesAnUnchangedPicture() async throws {
     let encoder = try VideoEncoder(width: 320, height: 180, framesPerSecond: 30, bitRate: 300_000)
-    var latest: VideoPacket?
+    var latest: VideoFrameMessage?
     let session = VideoSession(
-        encoder: encoder, send: { data, _ in latest = try VideoPacket(data) },
+        encoder: encoder, send: { data, _ in latest = try VideoFrameMessage(data) },
         onFrame: { _, _, _ in }, onFailure: { Issue.record("Unexpected failure: \($0)") })
     defer { session.close() }
     var buffer: CVPixelBuffer?
@@ -186,7 +186,7 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
         CVPixelBufferGetBaseAddressOfPlane(pixels, 1)!, 128,
         CVPixelBufferGetBytesPerRowOfPlane(pixels, 1) * 90)
     CVPixelBufferUnlockBaseAddress(pixels, [])
-    func encode(_ index: Int64) async throws -> VideoPacket {
+    func encode(_ index: Int64) async throws -> VideoFrameMessage {
         _ = try await session.sendFrame(
             pixels, presentationTime: CMTime(value: index, timescale: 30),
             duration: CMTime(value: 1, timescale: 30))
@@ -198,7 +198,7 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     session.requestKeyFrame()
     let refined = try await encode(30)
     #expect(refined.kind == .idr && refined.epoch > first.epoch)
-    func lumaError(_ packet: VideoPacket) async throws -> Int {
+    func lumaError(_ packet: VideoFrameMessage) async throws -> Int {
         let format = try #require(packet.format)
         let decoder = try VideoDecoder(format: format)
         let frame = try await decoder.decode(packet.sample(format: format))

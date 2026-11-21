@@ -31,14 +31,14 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
 
     private let diagnostics: Diagnostics
     private let trace: HeartbeatTrace
-    private var recent: [Fragment: UInt64] = [:]
+    private var recent: [Fragment: Instant] = [:]
     private var data = 0
     private var acks = 0
     private var unreliableRetries = 0
     private var reliableRetries = 0
     private var bytes = 0
     private var previousBytes = 0
-    private var previousTime = DispatchTime.now().uptimeNanoseconds
+    private var previousTime = Instant.now
 
     required init(framer: NWProtocolFramer.Instance) {
         diagnostics = Self.lock.withLock { Self.current }
@@ -55,9 +55,9 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
         guard trace.enabled, size == 10, buffer.count >= 10 else { return nil }
         let name: String
         switch (buffer[0], buffer[9]) {
-        case (0, SessionMessage.heartbeat.rawValue): name = "heartbeat"
-        case (2, SessionMessage.hello.rawValue): name = "hello"
-        case (2, SessionMessage.screenHello.rawValue): name = "screen hello"
+        case (0, MessageKind.heartbeat.rawValue): name = "heartbeat"
+        case (2, MessageKind.hello.rawValue): name = "hello"
+        case (2, MessageKind.screenHello.rawValue): name = "screen hello"
         default: return nil
         }
         let packet = UInt32(bigEndian: buffer.loadUnaligned(fromByteOffset: 1, as: UInt32.self))
@@ -117,7 +117,7 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
             framer.markFailed(error: .posix(.EIO))
             return
         }
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = Instant.now
         if let description { trace.write(framer.remote?.debugDescription, "UDP tx \(description)") }
         bytes += messageLength
         if ack { acks += 1 }
@@ -127,18 +127,18 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
                 if fragment.kind == 2 { reliableRetries += 1 } else { unreliableRetries += 1 }
             }
         }
-        if now - previousTime >= 1_000_000_000 {
+        if now - previousTime >= .seconds(1) {
             if diagnostics.wireStatistics { report(framer, now: now) }
             previousBytes = bytes
             previousTime = now
             // Every retry lifetime in use is shorter than three seconds.
-            recent = recent.filter { now - $0.value < 3_000_000_000 }
+            recent = recent.filter { now - $0.value < .seconds(3) }
         }
     }
 
-    private func report(_ framer: NWProtocolFramer.Instance, now: UInt64) {
-        let seconds = Double(now - previousTime) / 1e9
-        let mbps = Double(bytes - previousBytes) * 8 / max(seconds, 1e-9) / 1e6
+    private func report(_ framer: NWProtocolFramer.Instance, now: Instant) {
+        let seconds = max(now - previousTime, .milliseconds(1)) / .seconds(1)
+        let mbps = Double(bytes - previousBytes) * 8 / seconds / 1e6
         diagnostics.handler?(
             Diagnostic(
                 peer: framer.remote?.debugDescription, kind: .wire,
@@ -151,7 +151,7 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
     func stop(framer: NWProtocolFramer.Instance) -> Bool {
         trace.write(framer.remote?.debugDescription, "UDP flow stopped")
         if diagnostics.wireStatistics, bytes != previousBytes {
-            report(framer, now: DispatchTime.now().uptimeNanoseconds)
+            report(framer, now: .now)
         }
         return true
     }

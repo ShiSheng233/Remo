@@ -2,106 +2,10 @@ import AVFAudio
 import Foundation
 import RemoCodec
 
-struct AudioPacketQueue {
-    private var packets: [UInt64: CapturedAudioPacket] = [:]
-    private static let capacity = 24
-    private var nextTimestamp: Double?
-    private var lastPlayed: UInt64?
-    private(set) var latePackets = 0
-    var isEmpty: Bool { packets.isEmpty }
-
-    mutating func insert(_ packet: CapturedAudioPacket) -> Bool {
-        if let lastPlayed, packet.sequence <= lastPlayed {
-            latePackets += 1
-            return false
-        }
-        if let nextTimestamp, Double(packet.timestamp) < nextTimestamp - 480 {
-            latePackets += 1
-            return false
-        }
-        packets[packet.sequence] = packet
-        if packets.count > Self.capacity, let oldest = packets.keys.min() {
-            packets.removeValue(forKey: oldest)
-        }
-        return true
-    }
-
-    /// The audio device advances this clock by one 20 ms slot per rendered buffer.
-    mutating func pop() -> CapturedAudioPacket? {
-        let first = packets.keys.min().flatMap { packets[$0] }
-        guard let timestamp = nextTimestamp ?? first.map({ Double($0.timestamp) }) else { return nil }
-        nextTimestamp = timestamp + 960
-        guard let first, Double(first.timestamp) < timestamp + 480 else { return nil }
-        packets.removeValue(forKey: first.sequence)
-        lastPlayed = first.sequence
-        nextTimestamp = Double(first.timestamp) + 960
-        return first
-    }
-
-    var hasNextPacket: Bool {
-        guard let id = packets.keys.min(), let packet = packets[id] else { return false }
-        return nextTimestamp.map { Double(packet.timestamp) < $0 + 480 } ?? true
-    }
-
-    mutating func reanchor() { nextTimestamp = nil }
-}
-
-struct AudioFrameRenderer {
-    var consecutiveGaps = 0
-    private var needsFadeIn = false
-    private var lastSamples: [Float] = [0, 0]
-    private(set) var decodeFailures = 0
-    private(set) var concealedPackets = 0
-    private(set) var fadeFallbacks = 0
-
-    mutating func resetHistory() {
-        consecutiveGaps = 0
-        needsFadeIn = false
-        lastSamples = [0, 0]
-    }
-
-    mutating func render(_ packet: CapturedAudioPacket?, using decoder: OpusDecoder) -> AVAudioPCMBuffer? {
-        let pcm: AVAudioPCMBuffer
-        if let packet, let decoded = try? decoder.decode(packet.opus) {
-            pcm = decoded
-            consecutiveGaps = 0
-        } else {
-            if packet != nil { decodeFailures += 1 }
-            consecutiveGaps += 1
-            concealedPackets += 1
-            if let concealed = try? decoder.concealMissingFrame() {
-                pcm = concealed
-            } else {
-                guard let silence = AVAudioPCMBuffer(pcmFormat: OpusFormat.pcm, frameCapacity: 960)
-                else { return nil }
-                silence.frameLength = 960
-                for channel in 0..<2 {
-                    let samples = silence.floatChannelData![channel]
-                    samples.update(repeating: 0, count: 960)
-                    for i in 0..<120 { samples[i] = lastSamples[channel] * Float(119 - i) / 120 }
-                    lastSamples[channel] = 0
-                }
-                fadeFallbacks += 1
-                needsFadeIn = true
-                return silence
-            }
-        }
-        for channel in 0..<2 {
-            let samples = pcm.floatChannelData![channel]
-            if needsFadeIn {
-                for i in 0..<120 { samples[i] *= Float(i) / 120 }
-            }
-            lastSamples[channel] = samples[Int(pcm.frameLength) - 1]
-        }
-        needsFadeIn = false
-        return pcm
-    }
-}
-
-/// Accepts packets on the client's main actor. Audio processing runs on its own serial queue.
+/// Plays `AudioMessage`s. Accepts them on the client's main actor. Audio processing runs on its own serial queue.
 @MainActor
-final class ScreenAudioPlayback {
-    typealias Statistics = AudioPlaybackStatistics
+final class AudioPlayback {
+    typealias Statistics = ClientStatistics.Audio
 
     private let worker: AudioPlaybackWorker
     var statistics: Statistics { worker.statistics }
@@ -128,20 +32,20 @@ private final class AudioPlaybackWorker: @unchecked Sendable {
     private let engine: AVAudioEngine
     private let node = AVAudioPlayerNode()
     private var decoder: OpusDecoder?
-    private var queue = AudioPacketQueue()
+    private var queue = AudioJitterBuffer()
     private var startupPending = false
-    private let trace: AudioPCMTrace?
+    private let trace: AudioTrace?
     private let traceDirectory: URL?
     private var traceEnd: Int64 = 0
     private var tapInstalled = false
     private var scheduled = 0
     private var generation = 0
     private var running = false
-    private var renderer = AudioFrameRenderer()
+    private var renderer = AudioConcealer()
     private var rebufferCount = 0
     private let onError: @MainActor (Error) -> Void
 
-    var statistics: ScreenAudioPlayback.Statistics {
+    var statistics: AudioPlayback.Statistics {
         serial.sync {
             .init(decodeFailures: renderer.decodeFailures, concealedPackets: renderer.concealedPackets,
                 fadeFallbacks: renderer.fadeFallbacks, rebufferCount: rebufferCount, latePackets: queue.latePackets)
@@ -152,14 +56,14 @@ private final class AudioPlaybackWorker: @unchecked Sendable {
         self.engine = engine
         self.onError = onError
         self.traceDirectory = traceDirectory
-        trace = AudioPCMTrace.open("before-playback", in: traceDirectory)
+        trace = AudioTrace.open("before-playback", in: traceDirectory)
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: OpusFormat.pcm)
     }
 
     func receive(_ message: Data) {
         serial.async { [weak self] in
-            guard let self, let packet = CapturedAudioPacket(message: message), queue.insert(packet) else { return }
+            guard let self, let packet = try? AudioMessage(decoding: message), queue.insert(packet) else { return }
             if !running { startAfterBuffering() }
         }
     }
@@ -173,7 +77,7 @@ private final class AudioPlaybackWorker: @unchecked Sendable {
             startupPending = false
             do {
                 if decoder == nil { decoder = try OpusDecoder() }
-                if trace != nil, !tapInstalled, let mixTrace = AudioPCMTrace.open("mixer-output", in: traceDirectory) {
+                if trace != nil, !tapInstalled, let mixTrace = AudioTrace.open("mixer-output", in: traceDirectory) {
                     engine.mainMixerNode.installTap(onBus: 0, bufferSize: 960, format: nil) {
                         @Sendable buffer, time in
                         mixTrace.record(buffer, host: time.hostTime, playerFrame: time.sampleTime, kind: "mix")
@@ -209,7 +113,7 @@ private final class AudioPlaybackWorker: @unchecked Sendable {
         }
         traceEnd = 0
         scheduled = 0
-        queue = AudioPacketQueue()
+        queue = AudioJitterBuffer()
         decoder = nil
         renderer.resetHistory()
     }
