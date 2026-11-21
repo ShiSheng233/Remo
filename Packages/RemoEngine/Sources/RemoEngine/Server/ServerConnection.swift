@@ -39,6 +39,8 @@ final class ServerConnection {
     private var failed = false
     private let started = Instant.now
     private var lastSeen = Instant.now
+    private var lastNewAck: Instant?
+    private var previousAcceptedDataPackets: UInt32 = 0
 
     // Source
     private var source: (any ScreenFrameSource)?
@@ -112,7 +114,10 @@ final class ServerConnection {
 
         if let session, !stopping {
             session.onDeliveryConfirmed = { [weak self] in
-                self?.lastSeen = .now
+                guard let self else { return }
+                let now = Instant.now
+                lastNewAck = now
+                lastSeen = now
             }
             lastSeen = .now
             lastReport = lastSeen
@@ -370,6 +375,8 @@ final class ServerConnection {
                 packetsQueued: audioQueued, sourceGaps: audioSourceGaps,
                 backpressureDrops: audioBackpressure, peakQueueDelay: audioQueuePeak) : nil
         audioQueuePeak = .zero
+        let transport = session.statistics
+        let sampledAt = Instant.now
         let statistics = ServerStatistics(
             framesPerSecond: Double(queued - previousFrames) / seconds,
             videoBitsPerSecond: Double(videoBytes - previousBytes) * 8 / seconds,
@@ -377,7 +384,10 @@ final class ServerConnection {
             codecDrops: codecDrops, encoderBitRate: targetBitRate,
             captureSkips: captureSkips, checkpointSkips: checkpointSkips,
             acknowledgedReferences: acknowledgedReferences, controlsSent: controls,
-            heartbeatsReceived: heartbeats, audio: audio, link: LinkStatistics(session.statistics))
+            heartbeatsReceived: heartbeats, dataPacketsAccepted: transport.acceptedDataPackets - previousAcceptedDataPackets,
+            newAckAge: lastNewAck.map { sampledAt - $0 }, blocked: transport.blocked, probing: transport.probing,
+            audio: audio, link: LinkStatistics(transport))
+        previousAcceptedDataPackets = transport.acceptedDataPackets
         previousBytes = videoBytes
         previousFrames = queued
         lastReport = now

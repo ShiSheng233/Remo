@@ -39,6 +39,10 @@ public final class MessageTransport {
     public struct Statistics {
         public let bitsPerSecond: Double
         public let roundTripTime: TimeInterval?
+        /// Includes retransmissions. Standalone ACK datagrams use no packet number.
+        public let acceptedDataPackets: UInt32
+        public let blocked: Bool
+        public let probing: Bool
         public let estimatedQueueDelay: TimeInterval
         /// Admitted messages whose deadline elapsed before any datagram was accepted by I/O.
         public let expiredBeforeFirstSend: [UnreliablePriority: UInt64]
@@ -177,6 +181,7 @@ public final class MessageTransport {
     public var statistics: Statistics {
         return Statistics(
             bitsPerSecond: rate, roundTripTime: rtt,
+            acceptedDataPackets: lastPacket, blocked: blocked, probing: probeAt != nil,
             estimatedQueueDelay: Double(queuedBytes) * 8 / rate, expiredBeforeFirstSend: expiredBeforeFirstSend)
     }
 

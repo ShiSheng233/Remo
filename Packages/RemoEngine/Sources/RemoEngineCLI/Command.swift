@@ -141,7 +141,9 @@ enum Command {
                 case .clientConnected: break
                 case .streamingStarted(let peer): log("[\(peer)] streaming started")
                 case .clientDisconnected(let peer, let reason, _): log("[\(peer)] \(reason)")
-                case .statistics(let peer, let statistics): log("[\(peer)] \(statistics)")
+                case .statistics(let peer, let statistics):
+                    let stamp = Date.now.formatted(.iso8601.time(includingFractionalSeconds: true))
+                    log("\(stamp) [\(peer)] \(statistics)")
                 }
             }
         } catch {

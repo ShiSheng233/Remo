@@ -25,6 +25,11 @@ public struct ServerStatistics: Sendable {
     public let acknowledgedReferences: Int
     public let controlsSent: UInt64
     public let heartbeatsReceived: Int
+    /// DATA datagrams accepted by local I/O during this reporting interval.
+    public let dataPacketsAccepted: UInt32
+    public let newAckAge: Duration?
+    public let blocked: Bool
+    public let probing: Bool
     public let audio: Audio?
     public let link: LinkStatistics
 }
@@ -44,6 +49,7 @@ extension ServerStatistics: CustomStringConvertible {
         }
         return "video queued "
             + String(format: "%.1f fps %.2f Mbps", framesPerSecond, videoBitsPerSecond / 1e6)
-            + "  \(details)  \(link)"
+            + "  \(details)  \(link) dataTxAccepted=\(dataPacketsAccepted)"
+            + " newAckAge=\(newAckAge?.logDescription ?? "pending") blocked=\(blocked) probing=\(probing)"
     }
 }
