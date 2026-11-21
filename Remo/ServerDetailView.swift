@@ -176,7 +176,7 @@ struct ServerDetailView: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
             LabeledContent("UDP port") {
-                TextField("UDP port", text: $draft.address.port, prompt: Text("7711"))
+                TextField("UDP port", text: $draft.address.port, prompt: Text(verbatim: RemoteServer.Address.defaultPort))
                     .keyboardType(.numberPad)
                     .multilineTextAlignment(.trailing)
             }

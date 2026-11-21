@@ -8,12 +8,9 @@ final class AudioPCMTrace: Sendable {
     private let writer = DispatchQueue(label: "RemoEngine.PCMTrace", qos: .utility)
     private let slots = DispatchSemaphore(value: 96)
 
-    static func open(_ stage: String) -> AudioPCMTrace? {
-        guard let path = ProcessInfo.processInfo.environment["REMO_AUDIO_TRACE_DIR"], !path.isEmpty else {
-            return nil
-        }
+    static func open(_ stage: String, in directory: URL?) -> AudioPCMTrace? {
+        guard let directory else { return nil }
         do {
-            let directory = URL(fileURLWithPath: path, isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let base = directory.appendingPathComponent("\(stage)-\(UUID().uuidString)")
             return try AudioPCMTrace(base: base)

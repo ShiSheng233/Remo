@@ -5,11 +5,13 @@
 
 import Foundation
 
+public enum MouseButton: UInt8, Sendable {
+    case leftClick = 1, rightClick, leftDown, leftUp
+}
+
 /// Positions are normalized to the captured display, with the origin at its upper left.
-public enum MouseMessage: Equatable {
-    public enum Button: UInt8 {
-        case leftClick = 1, rightClick, leftDown, leftUp
-    }
+enum MouseMessage: Equatable {
+    typealias Button = MouseButton
 
     case ready(position: CGPoint, width: UInt32, height: UInt32)
     case move(sequence: UInt64, afterButton: UInt64, position: CGPoint)
@@ -21,7 +23,7 @@ public enum MouseMessage: Equatable {
         case move = 1, button, scroll
     }
 
-    public var encoded: Data {
+    var encoded: Data {
         var data = Data()
         switch self {
         case let .ready(position, width, height):
@@ -49,7 +51,7 @@ public enum MouseMessage: Equatable {
         return data
     }
 
-    public init(decoding bytes: Data) throws {
+    init(decoding bytes: Data) throws {
         var data = bytes
         switch SessionMessage(rawValue: try data.take(UInt8.self)) {
         case .mouseReady:

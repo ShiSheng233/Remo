@@ -10,9 +10,7 @@ import Foundation
 import ImageIO
 import Network
 import Observation
-import RemoCodec
 import RemoEngine
-import RemoTransport
 import UIKit
 
 @MainActor
@@ -29,20 +27,9 @@ final class StreamPlayer {
     var mouseAvailable: Bool { mouseDisplaySize != nil }
 
     private var mouseDisplaySize: CGSize?
-    @ObservationIgnored private var mousePosition = CGPoint.zero
-    @ObservationIgnored private var mouseSequence: UInt64 = 0
-    @ObservationIgnored private var mouseButtonSequence: UInt64 = 0
+    @ObservationIgnored private var client: RemoteScreenClient?
     @ObservationIgnored private var task: Task<Void, Never>?
-    @ObservationIgnored private var transport: NetworkMessageSession?
-    @ObservationIgnored private var playback: ScreenAudioPlayback?
-    @ObservationIgnored private var audioDisabled = false
-    @ObservationIgnored private var video: VideoSession?
-    @ObservationIgnored private var failure: String?
-    @ObservationIgnored private var lastSeen: TimeInterval = 0
-    @ObservationIgnored private var lastFrame: TimeInterval = 0
-    @ObservationIgnored private var receivedControl = false
     @ObservationIgnored private var lastPixels: CVPixelBuffer?
-    @ObservationIgnored private var onFinalFrame: ((Data) -> Void)?
 
     /// Starts a session; `onFinalFrame` receives a JPEG of the last frame shown once it ends.
     func connect(
@@ -50,217 +37,83 @@ final class StreamPlayer {
         onFinalFrame: ((Data) -> Void)? = nil
     ) {
         guard task == nil else { return }
-        self.onFinalFrame = onFinalFrame
-        surface = VideoSurface()
+        let surface = VideoSurface()
+        self.surface = surface
         phase = .connecting
-        task = Task { await run(endpoint, wireGuard: wireGuard) }
-    }
-
-    func disconnect() {
-        task?.cancel()
-    }
-
-    private func run(_ endpoint: NWEndpoint, wireGuard: WireGuardConfiguration?) async {
-        let setupTimeout = Task { [weak self] in
-            try await Task.sleep(for: .seconds(8))
-            self?.fail(
-                wireGuard == nil
-                    ? "Couldn’t open a connection to the server." : "The WireGuard handshake timed out.")
-        }
-        defer {
-            setupTimeout.cancel()
-            playback?.stop()
-            playback = nil
-            audioDisabled = false
-            video?.close()
-            video = nil
-            let session = transport
-            transport = nil
-            if let session {
-                try? session.send(Data([SessionMessage.goodbye.rawValue]), mode: .reliable)
-                session.cancel()
-            }
+        let client = RemoteScreenClient(
+            onFrame: { [weak self] in try self?.present($0, on: surface) },
+            onEvent: { [weak self] in self?.handle($0) })
+        self.client = client
+        task = Task {
+            let failure = await client.run(
+                wireGuard.map { .datagrams(WireGuardDatagramConnection($0)) } ?? .udp(endpoint))
             if let pixels = lastPixels, let onFinalFrame {
                 Task {
                     if let jpeg = await Self.thumbnail(of: pixels) { onFinalFrame(jpeg) }
                 }
             }
             lastPixels = nil
-            onFinalFrame = nil
-            surface = nil
+            self.surface = nil
+            self.client = nil
             videoSize = nil
-            phase = failure.map(Phase.failed) ?? .idle
-            failure = nil
-            receivedControl = false
             mouseDisplaySize = nil
-            mouseSequence = 0
-            mouseButtonSequence = 0
+            phase = failure.map { .failed(Self.message(for: $0, wireGuard: wireGuard != nil)) } ?? .idle
             task = nil
         }
-
-        do {
-            let receive: (MessageTransport.Channel, Data) -> Void = { [weak self] in
-                self?.receive($0, $1)
-            }
-            let close: (NetworkMessageSession.CloseReason) -> Void = { [weak self] reason in
-                guard let self, transport != nil else { return }
-                if case .network(let error) = reason {
-                    fail(error.localizedDescription)
-                } else {
-                    fail("The connection to the server closed.")
-                }
-            }
-            let session: NetworkMessageSession
-            if let wireGuard {
-                session = try await NetworkMessageSession(
-                    driver: WireGuardDatagramConnection(wireGuard),
-                    dataHandler: receive, closeHandler: close)
-            } else {
-                session = try await NetworkMessageSession(
-                    connection: NWConnection(to: endpoint, using: .udp),
-                    dataHandler: receive, closeHandler: close)
-            }
-            transport = session
-            setupTimeout.cancel()
-            try Task.checkCancellation()
-
-            video = VideoSession(
-                send: { [weak self] data, mode in
-                    guard let session = self?.transport else {
-                        throw NetworkMessageSession.SendError.closed
-                    }
-                    try session.send(data, mode: mode)
-                },
-                onFrame: { [weak self] _, frame, _ in self?.present(frame) },
-                onFailure: { [weak self] error in
-                    self?.fail("Video decoding failed. \(error.localizedDescription)")
-                })
-            // A screen client can receive either the desktop or the server’s test pattern.
-            try session.send(Data([SessionMessage.screenHello.rawValue]), mode: .reliable)
-            phase = .waitingForVideo
-            try await keepAlive(session)
-        } catch is CancellationError {
-        } catch {
-            fail(error.localizedDescription)
-        }
     }
 
-    private func keepAlive(_ session: NetworkMessageSession) async throws {
-        let started = ProcessInfo.processInfo.systemUptime
-        lastSeen = started
-        lastFrame = started
-        var nextMouseHello = started
-        while !Task.isCancelled {
-            let now = ProcessInfo.processInfo.systemUptime
-            if now - lastSeen >= 4 {
-                fail("The server stopped responding.")
-                return
-            }
-            if phase == .waitingForVideo, now - started >= 15 {
-                fail("The server responded but no video arrived.")
-                return
-            }
-            if receivedControl, now - lastFrame >= 2 {
-                try video?.requestRefresh()
-            }
-            do {
-                if !mouseAvailable, now >= nextMouseHello {
-                    nextMouseHello = now + 1.2
-                    try session.send(Data([SessionMessage.mouseHello.rawValue]), mode: .reliable)
-                }
-                try session.send(
-                    Data([SessionMessage.heartbeat.rawValue]), mode: .unreliable(retryBudget: 0))
-            } catch NetworkMessageSession.SendError.backpressure {
-                // The next heartbeat replaces this one.
-            }
-            try await Task.sleep(for: .milliseconds(400))
-        }
+    func disconnect() {
+        client?.disconnect()
     }
 
-    private func receive(_ channel: MessageTransport.Channel, _ data: Data) {
-        guard task?.isCancelled == false, video?.receive(channel, data) != true,
-            let byte = data.first
-        else { return }
-
-        if channel == .unreliable, byte == SessionMessage.audio.rawValue, !audioDisabled {
-            if playback == nil {
-                playback = ScreenAudioPlayback { [weak self] error in
-                    self?.audioDisabled = true
-                    NSLog("Audio playback failed: %@", error.localizedDescription)
-                }
-            }
-            playback?.receive(data)
-            return
-        }
-        guard channel == .reliable else { return }
-        switch SessionMessage(rawValue: byte) {
-        case .control where data.count == 9:
-            receivedControl = true
-            lastSeen = ProcessInfo.processInfo.systemUptime
-        case .modeMismatch where data.count == 1:
-            fail("The server doesn’t support this video session.")
-        case .mouseReady where !mouseAvailable:
-            if case let .ready(position, width, height) = try? MouseMessage(decoding: data) {
-                mousePosition = position
-                mouseDisplaySize = CGSize(width: Int(width), height: Int(height))
-            }
-        default: break
+    private func handle(_ event: RemoteScreenClient.Event) {
+        switch event {
+        case .state(.connecting): phase = .connecting
+        case .state(.waitingForVideo): phase = .waitingForVideo
+        case .state(.streaming): phase = .streaming
+        case .state(.idle), .statistics: break
+        case .pointerAvailable(let size): mouseDisplaySize = size
         }
     }
 
     func handleTrackpad(_ gesture: TrackpadGesture) {
-        guard phase == .streaming, task?.isCancelled == false, let transport,
-            let displaySize = mouseDisplaySize, let bounds = surface?.bounds, !bounds.isEmpty
+        guard let client, let displaySize = mouseDisplaySize, let surface, !surface.bounds.isEmpty
         else { return }
-
-        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
-
-        let message: MouseMessage
-        let mode: MessageTransport.Mode
         switch gesture {
         case let .move(delta):
-            guard delta != .zero else { return }
             // Finger travel follows the picture, so a zoomed view moves the pointer less.
-            let scale = min(bounds.width / displaySize.width, bounds.height / displaySize.height)
-                * (surface?.zoom ?? 1)
-            mousePosition = CGPoint(
-                x: min(1, max(0, mousePosition.x + delta.x / (displaySize.width * scale))),
-                y: min(1, max(0, mousePosition.y + delta.y / (displaySize.height * scale))))
-            mouseSequence += 1
-            message = .move(
-                sequence: mouseSequence, afterButton: mouseButtonSequence, position: mousePosition)
-            mode = .unreliable(retryBudget: 0, firstSendDeadline: now + 0.05)
+            let bounds = surface.bounds
+            let scale =
+                min(bounds.width / displaySize.width, bounds.height / displaySize.height)
+                * surface.zoom
+            client.movePointer(by: CGVector(dx: delta.x / scale, dy: delta.y / scale))
         case let .button(action):
-            mouseSequence += 1
-            mouseButtonSequence = mouseSequence
-            message = .button(sequence: mouseSequence, action: action, position: mousePosition)
-            mode = .reliable
+            client.pressPointer(action)
         case let .scroll(lines):
-            guard lines != 0 else { return }
-            message = .scroll(lines: Int32(clamping: lines))
-            mode = .unreliable(retryBudget: 0, firstSendDeadline: now + 0.05)
-        }
-        do {
-            try transport.send(message.encoded, mode: mode)
-        } catch {
-            if case .unreliable = mode { return }
-            fail("Mouse input couldn’t be sent. \(error.localizedDescription)")
+            client.scroll(lines: lines)
         }
     }
 
-    private func present(_ frame: DecodedVideoFrame) {
-        guard task?.isCancelled == false, let surface else { return }
-        lastFrame = ProcessInfo.processInfo.systemUptime
-        lastSeen = lastFrame
-        do {
-            guard try surface.present(frame) else { return }
-            lastPixels = frame.pixels
-            let size = CGSize(
-                width: CVPixelBufferGetWidth(frame.pixels), height: CVPixelBufferGetHeight(frame.pixels))
-            if videoSize != size { videoSize = size }
-            if phase == .waitingForVideo { phase = .streaming }
-        } catch {
-            fail("Video display failed. \(error.localizedDescription)")
+    private func present(_ frame: VideoFrame, on surface: VideoSurface) throws {
+        guard try surface.present(frame) else { return }
+        lastPixels = frame.pixels
+        let size = CGSize(
+            width: CVPixelBufferGetWidth(frame.pixels), height: CVPixelBufferGetHeight(frame.pixels))
+        if videoSize != size { videoSize = size }
+    }
+
+    private static func message(for failure: RemoteScreenClient.Failure, wireGuard: Bool) -> String {
+        switch failure {
+        case .setupTimedOut:
+            wireGuard ? "The WireGuard handshake timed out." : "Couldn’t open a connection to the server."
+        case .connectionFailed(let error), .sendFailed(let error): error.localizedDescription
+        case .network(let error): error.localizedDescription
+        case .connectionClosed: "The connection to the server closed."
+        case .serverNotResponding: "The server stopped responding."
+        case .noVideo: "The server responded but no video arrived."
+        case .videoFailed(let error): "Video decoding failed. \(error.localizedDescription)"
+        case .presentationFailed(let error): "Video display failed. \(error.localizedDescription)"
+        case .pointerInputFailed(let error): "Mouse input couldn’t be sent. \(error.localizedDescription)"
         }
     }
 
@@ -278,11 +131,5 @@ final class StreamPlayer {
             CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.8
         ]
         return CIContext().jpegRepresentation(of: output, colorSpace: colorSpace, options: options)
-    }
-
-    private func fail(_ message: String) {
-        guard task?.isCancelled == false else { return }
-        failure = message
-        task?.cancel()
     }
 }

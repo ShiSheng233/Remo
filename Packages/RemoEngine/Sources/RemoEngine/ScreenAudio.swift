@@ -3,13 +3,13 @@ import CoreMedia
 import Foundation
 import RemoCodec
 
-public struct CapturedAudioPacket: Sendable {
-    public let sequence: UInt64
+struct CapturedAudioPacket: Sendable {
+    let sequence: UInt64
     /// Capture PTS in 48 kHz sample ticks.
-    public let timestamp: Int64
-    public let opus: Data
+    let timestamp: Int64
+    let opus: Data
 
-    public var message: Data {
+    var message: Data {
         var data = Data([SessionMessage.audio.rawValue])
         data.put(sequence)
         data.put(timestamp)
@@ -36,13 +36,16 @@ public struct CapturedAudioPacket: Sendable {
 
 /// Used on the serial audio capture queue.
 final class ScreenAudioPacketizer {
-    private let trace = AudioPCMTrace.open("before-encode")
+    private let trace: AudioPCMTrace?
     private let encoder: OpusEncoder
     private let partial = AVAudioPCMBuffer(pcmFormat: OpusFormat.pcm, frameCapacity: OpusFormat.frames)!
     private var nextTimestamp: Int64?
     private var sequence: UInt64 = 0
 
-    init() throws { encoder = try OpusEncoder() }
+    init(traceDirectory: URL? = nil) throws {
+        encoder = try OpusEncoder()
+        trace = AudioPCMTrace.open("before-encode", in: traceDirectory)
+    }
 
     func append(_ sample: CMSampleBuffer, emit: (CapturedAudioPacket) -> Void) throws {
         guard let description = sample.formatDescription else { throw OpusFormat.Failure.unsupportedFormat }

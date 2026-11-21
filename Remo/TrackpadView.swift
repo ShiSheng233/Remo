@@ -11,7 +11,7 @@ enum TrackpadGesture {
     case move(CGPoint)
     /// Whole lines; positive values move the content down, following the finger.
     case scroll(lines: Int)
-    case button(MouseMessage.Button)
+    case button(MouseButton)
 }
 
 struct TrackpadView: View {

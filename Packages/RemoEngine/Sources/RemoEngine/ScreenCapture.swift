@@ -6,29 +6,48 @@ import Foundation
     import ScreenCaptureKit
 #endif
 
-/// A bounded source of screen frames. The consumer may poll at its own encoding cadence.
+/// One picture from a `ScreenFrameSource`.
+public struct ScreenFrame {
+    /// 4:2:0 bi-planar video-range pixels (`kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`)
+    /// at the source's size.
+    public let pixels: CVPixelBuffer
+    /// When the picture was produced. A new picture must have a new timestamp.
+    public let timestamp: CMTime
+
+    public init(pixels: CVPixelBuffer, timestamp: CMTime) {
+        self.pixels = pixels
+        self.timestamp = timestamp
+    }
+}
+
+/// Frames for a server to stream, such as a display capture. The server polls it at its own
+/// frame rate, sends only new pictures, re-sends a still one periodically so a client can
+/// recover, and scales them down when the link is slow.
+///
+/// A server starts one source per client and calls it only from the main actor.
 public protocol ScreenFrameSource: AnyObject {
     var width: Int { get }
     var height: Int { get }
-    func latestSample() throws -> CMSampleBuffer?
+    /// The newest complete picture, or nil before the first. Throwing ends the client's session.
+    func latestFrame() throws -> ScreenFrame?
     nonisolated(nonsending) func stop() async throws
 }
 
-public protocol ScreenAudioSource: ScreenFrameSource {
+protocol ScreenAudioSource: ScreenFrameSource {
     var audioPackets: AsyncThrowingStream<CapturedAudioPacket, Error> { get }
 }
 
 #if os(macOS)
     @available(macOS 12.3, *)
-    public struct ScreenCaptureConfiguration {
-        public enum Failure: Error { case noMainDisplay, invalidConfiguration, audioUnavailable }
+    struct ScreenCaptureConfiguration {
+        enum Failure: Error { case noMainDisplay, invalidConfiguration, audioUnavailable }
         private let filter: SCContentFilter
-        public let width: Int
-        public let height: Int
-        public let framesPerSecond: Int32
+        let width: Int
+        let height: Int
+        let framesPerSecond: Int32
 
         /// Resolves the main display and screen recording permission before accepting clients.
-        public static func mainDisplay(maximumDimension: Int = 1920, framesPerSecond: Int32 = 30)
+        static func mainDisplay(maximumDimension: Int = 1920, framesPerSecond: Int32 = 30)
             async throws -> Self
         {
             try await mainDisplay(
@@ -36,7 +55,7 @@ public protocol ScreenAudioSource: ScreenFrameSource {
                 framesPerSecond: framesPerSecond)
         }
 
-        public static func mainDisplay(
+        static func mainDisplay(
             maximumWidth: Int, maximumHeight: Int, framesPerSecond: Int32
         )
             async throws -> Self
@@ -79,7 +98,9 @@ public protocol ScreenAudioSource: ScreenFrameSource {
                 framesPerSecond: framesPerSecond)
         }
 
-        public nonisolated(nonsending) func start(capturesAudio: Bool = false) async throws -> any ScreenFrameSource {
+        nonisolated(nonsending) func start(capturesAudio: Bool = false, audioTraceDirectory: URL? = nil)
+            async throws -> any ScreenFrameSource
+        {
             let config = SCStreamConfiguration()
             config.width = width
             config.height = height
@@ -93,7 +114,8 @@ public protocol ScreenAudioSource: ScreenFrameSource {
                 config.sampleRate = 48_000
                 config.channelCount = 2
             }
-            let output = try ScreenOutput(capturesAudio: capturesAudio)
+            let output = try ScreenOutput(
+                capturesAudio: capturesAudio, audioTraceDirectory: audioTraceDirectory)
             let stream = SCStream(filter: filter, configuration: config, delegate: output)
             try stream.addStreamOutput(
                 output, type: .screen, sampleHandlerQueue: DispatchQueue(label: "RemoEngine.screen")
@@ -123,7 +145,13 @@ public protocol ScreenAudioSource: ScreenFrameSource {
         }
 
         var audioPackets: AsyncThrowingStream<CapturedAudioPacket, Error> { output.audioPackets }
-        func latestSample() throws -> CMSampleBuffer? { try output.latest().get() }
+        func latestFrame() throws -> ScreenFrame? {
+            guard let sample = try output.latest().get(),
+                let pixels = CMSampleBufferGetImageBuffer(sample)
+            else { return nil }
+            return ScreenFrame(
+                pixels: pixels, timestamp: CMSampleBufferGetPresentationTimeStamp(sample))
+        }
         nonisolated(nonsending) func stop() async throws {
             defer { output.finishAudio() }
             try await stream.stopCapture()
@@ -139,8 +167,9 @@ public protocol ScreenAudioSource: ScreenFrameSource {
         let audioPackets: AsyncThrowingStream<CapturedAudioPacket, Error>
         private let continuation: AsyncThrowingStream<CapturedAudioPacket, Error>.Continuation
 
-        init(capturesAudio: Bool) throws {
-            packetizer = capturesAudio ? try ScreenAudioPacketizer() : nil
+        init(capturesAudio: Bool, audioTraceDirectory: URL?) throws {
+            packetizer =
+                capturesAudio ? try ScreenAudioPacketizer(traceDirectory: audioTraceDirectory) : nil
             var sink: AsyncThrowingStream<CapturedAudioPacket, Error>.Continuation!
             audioPackets = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(3)) { sink = $0 }
             continuation = sink

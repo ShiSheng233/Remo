@@ -11,8 +11,8 @@ let package = Package(
     dependencies: [.package(path: "../RemoCodec"), .package(path: "../RemoTransport")],
     targets: [
         .target(name: "RemoEngine", dependencies: ["RemoCodec", "RemoTransport"]),
-        .executableTarget(
-            name: "RemoEngineCLI", dependencies: ["RemoEngine", "RemoTransport", "RemoCodec"]),
+        .executableTarget(name: "RemoEngineCLI", dependencies: ["RemoEngine"]),
+        .testTarget(name: "RemoEngineCLITests", dependencies: ["RemoEngineCLI"]),
         .testTarget(
             name: "RemoEngineTests", dependencies: ["RemoEngine", "RemoCodec", "RemoTransport"]),
     ]

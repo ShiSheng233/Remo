@@ -4,14 +4,17 @@
 
 import Foundation
 import Network
+import RemoEngine
 
 nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
     struct Address: Codable, Hashable, Sendable {
         var host = ""
-        var port = "7711"
+        var port = Self.defaultPort
+
+        static let defaultPort = String(RemoProtocol.defaultPort)
 
         var endpoint: NWEndpoint? {
-            Self.endpoint(host: host, port: port, defaultPort: "7711")
+            Self.endpoint(host: host, port: port, defaultPort: Self.defaultPort)
         }
 
         /// The address as it would be typed, with IPv6 hosts bracketed.
@@ -19,7 +22,7 @@ nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
             let address = host.trimmingCharacters(in: .whitespacesAndNewlines)
             let portText = port.trimmingCharacters(in: .whitespacesAndNewlines)
             let bracketed = address.contains(":") && !address.hasPrefix("[") ? "[\(address)]" : address
-            return "\(bracketed):\(portText.isEmpty ? "7711" : portText)"
+            return "\(bracketed):\(portText.isEmpty ? Self.defaultPort : portText)"
         }
 
         static func endpoint(host: String, port: String, defaultPort: String) -> NWEndpoint? {
@@ -127,7 +130,7 @@ extension RemoteServer {
                 useWireGuard: defaults.bool(forKey: "useWireGuard"),
                 direct: Address(
                     host: defaults.string(forKey: "serverHost") ?? "",
-                    port: defaults.string(forKey: "serverPort") ?? "7711"))
+                    port: defaults.string(forKey: "serverPort") ?? Address.defaultPort))
         }
         let wireGuard = legacyWireGuard(from: defaults)
         var server = RemoteServer(
@@ -154,7 +157,7 @@ extension RemoteServer {
         var settings = WireGuard(
             server: Address(
                 host: defaults.string(forKey: "wireGuardServerHost") ?? "",
-                port: defaults.string(forKey: "wireGuardServerPort") ?? "7711"),
+                port: defaults.string(forKey: "wireGuardServerPort") ?? Address.defaultPort),
             endpoint: defaults.string(forKey: "wireGuardEndpoint") ?? "",
             localAddress: defaults.string(forKey: "wireGuardLocalAddress") ?? "",
             peerPublicKey: defaults.string(forKey: "wireGuardPeerPublicKey") ?? "")

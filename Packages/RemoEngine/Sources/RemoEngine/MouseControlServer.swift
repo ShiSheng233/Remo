@@ -8,7 +8,7 @@ import RemoTransport
 
 /// Serializes remote mouse input from one controlling peer at a time.
 @MainActor
-public final class MouseControlServer {
+final class MouseControlServer {
     enum Event: Equatable {
         case move(CGPoint, dragging: Bool)
         case button(MouseMessage.Button, CGPoint)
@@ -35,7 +35,7 @@ public final class MouseControlServer {
         self.emit = emit
     }
 
-    public func begin(for peer: UUID) -> MouseMessage? {
+    func begin(for peer: UUID) -> MouseMessage? {
         guard owner == nil, let message = initialState(),
             case .ready(let position, _, _) = message
         else { return nil }
@@ -44,7 +44,7 @@ public final class MouseControlServer {
         return message
     }
 
-    public func receive(_ bytes: Data, on channel: MessageTransport.Channel, from peer: UUID) {
+    func receive(_ bytes: Data, on channel: MessageTransport.Channel, from peer: UUID) {
         guard owner == peer, let input = try? MouseMessage(decoding: bytes) else { return }
         switch (channel, input) {
         case let (.unreliable, .move(sequence, afterButton, position)):
@@ -92,11 +92,11 @@ public final class MouseControlServer {
         emit(.move(position, dragging: leftDown))
     }
 
-    public func end(for peer: UUID) {
+    func end(for peer: UUID) {
         if owner == peer { stop() }
     }
 
-    public func stop() {
+    func stop() {
         if leftDown { emit(.button(.leftUp, position)) }
         leftDown = false
         owner = nil
@@ -110,7 +110,7 @@ public final class MouseControlServer {
     import CoreGraphics
 
     extension MouseControlServer {
-        public convenience init(displayID: CGDirectDisplayID) {
+        convenience init(displayID: CGDirectDisplayID) {
             let source = CGEventSource(stateID: .hidSystemState)
             self.init(initialState: {
                 let bounds = CGDisplayBounds(displayID)

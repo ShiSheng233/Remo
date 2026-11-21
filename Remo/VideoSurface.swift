@@ -6,7 +6,7 @@
 import CoreImage
 import Metal
 import QuartzCore
-import RemoCodec
+import RemoEngine
 import UIKit
 
 @MainActor
@@ -84,7 +84,7 @@ final class VideoSurface: UIView {
         }
     }
 
-    func present(_ frame: DecodedVideoFrame) throws -> Bool {
+    func present(_ frame: VideoFrame) throws -> Bool {
         let image = CIImage(cvPixelBuffer: frame.pixels)
         lastImage = image
         redrawPending = false

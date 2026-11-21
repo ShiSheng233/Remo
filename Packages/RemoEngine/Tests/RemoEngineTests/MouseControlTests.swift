@@ -53,7 +53,7 @@ import Testing
     send(.move(sequence: 5, afterButton: 2, position: dragged), .unreliable)
     send(.button(sequence: 8, action: .rightClick, position: clicked), .unreliable)
     send(.button(sequence: 8, action: .rightClick, position: clicked), .reliable)
-    send(.scroll(lines: -3), .reliable)
+    send(.scroll(lines: -3), .unreliable)
 
     #expect(events == [
         .button(.leftDown, start), .move(dragged, dragging: true),
@@ -85,4 +85,43 @@ import Testing
     #expect(events.last == .button(.leftDown, position))
     server.stop()
     #expect(events.last == .button(.leftUp, position))
+}
+
+@Test @MainActor func pointerClientOrdersInputForTheServer() throws {
+    var client = MouseControlClient()
+    let early = [client.move(by: CGVector(dx: 10, dy: 10)), client.press(.leftClick)]
+    #expect(early == [nil, nil])
+
+    let start = CGPoint(x: 0.5, y: 0.5)
+    var events: [MouseControlServer.Event] = []
+    let server = MouseControlServer(
+        initialState: { .ready(position: start, width: 1000, height: 500) },
+        emit: { events.append($0) })
+    let id = UUID()
+    let ready = try #require(server.begin(for: id))
+    let granted = [client.receiveReady(ready.encoded), client.receiveReady(ready.encoded)]
+    #expect(granted == [true, false])
+    #expect(client.displaySize == CGSize(width: 1000, height: 500))
+
+    func send(_ message: MouseMessage?) throws {
+        let message = try #require(message)
+        let channel: MessageTransport.Channel =
+            if case .reliable = message.mode(now: 0) { .reliable } else { .unreliable }
+        server.receive(message.encoded, on: channel, from: id)
+    }
+    try send(client.move(by: CGVector(dx: 100, dy: -50)))
+    try send(client.press(.leftDown))
+    // Moves past the edge stop there.
+    try send(client.move(by: CGVector(dx: 10_000, dy: 10_000)))
+    try send(client.press(.leftUp))
+    try send(client.scroll(lines: 1_000))
+    let ignored = [client.scroll(lines: 0), client.move(by: .zero)]
+    #expect(ignored == [nil, nil])
+
+    let moved = CGPoint(x: 0.6, y: 0.4)
+    let corner = CGPoint(x: 1, y: 1)
+    #expect(events == [
+        .move(moved, dragging: false), .button(.leftDown, moved),
+        .move(corner, dragging: true), .button(.leftUp, corner), .scroll(lines: 100),
+    ])
 }

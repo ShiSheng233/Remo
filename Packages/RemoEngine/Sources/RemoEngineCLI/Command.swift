@@ -6,17 +6,7 @@ import RemoEngine
 
 #if os(macOS)
     import AppKit
-    import CoreGraphics
 #endif
-
-struct VideoSettings {
-    var resolution: (width: Int, height: Int)?
-    var simulatedSize: (width: Int, height: Int) { resolution ?? (640, 360) }
-    var screenBounds: (width: Int, height: Int) { resolution ?? (1920, 1920) }
-    var maxVideoBitRate = 2_000_000
-    var fps: Int32 = 30
-    var interval: UInt64 { 1_000_000_000 / UInt64(fps) }
-}
 
 @main
 enum Command {
@@ -25,12 +15,13 @@ enum Command {
           remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--audio] [--mouse-control] [--wire-stats] [--trace-heartbeats]
           remo-engine client <host> [port] [--screen] [--wire-stats] [--trace-heartbeats]
 
-        Default UDP port: 7711
-        --resolution sets the simulated frame size or caps the screen capture at WIDTHxHEIGHT pixels.
-        Dimensions must be even (2...8192). Defaults: 640x360 simulated, screen longest edge 1920.
+        Default UDP port: \(RemoProtocol.defaultPort)
+        --resolution sets the test pattern size or caps the screen capture at WIDTHxHEIGHT pixels.
+        Dimensions must be even (2...8192). Defaults: 640x360 test pattern, screen longest edge 1920.
         --fps sets the server frame rate (1...240, default 30). Screen capture may run slower.
         --max-video-bitrate sets the video bitrate ceiling in bits per second (default 2000000).
         --screen streams the main display on the server and opens a video window on the client (macOS).
+          Without it, the server streams a test pattern and the client verifies every frame of it.
         --audio includes system playback audio on a screen server (macOS 13 or later).
         --mouse-control enables remote mouse input on a macOS screen server (requires Accessibility access).
         --trace-heartbeats traces heartbeat submission, UDP framing, session delivery, and timeouts.
@@ -65,42 +56,39 @@ enum Command {
     @MainActor
     static func run() async {
         var args = Array(CommandLine.arguments.dropFirst())
-        let wireStats = args.contains("--wire-stats")
-        let screen = args.contains("--screen")
-        let audio = args.contains("--audio")
-        let mouseControl = args.contains("--mouse-control")
-        args.removeAll {
-            $0 == "--screen" || $0 == "--audio" || $0 == "--mouse-control" || $0 == "--wire-stats" || $0 == "--trace-heartbeats"
-        }
+        let flags = ["--screen", "--audio", "--mouse-control", "--wire-stats", "--trace-heartbeats"]
+        let present = Set(args.filter(flags.contains))
+        args.removeAll(where: flags.contains)
         if args == ["--help"] || args == ["-h"] {
             log(usage)
             return
         }
-        var settings = VideoSettings()
+        let screen = present.contains("--screen")
+        let audio = present.contains("--audio")
+        var resolution: (width: Int, height: Int)?
+        var fps: Int32 = 30
+        var bitRate = 2_000_000
         for option in ["--resolution", "--fps", "--max-video-bitrate"] {
             guard let index = args.firstIndex(of: option) else { continue }
             guard args.first == "server" else { fail("\(option) is a server option.") }
             guard index + 1 < args.count else { fail("Missing value for \(option).") }
             let value = args[index + 1]
-            if option == "--fps" {
-                guard let fps = Int32(value), (1...240).contains(fps) else {
-                    fail("Expected --fps 1...240.")
-                }
-                settings.fps = fps
-            } else if option == "--max-video-bitrate" {
-                guard let rate = Int32(value), rate > 0 else {
+            switch option {
+            case "--fps":
+                guard let value = Int32(value) else { fail("Expected --fps FPS.") }
+                fps = value
+            case "--max-video-bitrate":
+                guard let value = Int32(value) else {
                     fail("Expected --max-video-bitrate in bits per second (1...2147483647).")
                 }
-                settings.maxVideoBitRate = Int(rate)
-            } else {
+                bitRate = Int(value)
+            default:
                 let parts = value.lowercased().split(
                     separator: "x", omittingEmptySubsequences: false)
-                guard parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]),
-                    [w, h].allSatisfy({ (2...8192).contains($0) && $0.isMultiple(of: 2) })
-                else {
-                    fail("Expected --resolution WIDTHxHEIGHT with even dimensions from 2 to 8192.")
+                guard parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) else {
+                    fail("Expected --resolution WIDTHxHEIGHT.")
                 }
-                settings.resolution = (w, h)
+                resolution = (w, h)
             }
             args.removeSubrange(index...index + 1)
         }
@@ -110,141 +98,158 @@ enum Command {
         else { fail(usage) }
         let server = args[0] == "server"
         if audio && (!server || !screen) { fail("--audio requires server --screen.") }
-        if audio {
-            guard #available(macOS 13.0, *) else { fail("--audio requires macOS 13 or later.") }
-        }
-        if mouseControl && (!server || !screen) {
+        if present.contains("--mouse-control") && (!server || !screen) {
             fail("--mouse-control requires server --screen.")
         }
-        let value = args.dropFirst(server ? 1 : 2).first ?? "7711"
-        guard let raw = UInt16(value), raw > 0, let port = NWEndpoint.Port(rawValue: raw) else {
-            fail("Invalid UDP port: \(value)")
-        }
-        let parameters: NWParameters =
-            (wireStats || HeartbeatTrace.enabled) ? DatagramMonitor.parameters() : .udp
+        let value = args.dropFirst(server ? 1 : 2).first ?? String(RemoProtocol.defaultPort)
+        guard let port = UInt16(value), port > 0 else { fail("Invalid UDP port: \(value)") }
+        let diagnostics = Diagnostics(
+            handler: { logDiagnostic($0) }, wireStatistics: present.contains("--wire-stats"),
+            traceHeartbeats: present.contains("--trace-heartbeats"),
+            audioTraceDirectory: ProcessInfo.processInfo.environment["REMO_AUDIO_TRACE_DIR"]
+                .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) })
+
         if server {
-            var capture: DemoSession.StartCapture?
-            var mouse: MouseControlServer?
-            if screen {
-                #if os(macOS)
-                    guard #available(macOS 12.3, *) else {
-                        fail("Screen capture requires macOS 12.3 or later.")
-                    }
-                    if mouseControl {
-                        guard CGPreflightPostEventAccess() else {
-                            fail("Mouse control requires Accessibility access in System Settings → Privacy & Security.")
-                        }
-                        mouse = MouseControlServer(displayID: CGMainDisplayID())
-                    }
-                    do {
-                        let config = try await ScreenCaptureConfiguration.mainDisplay(
-                            maximumWidth: settings.screenBounds.width,
-                            maximumHeight: settings.screenBounds.height,
-                            framesPerSecond: settings.fps)
-                        capture = { try await config.start(capturesAudio: audio) }
-                        log(
-                            "Screen source: main display, \(config.width) × \(config.height) at up to \(settings.fps) fps"
-                        )
-                    } catch {
-                        fail(
-                            "Screen discovery failed: \(error.localizedDescription). Check Screen Recording access in System Settings → Privacy & Security."
-                        )
-                    }
-                #else
-                    fail("Screen capture requires macOS.")
-                #endif
-            }
-            if !screen {
-                log(
-                    "Simulated source: \(settings.simulatedSize.width) × \(settings.simulatedSize.height) at \(settings.fps) fps"
-                )
-            }
-            do {
-                try await listen(
-                    port, parameters: parameters, capture: capture, mouse: mouse, settings: settings)
-            } catch {
-                fail("Listener failed: \(error)")
-            }
+            let source: RemoteScreenServer.Source =
+                screen
+                ? .mainDisplay(
+                    maximumWidth: resolution?.width ?? 1920,
+                    maximumHeight: resolution?.height ?? 1920, capturesAudio: audio)
+                : testPattern(
+                    width: resolution?.width ?? 640, height: resolution?.height ?? 360, fps: fps)
+            await serve(
+                RemoteScreenServer.Configuration(
+                    source: source, framesPerSecond: fps, maximumVideoBitRate: bitRate,
+                    allowsPointerControl: present.contains("--mouse-control"),
+                    diagnostics: diagnostics),
+                port: port)
         } else {
-            let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(args[1]), port: port)
-            let client = DemoSession(role: .client, peer: endpoint, screen: screen)
-            #if os(macOS)
-                let window =
-                    screen
-                    ? VideoWindow(title: "Remo — \(endpoint)", onClose: { client.requestExit() })
-                    : nil
-                if let window {
-                    client.present = {
-                        try window.present($0.pixels, duration: $0.duration)
-                    }
-                }
-                defer {
-                    client.present = nil
-                    window?.close()
-                }
-            #else
-                if screen { fail("The screen viewer requires macOS.") }
-            #endif
-            let signals = [SIGINT, SIGTERM].map { number in
-                signal(number, SIG_IGN)
-                let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-                source.setEventHandler(
-                    handler: DispatchWorkItem {
-                        Task { @MainActor in client.requestExit() }
-                    })
-                source.activate()
-                return source
-            }
-            let success = await client.run(NWConnection(to: endpoint, using: parameters))
-            for source in signals { source.cancel() }
+            let endpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(args[1]), port: NWEndpoint.Port(rawValue: port)!)
+            let success = await view(endpoint, screen: screen, diagnostics: diagnostics)
             if !success { exit(EXIT_FAILURE) }
         }
     }
 
     @MainActor
-    static func listen(
-        _ port: NWEndpoint.Port, parameters: NWParameters, capture: DemoSession.StartCapture?,
-        mouse: MouseControlServer?, settings: VideoSettings
-    ) async throws {
-        let listener = try NWListener(using: parameters, on: port)
-        let (states, events) = AsyncStream<NWListener.State>.makeStream()
-        listener.stateUpdateHandler = { events.yield($0) }
-        listener.newConnectionHandler = { connection in
-            Task { @MainActor in
-                let peer = DemoSession(
-                    role: .server, peer: connection.endpoint, screen: capture != nil,
-                    startCapture: capture, mouse: mouse, settings: settings)
-                _ = await peer.run(connection)
+    static func serve(_ configuration: RemoteScreenServer.Configuration, port: UInt16) async {
+        let server: RemoteScreenServer
+        do {
+            server = try await RemoteScreenServer(configuration: configuration) { event in
+                switch event {
+                case .listening(let port): log("Listening on UDP port \(port)")
+                case .clientConnected: break
+                case .streamingStarted(let peer): log("[\(peer)] streaming started")
+                case .clientDisconnected(let peer, let reason, _): log("[\(peer)] \(reason)")
+                case .statistics(let peer, let statistics): log(format(statistics, peer: peer))
+                }
             }
+        } catch {
+            fail("\(error)")
         }
-        listener.start(queue: DispatchQueue(label: "RemoEngineCLI.listener"))
-        let signals: [any DispatchSourceSignal] = mouse.map { mouse in
-            [SIGINT, SIGTERM].map { number in
-                signal(number, SIG_IGN)
-                let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-                source.setEventHandler(handler: DispatchWorkItem {
-                    Task { @MainActor in
-                        mouse.stop()
-                        listener.cancel()
+        if let size = server.screenSize {
+            log(
+                "Screen source: main display, \(size.width) × \(size.height) at up to \(configuration.framesPerSecond) fps"
+            )
+        }
+        let signals = onTermination { server.stop() }
+        defer { signals.forEach { $0.cancel() } }
+        do {
+            try await server.listen(on: port)
+        } catch {
+            fail("Listener failed: \(error)")
+        }
+    }
+
+    /// A new source for each client, checked once up front.
+    static func testPattern(width: Int, height: Int, fps: Int32) -> RemoteScreenServer.Source {
+        do {
+            _ = try TestPatternSource(width: width, height: height, framesPerSecond: fps)
+        } catch {
+            fail("\(error)")
+        }
+        log("Test pattern source: \(width) × \(height)")
+        return .custom { try TestPatternSource(width: width, height: height, framesPerSecond: fps) }
+    }
+
+    @MainActor
+    static func view(_ endpoint: NWEndpoint, screen: Bool, diagnostics: Diagnostics) async -> Bool {
+        #if os(macOS)
+            var client: RemoteScreenClient?
+            let window =
+                screen
+                ? VideoWindow(title: "Remo — \(endpoint)") {
+                    log("[\(endpoint)] leaving")
+                    client?.disconnect()
+                } : nil
+            defer { window?.close() }
+        #else
+            if screen { fail("The screen viewer requires macOS.") }
+        #endif
+        var displayEnqueued = 0
+        var verifier = TestPatternVerifier()
+        let viewer = RemoteScreenClient(
+            configuration: .init(requestsPointerControl: false, diagnostics: diagnostics),
+            onFrame: { frame in
+                #if os(macOS)
+                    if let window {
+                        if try window.present(frame.pixels, duration: frame.duration) {
+                            displayEnqueued += 1
+                        }
+                        return
                     }
-                })
-                source.activate()
-                return source
-            }
-        } ?? []
-        defer {
-            for source in signals { source.cancel() }
-            mouse?.stop()
-            listener.cancel()
-            events.finish()
+                #endif
+                try verifier.check(frame)
+            },
+            onEvent: { event in
+                switch event {
+                case .state(.waitingForVideo): log("[\(endpoint)] connected; press Ctrl-C to exit")
+                case .statistics(let statistics):
+                    log(
+                        format(
+                            statistics, peer: "\(endpoint)",
+                            frames: screen
+                                ? "displayEnqueued=\(displayEnqueued)"
+                                : "verified=\(verifier.verified)"))
+                default: break
+                }
+            })
+        #if os(macOS)
+            client = viewer
+        #endif
+        let signals = onTermination {
+            log("[\(endpoint)] leaving")
+            viewer.disconnect()
         }
-        for await state in states {
-            switch state {
-            case .ready: log("Listening on UDP port \(port)")
-            case .failed(let error): throw error
-            case .cancelled: return
-            default: break
-            }
+        defer { signals.forEach { $0.cancel() } }
+        guard let failure = await viewer.run(.udp(endpoint)) else { return true }
+        log("[\(endpoint)] \(describe(failure, screen: screen))")
+        return false
+    }
+
+    static func describe(_ failure: RemoteScreenClient.Failure, screen: Bool) -> String {
+        switch failure {
+        case .setupTimedOut: "connection setup timed out"
+        case .connectionFailed(let error): "connection setup: \(error)"
+        case .connectionClosed: "connection closed"
+        case .network(let error): "connection closed: \(error)"
+        case .serverNotResponding: "server timed out"
+        case .noVideo: "server responded but no video arrived"
+        case .sendFailed(let error): "send failed: \(error)"
+        case .videoFailed(let error): "video failed: \(error)"
+        case .presentationFailed(let error): "\(screen ? "video display failed" : "verification failed"): \(error)"
+        case .pointerInputFailed(let error): "mouse input failed: \(error)"
+        }
+    }
+
+    @MainActor
+    static func onTermination(_ handler: @escaping @MainActor () -> Void) -> [any DispatchSourceSignal] {
+        [SIGINT, SIGTERM].map { number in
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler(handler: DispatchWorkItem { MainActor.assumeIsolated(handler) })
+            source.activate()
+            return source
         }
     }
 
@@ -252,4 +257,62 @@ enum Command {
         FileHandle.standardError.write(Data((message + "\n").utf8))
         exit(EXIT_FAILURE)
     }
+}
+
+// MARK: - Output
+
+func log(_ line: String) {
+    FileHandle.standardOutput.write(Data((line + "\n").utf8))
+}
+
+func logDiagnostic(_ diagnostic: Diagnostic) {
+    let prefix = diagnostic.peer.map { "[\($0)] " } ?? ""
+    log(prefix + (diagnostic.kind == .trace ? "trace " : "") + diagnostic.message)
+}
+
+func format(_ link: LinkStatistics) -> String {
+    let rtt = link.roundTripTime.map { String(format: "%.1f ms", $0 * 1000) } ?? "pending"
+    return "RTT=\(rtt)"
+        + String(
+            format: " txBudget=%.2f Mbps txQueue=%.1f ms", link.bitsPerSecond / 1e6,
+            link.queueDelay * 1000)
+}
+
+func format(_ statistics: ServerStatistics, peer: String) -> String {
+    var details =
+        "generated=\(statistics.framesGenerated) queued=\(statistics.framesQueued) backpressureDrops=\(statistics.backpressureDrops) codecDrops=\(statistics.codecDrops)"
+    details +=
+        " encoderBps=\(statistics.encoderBitRate) captureSkips=\(statistics.captureSkips) checkpointSkips=\(statistics.checkpointSkips)"
+    details +=
+        " ltrAcks=\(statistics.acknowledgedReferences) controlsQueued=\(statistics.controlsSent) heartbeatsRx=\(statistics.heartbeatsReceived)"
+    if let audio = statistics.audio, audio.packetsQueued > 0 || audio.backpressureDrops > 0 {
+        details +=
+            " audioQueued=\(audio.packetsQueued) audioSourceGaps=\(audio.sourceGaps) audioBackpressure=\(audio.backpressureDrops)"
+        details += " audioFirstSendExpired=\(statistics.link.audioExpiredBeforeFirstSend)"
+        details += String(format: " audioQueuePeak=%.1f ms", audio.peakQueueDelay * 1000)
+    }
+    return "[\(peer)] video queued "
+        + String(
+            format: "%.1f fps %.2f Mbps", statistics.framesPerSecond,
+            statistics.videoBitsPerSecond / 1e6)
+        + "  \(details)  \(format(statistics.link))"
+}
+
+func format(_ statistics: ClientStatistics, peer: String, frames: String) -> String {
+    var details =
+        "frames=\(statistics.framesDecoded) latest=#\(statistics.latestFrame) missingFrames=\(statistics.missingFrames)"
+    details += " \(frames)"
+    details +=
+        " controls=\(statistics.controlsReceived) latest=#\(statistics.latestControl) heartbeatsQueued=\(statistics.heartbeatsSent)"
+    if let audio = statistics.audio {
+        details +=
+            " audioPLC=\(audio.concealedPackets - audio.fadeFallbacks) audioFadeFallback=\(audio.fadeFallbacks)"
+        details +=
+            " audioLate=\(audio.latePackets) audioConcealed=\(audio.concealedPackets) audioRebuffers=\(audio.rebufferCount) audioDecodeErrors=\(audio.decodeFailures)"
+    }
+    return "[\(peer)] video received "
+        + String(
+            format: "%.1f fps %.2f Mbps", statistics.framesPerSecond,
+            statistics.videoBitsPerSecond / 1e6)
+        + "  \(details)  \(format(statistics.link))"
 }

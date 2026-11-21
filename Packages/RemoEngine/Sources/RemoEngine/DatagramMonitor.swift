@@ -1,29 +1,22 @@
 import Dispatch
 import Foundation
 import Network
-import RemoEngine
-
-struct HeartbeatTrace {
-    static let enabled = CommandLine.arguments.contains("--trace-heartbeats")
-    private let tag: String
-
-    init(layer: String) {
-        tag = "\(layer)=\(UUID().uuidString.prefix(8))"
-    }
-
-    func write(_ peer: NWEndpoint?, _ message: @autoclosure () -> String) {
-        guard Self.enabled else { return }
-        let time = String(format: "%.3f", Date().timeIntervalSince1970)
-        log("[\(peer?.debugDescription ?? "peer")] trace t=\(time) \(tag) \(message())")
-    }
-}
 
 /// Observes v1 headers immediately above UDP. Each connection owns its own counters.
 final class DatagramMonitor: NWProtocolFramerImplementation {
-    static let label = "Remo CLI datagram statistics"
+    static let label = "Remo datagram statistics"
     static let definition = NWProtocolFramer.Definition(implementation: DatagramMonitor.self)
 
-    static func parameters() -> NWParameters {
+    // Network creates each framer itself, so the options reach it through here. The most recent
+    // session's diagnostics apply to every monitored connection.
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var current = Diagnostics()
+
+    /// UDP parameters, with the monitor in place only when the diagnostics need it.
+    static func parameters(for diagnostics: Diagnostics) -> NWParameters {
+        guard diagnostics.handler != nil, diagnostics.wireStatistics || diagnostics.traceHeartbeats
+        else { return .udp }
+        lock.withLock { current = diagnostics }
         let parameters = NWParameters.udp
         parameters.defaultProtocolStack.applicationProtocols.insert(
             NWProtocolFramer.Options(definition: definition), at: 0)
@@ -36,7 +29,8 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
         let index: UInt16
     }
 
-    private let trace = HeartbeatTrace(layer: "flow")
+    private let diagnostics: Diagnostics
+    private let trace: HeartbeatTrace
     private var recent: [Fragment: UInt64] = [:]
     private var data = 0
     private var acks = 0
@@ -46,16 +40,19 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
     private var previousBytes = 0
     private var previousTime = DispatchTime.now().uptimeNanoseconds
 
-    required init(framer: NWProtocolFramer.Instance) {}
+    required init(framer: NWProtocolFramer.Instance) {
+        diagnostics = Self.lock.withLock { Self.current }
+        trace = HeartbeatTrace(layer: "flow", diagnostics: diagnostics)
+    }
 
     func start(framer: NWProtocolFramer.Instance) -> NWProtocolFramer.StartResult {
         // Keep handleInput active so each UDP datagram retains its message boundary.
-        trace.write(framer.remote, "UDP flow opened")
+        trace.write(framer.remote?.debugDescription, "UDP flow opened")
         return .ready
     }
 
     private func traceHeader(_ buffer: UnsafeMutableRawBufferPointer, size: Int) -> String? {
-        guard HeartbeatTrace.enabled, size == 10, buffer.count >= 10 else { return nil }
+        guard trace.enabled, size == 10, buffer.count >= 10 else { return nil }
         let name: String
         switch (buffer[0], buffer[9]) {
         case (0, SessionMessage.heartbeat.rawValue): name = "heartbeat"
@@ -80,7 +77,7 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
                 return 0
             }
             guard size > 0 else { return 1 }
-            if let description { trace.write(framer.remote, "UDP rx \(description)") }
+            if let description { trace.write(framer.remote?.debugDescription, "UDP rx \(description)") }
             guard
                 framer.deliverInputNoCopy(
                     length: size, message: .init(instance: framer), isComplete: true)
@@ -121,7 +118,7 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
             return
         }
         let now = DispatchTime.now().uptimeNanoseconds
-        if let description { trace.write(framer.remote, "UDP tx \(description)") }
+        if let description { trace.write(framer.remote?.debugDescription, "UDP tx \(description)") }
         bytes += messageLength
         if ack { acks += 1 }
         if let fragment {
@@ -131,8 +128,10 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
             }
         }
         if now - previousTime >= 1_000_000_000 {
-            report(framer, now: now)
-            // Both demo retry lifetimes are shorter than three seconds.
+            if diagnostics.wireStatistics { report(framer, now: now) }
+            previousBytes = bytes
+            previousTime = now
+            // Every retry lifetime in use is shorter than three seconds.
             recent = recent.filter { now - $0.value < 3_000_000_000 }
         }
     }
@@ -140,19 +139,20 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
     private func report(_ framer: NWProtocolFramer.Instance, now: UInt64) {
         let seconds = Double(now - previousTime) / 1e9
         let mbps = Double(bytes - previousBytes) * 8 / max(seconds, 1e-9) / 1e6
-        log(
-            "[\(framer.remote?.debugDescription ?? "peer")] UDP tx"
-                + String(format: " %.3f Mbps", mbps)
-                + "  bytes=\(bytes) DATA=\(data) ACK=\(acks) U-retries=\(unreliableRetries) R-retries=\(reliableRetries)"
-        )
-        previousBytes = bytes
-        previousTime = now
+        diagnostics.handler?(
+            Diagnostic(
+                peer: framer.remote?.debugDescription, kind: .wire,
+                message: "UDP tx" + String(format: " %.3f Mbps", mbps)
+                    + "  bytes=\(bytes) DATA=\(data) ACK=\(acks) U-retries=\(unreliableRetries) R-retries=\(reliableRetries)"
+            ))
     }
 
     func wakeup(framer: NWProtocolFramer.Instance) {}
     func stop(framer: NWProtocolFramer.Instance) -> Bool {
-        trace.write(framer.remote, "UDP flow stopped")
-        if bytes != previousBytes { report(framer, now: DispatchTime.now().uptimeNanoseconds) }
+        trace.write(framer.remote?.debugDescription, "UDP flow stopped")
+        if diagnostics.wireStatistics, bytes != previousBytes {
+            report(framer, now: DispatchTime.now().uptimeNanoseconds)
+        }
         return true
     }
     func cleanup(framer: NWProtocolFramer.Instance) {}

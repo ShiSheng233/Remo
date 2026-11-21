@@ -100,33 +100,26 @@ struct AudioFrameRenderer {
 
 /// Accepts packets on the client's main actor. Audio processing runs on its own serial queue.
 @MainActor
-public final class ScreenAudioPlayback {
-    public struct Statistics: Sendable {
-        public let decodeFailures: Int
-        public let concealedPackets: Int
-        public let fadeFallbacks: Int
-        public let rebufferCount: Int
-        public let latePackets: Int
-    }
+final class ScreenAudioPlayback {
+    typealias Statistics = AudioPlaybackStatistics
 
     private let worker: AudioPlaybackWorker
-    public var statistics: Statistics { worker.statistics }
-    public var decodeFailures: Int { statistics.decodeFailures }
-    public var concealedPackets: Int { statistics.concealedPackets }
-    public var fadeFallbacks: Int { statistics.fadeFallbacks }
-    public var rebufferCount: Int { statistics.rebufferCount }
-    public var latePackets: Int { statistics.latePackets }
+    var statistics: Statistics { worker.statistics }
+    var decodeFailures: Int { statistics.decodeFailures }
+    var concealedPackets: Int { statistics.concealedPackets }
+    var fadeFallbacks: Int { statistics.fadeFallbacks }
+    var rebufferCount: Int { statistics.rebufferCount }
+    var latePackets: Int { statistics.latePackets }
 
-    public convenience init(onError: @escaping @MainActor (Error) -> Void) {
-        self.init(engine: AVAudioEngine(), onError: onError)
+    init(
+        engine: AVAudioEngine = AVAudioEngine(), traceDirectory: URL? = nil,
+        onError: @escaping @MainActor (Error) -> Void
+    ) {
+        worker = AudioPlaybackWorker(engine: engine, traceDirectory: traceDirectory, onError: onError)
     }
 
-    init(engine: AVAudioEngine, onError: @escaping @MainActor (Error) -> Void) {
-        worker = AudioPlaybackWorker(engine: engine, onError: onError)
-    }
-
-    public func receive(_ message: Data) { worker.receive(message) }
-    public func stop() { worker.stop() }
+    func receive(_ message: Data) { worker.receive(message) }
+    func stop() { worker.stop() }
 }
 
 // After initialization, all mutable state and graph operations are confined to serial.
@@ -137,7 +130,8 @@ private final class AudioPlaybackWorker: @unchecked Sendable {
     private var decoder: OpusDecoder?
     private var queue = AudioPacketQueue()
     private var startupPending = false
-    private let trace = AudioPCMTrace.open("before-playback")
+    private let trace: AudioPCMTrace?
+    private let traceDirectory: URL?
     private var traceEnd: Int64 = 0
     private var tapInstalled = false
     private var scheduled = 0
@@ -154,9 +148,11 @@ private final class AudioPlaybackWorker: @unchecked Sendable {
         }
     }
 
-    init(engine: AVAudioEngine, onError: @escaping @MainActor (Error) -> Void) {
+    init(engine: AVAudioEngine, traceDirectory: URL?, onError: @escaping @MainActor (Error) -> Void) {
         self.engine = engine
         self.onError = onError
+        self.traceDirectory = traceDirectory
+        trace = AudioPCMTrace.open("before-playback", in: traceDirectory)
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: OpusFormat.pcm)
     }
@@ -177,7 +173,7 @@ private final class AudioPlaybackWorker: @unchecked Sendable {
             startupPending = false
             do {
                 if decoder == nil { decoder = try OpusDecoder() }
-                if trace != nil, !tapInstalled, let mixTrace = AudioPCMTrace.open("mixer-output") {
+                if trace != nil, !tapInstalled, let mixTrace = AudioPCMTrace.open("mixer-output", in: traceDirectory) {
                     engine.mainMixerNode.installTap(onBus: 0, bufferSize: 960, format: nil) {
                         @Sendable buffer, time in
                         mixTrace.record(buffer, host: time.hostTime, playerFrame: time.sampleTime, kind: "mix")

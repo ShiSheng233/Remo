@@ -5,9 +5,9 @@ import RemoTransport
 
 /// A single stream per direction. Confine the session, callbacks and transport to one actor.
 /// Forward application messages to receive; a false return leaves the message to the application.
-public final class VideoSession {
-    public enum Failure: Error { case closed, encoderUnavailable, encoderBusy }
-    public enum Event {
+final class VideoSession {
+    enum Failure: Error { case closed, encoderUnavailable, encoderBusy }
+    enum Event {
         case acknowledged(frame: UInt64, token: LongTermReferenceToken)
         case requestedRecovery(after: UInt64, firstAvailable: UInt64)
         case reliableKeyFrame(frame: UInt64, bytes: Int)
@@ -42,7 +42,7 @@ public final class VideoSession {
     private var queue: [VideoPacket] = []
     private var decoding = false
 
-    public init(
+    init(
         encoder: VideoEncoder? = nil, send: @escaping (Data, MessageTransport.Mode) throws -> Void,
         onFrame: @escaping (UInt64, DecodedVideoFrame, Int) -> Void,
         onEvent: @escaping (Event) -> Void = { _ in }, onFailure: @escaping (Error) -> Void
@@ -54,7 +54,7 @@ public final class VideoSession {
         self.onFailure = onFailure
     }
 
-    public func close() {
+    func close() {
         closed = true
         queue.removeAll()
         decoder = nil
@@ -65,13 +65,13 @@ public final class VideoSession {
     }
 
     /// Re-encode the source independently on the next submission, including an unchanged desktop.
-    public func requestKeyFrame() {
+    func requestKeyFrame() {
         if !closed { refresh = .keyFrame }
     }
 
     /// Switch at a frame boundary. The next IDR carries the new configuration and starts a new epoch.
     /// Returns false while an encode or reliable checkpoint is in progress.
-    public func replaceEncoder(_ replacement: VideoEncoder) throws -> Bool {
+    func replaceEncoder(_ replacement: VideoEncoder) throws -> Bool {
         guard !closed else { throw Failure.closed }
         guard !encoding, outgoing == nil else { return false }
         encoder = replacement
@@ -84,7 +84,7 @@ public final class VideoSession {
 
     /// Returns admitted video bytes, or zero when waiting for a reliable IDR to be decoded.
     /// Encode one source frame at a time, in PTS order.
-    public nonisolated(nonsending) func sendFrame(
+    nonisolated(nonsending) func sendFrame(
         _ pixels: CVPixelBuffer, presentationTime: CMTime,
         duration: CMTime, retryBudget: TimeInterval = 0.08, firstSendDeadline: TimeInterval? = nil
     ) async throws -> Int {
@@ -148,7 +148,7 @@ public final class VideoSession {
     }
 
     @discardableResult
-    public func receive(
+    func receive(
         _ channel: MessageTransport.Channel, _ message: Data,
         isolation: isolated any Actor = #isolation
     ) -> Bool {
@@ -269,7 +269,7 @@ public final class VideoSession {
 
     /// Call when the application expects video but even the tail frame may have been lost.
     /// Repeated calls share the same retry timer and escalation as observed frame gaps.
-    public func requestRefresh() throws {
+    func requestRefresh() throws {
         guard !closed else { throw Failure.closed }
         guard incoming == nil else { return }
         try requestRecovery(
@@ -373,5 +373,21 @@ public final class VideoSession {
         }
         if recovering { onEvent(.decodedRefresh(frame: packet.id, idr: packet.kind == .idr)) }
         onFrame(packet.id, frame, packet.bytes.count)
+    }
+}
+
+extension VideoSession.Event {
+    /// A diagnostic line for recovery activity. Acknowledgements are too frequent to describe.
+    var diagnostic: String? {
+        switch self {
+        case .acknowledged: nil
+        case .requestedRecovery(let last, let available):
+            "recovery requested lastDecoded=\(last) nextAvailable=\(available)"
+        case .reliableKeyFrame(let id, let bytes): "reliable IDR frame=\(id) bytes=\(bytes)"
+        case .encodedRefresh(let id, let reference):
+            "recovery encoded frame=\(id) kind=\(reference.map { "LTR-P ackToken=\($0.rawValue)" } ?? "IDR")"
+        case .decodedRefresh(let id, let idr):
+            "recovery decoded frame=\(id) kind=\(idr ? "IDR" : "LTR-P")"
+        }
     }
 }
