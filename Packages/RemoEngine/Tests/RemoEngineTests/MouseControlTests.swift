@@ -15,7 +15,7 @@ import Testing
         .ready(position: position, width: 1512, height: 982),
         .move(sequence: 4, afterButton: 3, position: position),
         .button(sequence: 5, action: .rightClick, position: position),
-        .scroll(-12),
+        .scroll(lines: -3),
     ]
     for message in messages {
         let decoded = try MouseMessage(decoding: message.encoded)
@@ -53,12 +53,12 @@ import Testing
     send(.move(sequence: 5, afterButton: 2, position: dragged), .unreliable)
     send(.button(sequence: 8, action: .rightClick, position: clicked), .unreliable)
     send(.button(sequence: 8, action: .rightClick, position: clicked), .reliable)
-    send(.scroll(-12), .reliable)
+    send(.scroll(lines: -3), .reliable)
 
     #expect(events == [
         .button(.leftDown, start), .move(dragged, dragging: true),
         .move(end, dragging: true), .button(.leftUp, end),
-        .button(.rightClick, clicked), .scroll(-12),
+        .button(.rightClick, clicked), .scroll(lines: -3),
     ])
 }
 

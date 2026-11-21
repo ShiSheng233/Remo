@@ -30,7 +30,6 @@ final class StreamPlayer {
     @ObservationIgnored private var mousePosition = CGPoint.zero
     @ObservationIgnored private var mouseSequence: UInt64 = 0
     @ObservationIgnored private var mouseButtonSequence: UInt64 = 0
-    @ObservationIgnored private var scrollRemainder: CGFloat = 0
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var transport: NetworkMessageSession?
     @ObservationIgnored private var playback: ScreenAudioPlayback?
@@ -93,7 +92,6 @@ final class StreamPlayer {
             mouseDisplaySize = nil
             mouseSequence = 0
             mouseButtonSequence = 0
-            scrollRemainder = 0
             task = nil
         }
 
@@ -212,6 +210,8 @@ final class StreamPlayer {
             let displaySize = mouseDisplaySize, let bounds = surface?.bounds, !bounds.isEmpty
         else { return }
 
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+
         let message: MouseMessage
         let mode: MessageTransport.Mode
         switch gesture {
@@ -224,20 +224,16 @@ final class StreamPlayer {
             mouseSequence += 1
             message = .move(
                 sequence: mouseSequence, afterButton: mouseButtonSequence, position: mousePosition)
-            let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
             mode = .unreliable(retryBudget: 0, firstSendDeadline: now + 0.05)
         case let .button(action):
             mouseSequence += 1
             mouseButtonSequence = mouseSequence
             message = .button(sequence: mouseSequence, action: action, position: mousePosition)
             mode = .reliable
-        case let .scroll(delta):
-            scrollRemainder = min(1000, max(-1000, scrollRemainder + delta))
-            let wheel = Int32(scrollRemainder.rounded(.towardZero))
-            guard wheel != 0 else { return }
-            scrollRemainder -= CGFloat(wheel)
-            message = .scroll(wheel)
-            mode = .reliable
+        case let .scroll(lines):
+            guard lines != 0 else { return }
+            message = .scroll(lines: Int32(clamping: lines))
+            mode = .unreliable(retryBudget: 0, firstSendDeadline: now + 0.05)
         }
         do {
             try transport.send(message.encoded, mode: mode)

@@ -14,7 +14,8 @@ public enum MouseMessage: Equatable {
     case ready(position: CGPoint, width: UInt32, height: UInt32)
     case move(sequence: UInt64, afterButton: UInt64, position: CGPoint)
     case button(sequence: UInt64, action: Button, position: CGPoint)
-    case scroll(Int32)
+    /// Whole lines; positive values move the content down, following the finger.
+    case scroll(lines: Int32)
 
     private enum Input: UInt8 {
         case move = 1, button, scroll
@@ -40,10 +41,10 @@ public enum MouseMessage: Equatable {
             data.put(sequence)
             data.put(action.rawValue)
             data.putPosition(position)
-        case let .scroll(delta):
+        case let .scroll(lines):
             data.put(SessionMessage.mouseInput.rawValue)
             data.put(Input.scroll.rawValue)
-            data.put(delta)
+            data.put(lines)
         }
         return data
     }
@@ -70,9 +71,9 @@ public enum MouseMessage: Equatable {
                 else { throw PacketError.invalid }
                 self = .button(sequence: sequence, action: button, position: try data.takePosition())
             case .scroll:
-                let delta = try data.take(Int32.self)
-                guard (-1000...1000).contains(delta), delta != 0 else { throw PacketError.invalid }
-                self = .scroll(delta)
+                let lines = try data.take(Int32.self)
+                guard (-100...100).contains(lines), lines != 0 else { throw PacketError.invalid }
+                self = .scroll(lines: lines)
             case nil: throw PacketError.invalid
             }
         default: throw PacketError.invalid

@@ -12,7 +12,7 @@ public final class MouseControlServer {
     enum Event: Equatable {
         case move(CGPoint, dragging: Bool)
         case button(MouseMessage.Button, CGPoint)
-        case scroll(Int32)
+        case scroll(lines: Int32)
     }
 
     private struct Move {
@@ -49,6 +49,8 @@ public final class MouseControlServer {
         switch (channel, input) {
         case let (.unreliable, .move(sequence, afterButton, position)):
             receiveMove(Move(sequence: sequence, afterButton: afterButton, position: position))
+        case let (.unreliable, .scroll(lines)):
+            emit(.scroll(lines: lines))
         case let (.reliable, .button(sequence, action, position)):
             guard sequence > latestPosition else { return }
             latestButton = sequence
@@ -74,8 +76,6 @@ public final class MouseControlServer {
                 self.pendingMove = nil
                 receiveMove(pendingMove)
             }
-        case let (.reliable, .scroll(delta)):
-            emit(.scroll(delta))
         default: break
         }
     }
@@ -154,9 +154,9 @@ public final class MouseControlServer {
                     case .leftUp:
                         post(.leftMouseUp, .left, at: position)
                     }
-                case let .scroll(delta):
-                    CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 1,
-                        wheel1: delta, wheel2: 0, wheel3: 0)?.post(tap: .cghidEventTap)
+                case let .scroll(lines):
+                    CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 1,
+                        wheel1: lines, wheel2: 0, wheel3: 0)?.post(tap: .cghidEventTap)
                 }
             })
         }

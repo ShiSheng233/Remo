@@ -116,43 +116,6 @@ struct ContentView: View {
     }
 }
 
-private struct PlayerView: View {
-    let player: StreamPlayer
-    let surface: VideoSurface
-    let title: String
-
-    var body: some View {
-        NavigationStack {
-            ZStack {
-                VideoSurfaceView(surface: surface)
-                    .accessibilityLabel("Remote video")
-                if player.phase == .streaming, player.mouseAvailable {
-                    TrackpadView(onInput: player.handleTrackpad)
-                }
-                if player.phase == .connecting {
-                    ProgressView("Connecting…")
-                        .tint(.white)
-                        .foregroundStyle(.white)
-                } else if player.phase == .waitingForVideo {
-                    ProgressView("Waiting for video…")
-                        .tint(.white)
-                        .foregroundStyle(.white)
-                }
-            }
-            .background(.black)
-            .ignoresSafeArea(.container, edges: .bottom)
-            .navigationTitle(title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Disconnect", systemImage: "xmark") { player.disconnect() }
-                        .labelStyle(.iconOnly)
-                }
-            }
-        }
-    }
-}
-
 #Preview {
     ContentView()
 }
