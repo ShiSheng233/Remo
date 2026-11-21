@@ -18,7 +18,7 @@ private final class LimitedLink {
     init() {
         for side in 0..<2 {
             endpoints.append(MessageTransport(
-                clock: { [unowned self] in now }, dataHandler: { _ in },
+                initialRate: 4_000_000, clock: { [unowned self] in now }, dataHandler: { _ in },
                 ioHandler: { [unowned self] request in handle(request, from: side) })!)
         }
     }

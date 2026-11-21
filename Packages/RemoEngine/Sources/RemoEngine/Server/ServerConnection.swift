@@ -26,6 +26,9 @@ final class ServerConnection {
         var frameInterval: Duration { .seconds(1) / Int(framesPerSecond) }
     }
 
+    /// 96 kbps Opus in 20 ms packets, with their headers.
+    private static let audioBitRate = 110_000.0
+
     private let peer: String
     private let context: Context
     private let trace: HeartbeatTrace
@@ -302,7 +305,10 @@ final class ServerConnection {
         let stats = session.statistics
         let budget = stats.bitsPerSecond
         let maximum = context.maximumVideoBitRate
-        let target = min(maximum, max(128_000, Int(budget * 0.7)))
+        // Audio is sent first whatever the video does, so it comes off the top. The rest keeps
+        // a margin for retransmissions and for frames larger than the encoder was asked for.
+        let target = min(
+            maximum, max(128_000, Int(budget * 0.85 - (sendsAudio ? Self.audioBitRate : 0))))
         if now.hasElapsed(.milliseconds(500), since: lastRateUpdate)
             && (abs(target - targetBitRate) > targetBitRate / 8
                 || (target == maximum && target != targetBitRate))

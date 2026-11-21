@@ -23,7 +23,7 @@ private final class Port {
     }
 
     lazy var endpoint = MessageTransport(
-        datagramLimit: mtu, clock: { [clock] in clock.now },
+        datagramLimit: mtu, initialRate: 4_000_000, clock: { [clock] in clock.now },
         dataHandler: { [unowned self] bytes in
             messages.append(bytes)
             onData?(bytes)
@@ -704,25 +704,32 @@ func sparseACKsCannotRestoreAnUnverifiedBudgetAfterBackoff(lateACKs: Bool) throw
     #expect(port.endpoint.statistics.bitsPerSecond == reduced)
 }
 
-@Test func persistentPacketLossCutsRateWhileOtherPacketsAreAcknowledged() {
+@Test func lossThatIgnoresTheRateIsTriedOnceThenTolerated() {
     let port = Port(Clock())
     let original = port.endpoint.statistics.bitsPerSecond
     let full = Data(count: 1191)
     var inspected = 0
-    for _ in 0..<500 {
-        port.endpoint.send(full, delivery: .init(retryBudget: 0))
-        port.advance(to: port.clock.now + 0.0025)
-        for bytes in port.packets.dropFirst(inspected) {
-            let packet = bytes.withUnsafeBytes {
-                UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self))
+    // One datagram in four is lost, however fast or slow they are sent.
+    func run(_ sends: Int) {
+        for _ in 0..<sends {
+            port.endpoint.send(full, delivery: .init(retryBudget: 0))
+            port.advance(to: port.clock.now + 0.0025)
+            for bytes in port.packets.dropFirst(inspected) {
+                let packet = number(of: bytes)
+                if !packet.isMultiple(of: 4) {
+                    port.endpoint.handleEvent(.datagram(Wire.ack(packet, 1)))
+                }
             }
-            if !packet.isMultiple(of: 4) {
-                port.endpoint.handleEvent(.datagram(Wire.ack(packet, 1)))
-            }
+            inspected = port.packets.count
         }
-        inspected = port.packets.count
     }
+    run(500)
+    // Sending less is the experiment that tells a full link from a lossy one.
     #expect(port.endpoint.statistics.bitsPerSecond < original)
+    run(2000)
+    // It made no difference, so the budget is given back and the loss is lived with.
+    #expect(port.endpoint.statistics.bitsPerSecond >= original)
+    #expect(abs(port.endpoint.statistics.lossRatio - 0.25) < 0.05)
     #expect(!port.endpoint.isClosed)
 }
 

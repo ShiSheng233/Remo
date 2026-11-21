@@ -77,6 +77,10 @@ public final class MessageTransport {
     public struct Statistics {
         public let bitsPerSecond: Double
         public let roundTripTime: TimeInterval?
+        /// The lowest round trip of the last several seconds: the path without any queueing.
+        public let minimumRoundTripTime: TimeInterval?
+        /// The share of data datagrams lost over about the last second.
+        public let lossRatio: Double
         /// Includes retransmissions. Standalone ACK datagrams use no packet number.
         public let acceptedDataPackets: UInt32
         public let blocked: Bool
@@ -172,7 +176,10 @@ public final class MessageTransport {
     /// Time since I/O accepted a data datagram, or since initialization before the first send.
     public var dataSendIdleTime: TimeInterval { clock() - lastDataSend }
     private var creditAt: TimeInterval
-    private var rate = 4_000_000.0
+    /// A modest first guess. Until the link pushes back, the budget grows quickly from here.
+    public static let initialRate = 1_500_000.0
+    private var rate: Double
+    private var startup = true
     private var recoveryCeiling = 0.0
     private var healthyFeedbackTime: TimeInterval = 0
     private var rtt: TimeInterval?
@@ -184,7 +191,6 @@ public final class MessageTransport {
     private var probeAt: TimeInterval?
     private var probeInterval = 0.1
     private var sampleAt: TimeInterval
-    private var congestedLastWindow = false
     // Delivery can be confirmed after a fragment expires or another attempt completes it.
     // Retain only wire metadata, independently of retransmission and payload lifetimes.
     private struct DeliveryRecord {
@@ -196,17 +202,53 @@ public final class MessageTransport {
     private var deliverySampleAt: TimeInterval
     private var acknowledgedBytes = 0
     private var deliveryRate = 0.0
-    // Leave room to probe when the adaptive encoder targets only part of the pacing budget.
-    private var probeCeiling: Double { deliveryRate * 1.4 }
+    // The budget may run ahead of what was delivered, but only by one step: an application that
+    // spends most of its budget then asks the link for a quarter more than it has shown.
+    private var probeCeiling: Double { deliveryRate * 1.5 }
     private var windowBytes = 0
+    private var windowAcknowledged = 0
+    private var windowPackets = 0
     private var probeReducedRate = false
     // Recovery acts on a timeout immediately. Rate control waits one full observation
     // window so a later bitmap can clear that exact transmission, even after payload eviction.
     private var suspectedLosses: Set<UInt32> = []
     private var agingLosses: Set<UInt32> = []
-    private var agingWindowUtilized = false
     private var confirmations = 0
-    private var baselineRTT: TimeInterval?
+
+    private static let minimumRate = 256_000.0
+    private struct Window {
+        let interval: TimeInterval
+        let sent: Int
+        let acknowledged: Int
+        let packets: Int
+        let losses: Int
+    }
+    /// The last second of observation windows, newest last.
+    private var history: [Window] = []
+    // Queueing is measured against the fastest round trip of the last five to ten seconds.
+    // A queue that outlives that span becomes the new baseline, whoever caused it.
+    private var floorRTT: TimeInterval?
+    private var previousFloorRTT: TimeInterval?
+    private var floorRotatedAt: TimeInterval
+    private var minimumRTT: TimeInterval? {
+        [floorRTT, previousFloorRTT].compactMap { $0 }.min()
+    }
+    /// The fastest round trip of the current window. If even that one queued, the queue stands.
+    private var windowFastestRTT: TimeInterval?
+    private var holdUntil: TimeInterval = 0
+    private var cutQueueDelay: TimeInterval?
+    private var futileCuts = 0
+    /// A rate the link is known to struggle beyond, approached slowly while the memory is fresh.
+    private var capacityMark: (rate: Double, at: TimeInterval)?
+    // Loss alone doesn't say whether the link is full. A reduction that makes it go away does.
+    private var lossTrial: (rate: Double, loss: Double, until: TimeInterval)?
+    private var toleratedLoss = 0.02
+    private var toleratedLossAt: TimeInterval = 0
+    private var lossRatio: Double {
+        let packets = history.reduce(0) { $0 + $1.packets }
+        let losses = history.reduce(0) { $0 + $1.losses }
+        return packets >= 20 && losses >= 3 ? min(1, Double(losses) / Double(packets)) : 0
+    }
 
     /// Return false for sendDatagram only if the datagram was not accepted.
     /// After that, signal writable to resume. Other request return values are ignored.
@@ -214,11 +256,13 @@ public final class MessageTransport {
     /// the order they complete, not the order they were sent. The adapter owns peer selection
     /// and session isolation.
     public init?(
-        datagramLimit: Int = 1200, clock: @escaping () -> TimeInterval,
+        datagramLimit: Int = 1200, initialRate: Double = MessageTransport.initialRate,
+        clock: @escaping () -> TimeInterval,
         dataHandler: @escaping (Data) -> Void,
         ioHandler: @escaping (IORequest) -> Bool
     ) {
         guard datagramLimit >= 64 else { return nil }
+        rate = max(Self.minimumRate, initialRate)
         self.datagramLimit = min(datagramLimit, 1200)
         self.clock = clock
         self.dataHandler = dataHandler
@@ -228,6 +272,7 @@ public final class MessageTransport {
         lastDataSend = creditAt
         sampleAt = creditAt
         deliverySampleAt = creditAt
+        floorRotatedAt = creditAt
     }
 
     private var queuedBytes: Int { messages.values.reduce(0) { $0 + $1.queuedBytes } }
@@ -237,8 +282,8 @@ public final class MessageTransport {
         var queued: [Priority: Int] = [:]
         for msg in messages.values { queued[msg.priority, default: 0] += msg.queuedBytes }
         return Statistics(
-            bitsPerSecond: rate, roundTripTime: rtt,
-            acceptedDataPackets: lastPacket, blocked: blocked, probing: probeAt != nil,
+            bitsPerSecond: rate, roundTripTime: rtt, minimumRoundTripTime: minimumRTT,
+            lossRatio: lossRatio, acceptedDataPackets: lastPacket, blocked: blocked, probing: probeAt != nil,
             estimatedQueueDelay: queueDelay, queuedBytes: queued,
             expiredBeforeFirstSend: expiredBeforeFirstSend)
     }
@@ -430,6 +475,7 @@ public final class MessageTransport {
                 let elapsed = max(0, now - record.sent)
                 if elapsed <= 2 {
                     acknowledgedBytes += record.bytes
+                    windowAcknowledged += record.bytes
                     confirmations += 1
                     if sample == nil { sample = elapsed }
                 }
@@ -446,6 +492,8 @@ public final class MessageTransport {
                 variation = sample / 2
                 rtt = sample
             }
+            floorRTT = min(floorRTT ?? sample, sample)
+            windowFastestRTT = min(windowFastestRTT ?? sample, sample)
             progressAt = now
             probeAt = nil
         }
@@ -545,47 +593,135 @@ public final class MessageTransport {
             deliverySampleAt = now
             acknowledgedBytes = 0
         }
+        if now >= floorRotatedAt + 5 {
+            previousFloorRTT = floorRTT
+            floorRTT = nil
+            floorRotatedAt = now
+        }
         if now >= sampleAt + 0.25 {
-            let queued = statistics.estimatedQueueDelay > 0
-            let inflated = rtt.map { $0 > (baselineRTT ?? $0) * 1.25 + 0.005 } ?? false
-            // Timing variation on sparse traffic does not measure link capacity.
-            let utilized = Double(windowBytes) * 8 >= rate * (now - sampleAt) * 0.5
-            let losses = agingLosses.count
-            let congested = (agingWindowUtilized && losses >= 2) || (utilized && queued && inflated)
-            let healthy =
-                now - sampleAt <= 1.5 && confirmations > 0 && losses == 0
-                && !inflated && probeAt == nil
-            if congested && congestedLastWindow {
-                reduceRate()
-            } else if healthy {
-                // An adaptive encoder can empty the queue at its reduced target. Use fresh
-                // ACKs to recover toward a previously demonstrated delivery rate.
-                healthyFeedbackTime += min(now - sampleAt, 0.5)
-                if min(recoveryCeiling, probeCeiling) > rate && healthyFeedbackTime >= 1 {
-                    rate = min(recoveryCeiling, probeCeiling, rate * 1.15)
-                    healthyFeedbackTime = 0
-                } else if (queued || utilized) && probeCeiling > rate {
-                    rate = min(100_000_000, probeCeiling, rate * pow(1.05, 0.25))
-                }
-                if rate >= recoveryCeiling { recoveryCeiling = 0 }
-            } else if congested || probeAt != nil || now - sampleAt > 1.5 {
-                healthyFeedbackTime = 0
-            }
-            congestedLastWindow = congested
-            baselineRTT = rtt
+            let interval = now - sampleAt
+            history.append(Window(
+                interval: interval, sent: windowBytes, acknowledged: windowAcknowledged,
+                packets: windowPackets, losses: agingLosses.count))
+            if history.count > 4 { history.removeFirst() }
+            adjustRate(now, interval: interval)
             confirmations = 0
             windowBytes = 0
+            windowAcknowledged = 0
+            windowPackets = 0
+            windowFastestRTT = nil
             agingLosses = suspectedLosses
             suspectedLosses.removeAll(keepingCapacity: true)
-            agingWindowUtilized = utilized
             sampleAt = now
+        }
+    }
+
+    /// One step of rate control, on a quarter second of evidence.
+    private func adjustRate(_ now: TimeInterval, interval: TimeInterval) {
+        // A window stretched by silence says nothing about the link.
+        guard interval <= 1.5 else {
+            history.removeAll()
+            healthyFeedbackTime = 0
+            return
+        }
+        let queued = queuedBytes > 0
+        // Timing variation on sparse traffic does not measure link capacity.
+        let utilized = Double(windowBytes) * 8 >= rate * interval * 0.5
+        let tolerance = max(0.02, (minimumRTT ?? 0) * 0.25)
+        var queueDelay: TimeInterval?
+        if confirmations >= 8, let fastest = windowFastestRTT, let floor = minimumRTT {
+            queueDelay = max(0, fastest - floor)
+        }
+        if (queueDelay ?? 0) <= tolerance {
+            cutQueueDelay = nil
+            futileCuts = 0
+        }
+        // The first sign of a queue ends the quick climb, before it has to be undone.
+        if (queueDelay ?? 0) > tolerance / 2 { startup = false }
+        let loss = lossRatio
+        if let trial = lossTrial, now >= trial.until {
+            lossTrial = nil
+            if loss > trial.loss * 0.6 {
+                // Sending less changed nothing, so this loss is the link's own. Put the rate
+                // back and stop reading loss at this level as a sign of congestion.
+                toleratedLoss = max(toleratedLoss, loss * 1.3 + 0.01)
+                toleratedLossAt = now
+                rate = max(rate, trial.rate)
+            } else {
+                capacityMark = (rate, now)
+            }
+        }
+        if toleratedLoss > 0.02, now >= toleratedLossAt + 30 {
+            // Test the assumption again now and then.
+            toleratedLoss = max(0.02, toleratedLoss * 0.7)
+            toleratedLossAt = now
+        }
+
+        if let queueDelay, queueDelay > tolerance, now >= holdUntil {
+            healthyFeedbackTime = 0
+            if let before = cutQueueDelay, queueDelay > before * 0.75 {
+                futileCuts += 1
+            } else {
+                futileCuts = 0
+            }
+            if futileCuts >= 2 {
+                // Two reductions did not shorten the queue: the delay is a longer path or
+                // someone else's traffic, and giving way further would only starve this session.
+                floorRTT = windowFastestRTT
+                previousFloorRTT = nil
+                floorRotatedAt = now
+                futileCuts = 0
+                cutQueueDelay = nil
+                return
+            }
+            // A standing queue means the link is saturated, so what it delivered of what was
+            // sent is what it can carry. Settle a little under that, and go lower still for
+            // as long as it takes the queue to empty.
+            let recent = history.suffix(2)
+            let sent = recent.reduce(0) { $0 + $1.sent }
+            let acknowledged = recent.reduce(0) { $0 + $1.acknowledged }
+            let carried = sent > 0 ? max(0.25, min(1, Double(acknowledged) / Double(sent))) : 1
+            let sustainable = max(Self.minimumRate, rate * 0.9 * carried)
+            startup = false
+            recoveryCeiling = sustainable
+            capacityMark = (sustainable, now)
+            rate = max(Self.minimumRate, sustainable * max(0.5, 1 - queueDelay))
+            cutQueueDelay = queueDelay
+            holdUntil = now + max(0.5, 2 * (rtt ?? 0))
+            lossTrial = nil
+        } else if loss > toleratedLoss, lossTrial == nil, now >= holdUntil {
+            healthyFeedbackTime = 0
+            // If the link is full, sending this much less ends the loss.
+            let until = now + 1.5 + 2 * (rtt ?? 0)
+            lossTrial = (rate, loss, until)
+            startup = false
+            rate = max(Self.minimumRate, rate * (1 - loss) * 0.95)
+            holdUntil = until
+        } else if confirmations > 0, loss <= toleratedLoss, (queueDelay ?? 0) <= tolerance / 2,
+            probeAt == nil, lossTrial == nil, now >= holdUntil
+        {
+            healthyFeedbackTime += min(interval, 0.5)
+            if min(recoveryCeiling, probeCeiling) > rate && healthyFeedbackTime >= 0.5 {
+                // The queue has emptied: return to what the link was just shown to carry.
+                rate = min(recoveryCeiling, probeCeiling, rate * 1.15)
+                healthyFeedbackTime = 0
+            } else if (queued || utilized) && probeCeiling > rate {
+                // Probe upward only while the budget is being used, and gently near a rate
+                // that recently proved too much.
+                let nearMark = capacityMark.map { now - $0.at < 20 && rate >= $0.rate * 0.98 } ?? false
+                rate = min(100_000_000, probeCeiling, rate * (nearMark ? 1.002 : startup ? 1.05 : 1.02))
+            }
+            if rate >= recoveryCeiling { recoveryCeiling = 0 }
+        } else if probeAt != nil {
+            healthyFeedbackTime = 0
         }
     }
 
     private func reduceRate() {
         recoveryCeiling = max(recoveryCeiling, min(rate, deliveryRate))
         healthyFeedbackTime = 0
-        rate = max(64_000, rate * 0.8)
+        startup = false
+        rate = max(Self.minimumRate, rate * 0.8)
     }
 
     private func candidate(_ now: TimeInterval) -> Wire.Fragment? {
@@ -638,6 +774,7 @@ public final class MessageTransport {
         }
         credit -= Double(bytes.count)
         windowBytes += bytes.count
+        windowPackets += 1
     }
 
     private func nextDeadline(_ now: TimeInterval) -> TimeInterval {

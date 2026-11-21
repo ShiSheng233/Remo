@@ -3,6 +3,11 @@ import RemoTransport
 /// The datagram link as the sender sees it.
 public struct LinkStatistics: Sendable {
     public let roundTripTime: Duration?
+    /// The fastest round trip of the last several seconds. The gap to `roundTripTime` is
+    /// time spent in queues along the path.
+    public let minimumRoundTripTime: Duration?
+    /// The share of data datagrams lost over about the last second.
+    public let lossRatio: Double
     /// Estimated sending budget in bits per second.
     public let bitsPerSecond: Double
     public let queueDelay: Duration
@@ -11,6 +16,8 @@ public struct LinkStatistics: Sendable {
 
     init(_ statistics: MessageTransport.Statistics) {
         roundTripTime = statistics.roundTripTime.map(Duration.seconds)
+        minimumRoundTripTime = statistics.minimumRoundTripTime.map(Duration.seconds)
+        lossRatio = statistics.lossRatio
         bitsPerSecond = statistics.bitsPerSecond
         queueDelay = .seconds(statistics.estimatedQueueDelay)
         audioExpiredBeforeFirstSend = statistics.expiredBeforeFirstSend[.high, default: 0]
@@ -20,7 +27,8 @@ public struct LinkStatistics: Sendable {
 extension LinkStatistics: CustomStringConvertible {
     public var description: String {
         "RTT=\(roundTripTime.map(\.logDescription) ?? "pending")"
-            + String(format: " txBudget=%.2f Mbps", bitsPerSecond / 1e6)
+            + " minRTT=\(minimumRoundTripTime.map(\.logDescription) ?? "pending")"
+            + String(format: " loss=%.1f%% txBudget=%.2f Mbps", lossRatio * 100, bitsPerSecond / 1e6)
             + " txQueue=\(queueDelay.logDescription)"
     }
 }

@@ -51,7 +51,9 @@ private actor SessionOwner {
         }
         let active = try #require(session)
         #expect(driver.receives == 1)
-        try active.send(Data([1]), delivery: .untilDelivered())
+        // Sent once: with no peer to acknowledge it, a retried message would compete with
+        // the reply below whenever this test is starved of CPU.
+        try active.send(Data([1]))
         #expect(driver.packets.count == 1)
         let inbound = Data([0, 0, 0, 0, 1, 0, 0, 0, 1, 13])
         driver.events?.yield(.received(inbound))
