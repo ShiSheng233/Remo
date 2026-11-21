@@ -34,8 +34,7 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
     private var recent: [Fragment: Instant] = [:]
     private var data = 0
     private var acks = 0
-    private var unreliableRetries = 0
-    private var reliableRetries = 0
+    private var retries = 0
     private var bytes = 0
     private var previousBytes = 0
     private var previousTime = Instant.now
@@ -56,8 +55,8 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
         let name: String
         switch (buffer[0], buffer[9]) {
         case (0, MessageKind.heartbeat.rawValue): name = "heartbeat"
-        case (2, MessageKind.hello.rawValue): name = "hello"
-        case (2, MessageKind.screenHello.rawValue): name = "screen hello"
+        case (0, MessageKind.hello.rawValue): name = "hello"
+        case (0, MessageKind.screenHello.rawValue): name = "screen hello"
         default: return nil
         }
         let packet = UInt32(bigEndian: buffer.loadUnaligned(fromByteOffset: 1, as: UInt32.self))
@@ -101,7 +100,7 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
                 let kind = buffer[0]
                 if kind == 0x80 {
                     ack = true
-                } else if kind == 0 || kind == 2 || (kind == 1 && buffer.count >= 13) {
+                } else if kind == 0 || (kind == 1 && buffer.count >= 13) {
                     let id = UInt32(
                         bigEndian: buffer.loadUnaligned(fromByteOffset: 5, as: UInt32.self))
                     let index =
@@ -123,15 +122,13 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
         if ack { acks += 1 }
         if let fragment {
             data += 1
-            if recent.updateValue(now, forKey: fragment) != nil {
-                if fragment.kind == 2 { reliableRetries += 1 } else { unreliableRetries += 1 }
-            }
+            if recent.updateValue(now, forKey: fragment) != nil { retries += 1 }
         }
         if now - previousTime >= .seconds(1) {
             if diagnostics.wireStatistics { report(framer, now: now) }
             previousBytes = bytes
             previousTime = now
-            // Every retry lifetime in use is shorter than three seconds.
+            // Retransmissions of one fragment are at most half a second apart.
             recent = recent.filter { now - $0.value < .seconds(3) }
         }
     }
@@ -143,7 +140,7 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
             Diagnostic(
                 peer: framer.remote?.debugDescription, kind: .wire,
                 message: "UDP tx" + String(format: " %.3f Mbps", mbps)
-                    + "  bytes=\(bytes) DATA=\(data) ACK=\(acks) U-retries=\(unreliableRetries) R-retries=\(reliableRetries)"
+                    + "  bytes=\(bytes) DATA=\(data) ACK=\(acks) retries=\(retries)"
             ))
     }
 

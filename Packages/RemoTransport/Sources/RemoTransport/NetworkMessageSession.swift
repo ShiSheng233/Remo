@@ -79,11 +79,11 @@ public final class NetworkMessageSession {
     private let datagramLimit: Int
     private var inFlightBytes = 0
     private var closed = false
-    private var dataHandler: ((MessageTransport.Channel, Data) -> Void)?
+    private var dataHandler: ((Data) -> Void)?
     private var closeHandler: ((CloseReason) -> Void)?
     private lazy var transport = MessageTransport(
         datagramLimit: datagramLimit, clock: Self.now,
-        dataHandler: { [weak self] in self?.dataHandler?($0, $1) },
+        dataHandler: { [weak self] in self?.dataHandler?($0) },
         ioHandler: { [weak self] in self?.perform($0) ?? false }
     )!
 
@@ -92,7 +92,7 @@ public final class NetworkMessageSession {
     public convenience init(
         connection: NWConnection, datagramLimit: Int = 1200,
         isolation: isolated any Actor = #isolation,
-        dataHandler: @escaping (MessageTransport.Channel, Data) -> Void,
+        dataHandler: @escaping (Data) -> Void,
         closeHandler: @escaping (CloseReason) -> Void
     ) async throws {
         try await self.init(
@@ -104,7 +104,7 @@ public final class NetworkMessageSession {
     public init(
         driver: any DatagramConnection, datagramLimit: Int = 1200,
         isolation: isolated any Actor = #isolation,
-        dataHandler: @escaping (MessageTransport.Channel, Data) -> Void,
+        dataHandler: @escaping (Data) -> Void,
         closeHandler: @escaping (CloseReason) -> Void
     ) async throws {
         guard datagramLimit >= 64 else { throw SetupError.invalidDatagramLimit }
@@ -172,18 +172,31 @@ public final class NetworkMessageSession {
         return transport.statistics
     }
 
-    /// Success means local admission. A network failure can still leave delivery unknown.
-    /// Absolute U deadlines use DispatchTime uptime in seconds.
-    public func send(_ data: Data, mode: MessageTransport.Mode) throws(SendError) {
+    /// Success means local admission. `onOutcome` runs on the owning actor when the message is
+    /// delivered, expires or is cancelled; it never runs once the session has closed.
+    /// Absolute first-send deadlines use DispatchTime uptime in seconds.
+    @discardableResult
+    public func send(
+        _ data: Data, delivery: MessageTransport.Delivery = .init(),
+        onOutcome: ((MessageTransport.Outcome) -> Void)? = nil
+    ) throws(SendError) -> MessageTransport.MessageID {
         owner.preconditionIsolated()
         guard !closed else { throw .closed }
-        switch transport.send(data, mode: mode) {
-        case .queued: return
+        switch transport.send(data, delivery: delivery, onOutcome: onOutcome) {
+        case .queued(let id): return id
         case .backpressure: throw .backpressure
         case .invalidLength: throw .invalidLength
         case .invalidTime: throw .invalidTime
         case .closed: throw .closed
         }
+    }
+
+    /// Stops sending a message that has not finished. The peer can still receive it if its
+    /// datagrams were already on their way.
+    public func cancelMessage(_ id: MessageTransport.MessageID) {
+        owner.preconditionIsolated()
+        guard !closed else { return }
+        transport.cancelMessage(id)
     }
 
     /// End the session and release its event loop when its owning actor is done.

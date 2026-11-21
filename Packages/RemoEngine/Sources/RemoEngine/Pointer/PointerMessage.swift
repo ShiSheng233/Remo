@@ -10,14 +10,19 @@ import RemoTransport
 enum PointerMessage: Equatable {
     case ready(position: CGPoint, width: UInt32, height: UInt32)
     case move(sequence: UInt64, afterButton: UInt64, position: CGPoint)
-    case button(sequence: UInt64, action: PointerButton, position: CGPoint)
+    /// `afterButton` is the previous button change, or zero for the first.
+    case button(sequence: UInt64, afterButton: UInt64, action: PointerButton, position: CGPoint)
     /// Whole lines; positive values move the content down, following the finger.
     case scroll(lines: Int32)
 
-    /// Button changes must arrive. A late move or scroll is only noise.
-    var mode: MessageTransport.Mode {
-        if case .button = self { return .reliable }
-        return .unreliable(sendWithin: SessionTiming.pointerDeadline)
+    /// Button changes must arrive. A late move or scroll is only noise, and a newer position
+    /// makes an unsent older one pointless.
+    var delivery: MessageTransport.Delivery {
+        switch self {
+        case .ready, .button: .essential
+        case .move: .retrying(sendWithin: SessionTiming.pointerDeadline, replacing: .pointerMove)
+        case .scroll: .retrying(sendWithin: SessionTiming.pointerDeadline)
+        }
     }
 
     private enum Input: UInt8 {
@@ -38,10 +43,11 @@ enum PointerMessage: Equatable {
             data.put(sequence)
             data.put(afterButton)
             data.putPosition(position)
-        case let .button(sequence, action, position):
+        case let .button(sequence, afterButton, action, position):
             data.put(MessageKind.pointerInput.rawValue)
             data.put(Input.button.rawValue)
             data.put(sequence)
+            data.put(afterButton)
             data.put(action.rawValue)
             data.putPosition(position)
         case let .scroll(lines):
@@ -70,9 +76,13 @@ enum PointerMessage: Equatable {
                 self = .move(sequence: sequence, afterButton: afterButton, position: try data.takePosition())
             case .button:
                 let sequence = try data.take(UInt64.self)
-                guard sequence > 0, let button = PointerButton(rawValue: try data.take(UInt8.self))
+                let afterButton = try data.take(UInt64.self)
+                guard sequence > afterButton,
+                    let button = PointerButton(rawValue: try data.take(UInt8.self))
                 else { throw WireFormatError.invalid }
-                self = .button(sequence: sequence, action: button, position: try data.takePosition())
+                self = .button(
+                    sequence: sequence, afterButton: afterButton, action: button,
+                    position: try data.takePosition())
             case .scroll:
                 let lines = try data.take(Int32.self)
                 guard (-100...100).contains(lines), lines != 0 else { throw WireFormatError.invalid }

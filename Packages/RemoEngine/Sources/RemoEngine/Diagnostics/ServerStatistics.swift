@@ -20,8 +20,8 @@ public struct ServerStatistics: Sendable {
     public let encoderBitRate: Int
     /// Source frames skipped because the send queue was too deep.
     public let captureSkips: Int
-    /// Frames withheld while a reliable key frame was in flight.
-    public let checkpointSkips: UInt64
+    /// Frames withheld while a key frame was still on its way to the client.
+    public let keyFrameWaits: UInt64
     public let acknowledgedReferences: Int
     public let controlsSent: UInt64
     public let heartbeatsReceived: Int
@@ -39,7 +39,7 @@ extension ServerStatistics: CustomStringConvertible {
     public var description: String {
         var details =
             "generated=\(framesGenerated) queued=\(framesQueued) backpressureDrops=\(backpressureDrops) codecDrops=\(codecDrops)"
-            + " encoderBps=\(encoderBitRate) captureSkips=\(captureSkips) checkpointSkips=\(checkpointSkips)"
+            + " encoderBps=\(encoderBitRate) captureSkips=\(captureSkips) keyFrameWaits=\(keyFrameWaits)"
             + " ltrAcks=\(acknowledgedReferences) controlsQueued=\(controlsSent) heartbeatsRx=\(heartbeatsReceived)"
         if let audio, audio.packetsQueued > 0 || audio.backpressureDrops > 0 {
             details +=

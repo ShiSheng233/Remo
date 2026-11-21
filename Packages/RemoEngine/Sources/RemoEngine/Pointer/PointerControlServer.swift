@@ -4,7 +4,6 @@
 //
 
 import Foundation
-import RemoTransport
 
 /// Serializes remote pointer input from one controlling peer at a time.
 @MainActor
@@ -29,6 +28,8 @@ final class PointerControlServer {
     private var latestPosition: UInt64 = 0
     private var latestButton: UInt64 = 0
     private var pendingMove: Move?
+    /// Button changes that arrived before the one they follow, keyed by that one's sequence.
+    private var pendingButtons: [UInt64: PointerMessage] = [:]
 
     init(initialState: @escaping () -> PointerMessage?, emit: @escaping (Event) -> Void) {
         self.initialState = initialState
@@ -45,15 +46,31 @@ final class PointerControlServer {
     }
 
     @discardableResult
-    func receive(_ bytes: Data, on channel: MessageTransport.Channel, from peer: UUID) -> Bool {
+    func receive(_ bytes: Data, from peer: UUID) -> Bool {
         guard owner == peer, let input = try? PointerMessage(decoding: bytes) else { return false }
-        switch (channel, input) {
-        case let (.unreliable, .move(sequence, afterButton, position)):
+        switch input {
+        case let .move(sequence, afterButton, position):
             receiveMove(Move(sequence: sequence, afterButton: afterButton, position: position))
-        case let (.unreliable, .scroll(lines)):
+        case let .scroll(lines):
             emit(.scroll(lines: lines))
-        case let (.reliable, .button(sequence, action, position)):
-            guard sequence > latestPosition else { return true }
+        case .button:
+            receiveButton(input)
+        case .ready: return false
+        }
+        return true
+    }
+
+    /// Applies button changes in the order they were made. One that overtook its predecessor
+    /// waits for it, which always arrives: button changes are sent until delivered.
+    private func receiveButton(_ input: PointerMessage) {
+        var next: PointerMessage? = input
+        while let current = next, case let .button(sequence, afterButton, action, position) = current {
+            next = nil
+            guard afterButton >= latestButton, sequence > latestPosition else { return }
+            if afterButton > latestButton {
+                if pendingButtons.count < 64 { pendingButtons[afterButton] = current }
+                return
+            }
             latestButton = sequence
             latestPosition = sequence
             switch action {
@@ -77,14 +94,13 @@ final class PointerControlServer {
                 self.pendingMove = nil
                 receiveMove(pendingMove)
             }
-        default: return false
+            next = pendingButtons.removeValue(forKey: sequence)
         }
-        return true
     }
 
     private func receiveMove(_ move: Move) {
         guard move.sequence > latestPosition, move.afterButton >= latestButton else { return }
-        // A move can overtake its reliable button transition. Keep only the latest such move.
+        // A move can overtake the button change it follows. Keep only the latest such move.
         if move.afterButton > latestButton {
             if move.sequence > (pendingMove?.sequence ?? 0) { pendingMove = move }
             return
@@ -105,6 +121,7 @@ final class PointerControlServer {
         latestPosition = 0
         latestButton = 0
         pendingMove = nil
+        pendingButtons.removeAll()
     }
 }
 

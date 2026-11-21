@@ -149,11 +149,11 @@ public final class RemoteScreenClient {
         guard isRunning, state == .streaming, let transport, let message = make(&pointer) else {
             return
         }
-        let mode = message.mode
         do {
-            try transport.send(message.encoded, mode: mode)
+            try transport.send(message.encoded, delivery: message.delivery)
         } catch {
-            if case .unreliable = mode { return }
+            // A move or scroll that finds no room is simply late. A button change must not vanish.
+            guard case .button = message else { return }
             fail(.pointerInputFailed(error))
         }
     }
@@ -190,7 +190,7 @@ public final class RemoteScreenClient {
         if let session = transport {
             // Without the goodbye, the server holds the capture and pointer until it times out.
             // Keep the link open long enough to send and retry it; nothing else is processed.
-            if (try? session.send(MessageKind.goodbye.encoded, mode: .reliable)) != nil {
+            if (try? session.send(MessageKind.goodbye.encoded, delivery: .essential)) != nil {
                 let roundTrip = session.statistics.roundTripTime.map(Duration.seconds)
                 await linger(
                     min(.milliseconds(250), max(.milliseconds(50), (roundTrip ?? .milliseconds(100)) * 2)))
@@ -230,12 +230,13 @@ public final class RemoteScreenClient {
 
         do {
             video = VideoSession(
-                send: { [weak self] data, mode in
+                send: { [weak self] data, delivery, onOutcome in
                     guard let session = self?.transport else {
                         throw NetworkMessageSession.SendError.closed
                     }
-                    try session.send(data, mode: mode)
+                    return try session.send(data, delivery: delivery, onOutcome: onOutcome)
                 },
+                cancel: { [weak self] in self?.transport?.cancelMessage($0) },
                 onFrame: { [weak self] id, frame, bytes in
                     self?.present(VideoFrame(frame), id: id, bytes: bytes)
                 },
@@ -244,7 +245,7 @@ public final class RemoteScreenClient {
                     configuration.diagnostics.info(nil, line)
                 },
                 onFailure: { [weak self] error in self?.fail(.videoFailed(error)) })
-            try session.send(MessageKind.screenHello.encoded, mode: .reliable)
+            try session.send(MessageKind.screenHello.encoded, delivery: .essential)
             trace.write(nil, "hello queued")
             setState(.waitingForVideo)
             try await keepAlive(session)
@@ -255,12 +256,10 @@ public final class RemoteScreenClient {
     }
 
     private func open(_ link: Link) async throws -> NetworkMessageSession {
-        let receive: (MessageTransport.Channel, Data) -> Void = { [weak self] in
-            self?.receive($0, $1)
-        }
+        let receive: (Data) -> Void = { [weak self] in self?.receive($0) }
         let close: (NetworkMessageSession.CloseReason) -> Void = { [weak self] reason in
             guard let self else { return }
-            configuration.diagnostics.info(nil, "client connection closed: \(reason.diagnosticDescription)")
+            configuration.diagnostics.info(nil, "client connection closed: \(reason)")
             guard transport != nil else { return }
             if case .network(let error) = reason {
                 fail(.network(error))
@@ -303,11 +302,17 @@ public final class RemoteScreenClient {
                 if configuration.requestsPointerControl, pointer.displaySize == nil,
                     now >= nextPointerHello
                 {
+                    // The server answers only once it can grant control, so keep asking. Each
+                    // request is retried until the next one takes over.
                     nextPointerHello = now + SessionTiming.pointerHelloRetry
-                    try session.send(MessageKind.pointerHello.encoded, mode: .reliable)
+                    try session.send(
+                        MessageKind.pointerHello.encoded,
+                        delivery: .retrying(
+                            for: SessionTiming.pointerHelloRetry, priority: .high,
+                            replacing: .pointerHello))
                 }
                 try session.send(
-                    MessageKind.heartbeat.encoded, mode: .unreliable(retryBudget: 0))
+                    MessageKind.heartbeat.encoded, delivery: .retrying(replacing: .heartbeat))
                 counters.heartbeats += 1
                 trace.write(nil, "heartbeat queued count=\(counters.heartbeats)")
             } catch NetworkMessageSession.SendError.backpressure {
@@ -318,14 +323,14 @@ public final class RemoteScreenClient {
         }
     }
 
-    private func receive(_ channel: MessageTransport.Channel, _ data: Data) {
+    private func receive(_ data: Data) {
         // Video first: it also uses unrelated messages to retry lost refresh requests.
         guard isRunning, let byte = data.first else { return }
-        if video?.receive(channel, data) == true {
+        if video?.receive(data) == true {
             lastSeen = .now
             return
         }
-        if channel == .unreliable, byte == MessageKind.audio.rawValue {
+        if byte == MessageKind.audio.rawValue {
             guard let packet = try? AudioMessage(decoding: data) else { return }
             lastSeen = .now
             guard !audioDisabled else { return }
@@ -347,7 +352,7 @@ public final class RemoteScreenClient {
             counters.controls += 1
             counters.latestControl = max(counters.latestControl, control.sequence)
             lastSeen = .now
-        case .pointerReady where channel == .reliable:
+        case .pointerReady:
             if pointer.receiveReady(data), let size = pointer.displaySize {
                 lastSeen = .now
                 onEvent(.pointerAvailable(displaySize: size))

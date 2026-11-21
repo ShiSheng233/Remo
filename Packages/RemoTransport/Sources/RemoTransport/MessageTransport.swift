@@ -3,26 +3,64 @@ import Foundation
 /// One direction pair in an already isolated, authenticated datagram session.
 /// Serialize all calls on the same executor. Times are monotonic seconds on the supplied clock.
 public final class MessageTransport {
-    public enum UnreliablePriority: Int {
+    public enum Priority: Int, Sendable {
         case normal, high
     }
 
-    public enum Mode {
-        case reliable
-        /// The budget starts at admission. The optional absolute deadline limits first transmissions.
-        /// Priority is local to the sender and applies at each datagram scheduling decision.
-        case unreliable(
-            retryBudget: TimeInterval, firstSendDeadline: TimeInterval? = nil,
-            priority: UnreliablePriority = .normal)
+    /// How hard to try for one message. There is one kind of message: what used to be a
+    /// reliable one is a message whose retry budget never runs out.
+    public struct Delivery {
+        /// Lost fragments are retransmitted until this long after admission. Zero sends each
+        /// fragment once. Infinity retransmits until the peer has the message or it is cancelled.
+        public var retryBudget: TimeInterval
+        /// An optional absolute time by which every fragment must have been sent once.
+        public var firstSendDeadline: TimeInterval?
+        /// Local to the sender, applied at each datagram scheduling decision.
+        public var priority: Priority
+        /// Cancels the unfinished message last admitted with the same key, for state where only
+        /// the newest value matters.
+        public var replacing: Int?
+
+        public init(
+            retryBudget: TimeInterval = 0, firstSendDeadline: TimeInterval? = nil,
+            priority: Priority = .normal, replacing key: Int? = nil
+        ) {
+            self.retryBudget = retryBudget
+            self.firstSendDeadline = firstSendDeadline
+            self.priority = priority
+            replacing = key
+        }
+
+        public static func untilDelivered(priority: Priority = .normal, replacing key: Int? = nil) -> Self {
+            Self(retryBudget: .infinity, priority: priority, replacing: key)
+        }
     }
 
-    public enum Channel { case reliable, unreliable }
+    /// Names an admitted message for `cancelMessage`.
+    public struct MessageID: Hashable, Sendable {
+        let rawValue: UInt32
+    }
+
+    /// How a message ended. None is reported once the transport has closed.
+    public enum Outcome: Equatable, Sendable {
+        /// The peer acknowledged every fragment.
+        case delivered
+        /// Its first-send deadline passed, or a fragment was lost with no retry budget left.
+        case expired
+        /// Cancelled or replaced. Fragments already sent can still complete at the peer.
+        case cancelled
+    }
+
     public enum SendResult: Equatable {
-        case queued, backpressure, invalidLength, invalidTime, closed
+        case queued(MessageID)
+        case backpressure, invalidLength, invalidTime, closed
+
+        public var id: MessageID? {
+            if case .queued(let id) = self { return id }
+            return nil
+        }
     }
     public enum Failure: Equatable {
-        /// First transmission and retransmissions count only datagrams accepted by I/O.
-        case reliableDeadline(firstByte: UInt8, sequence: UInt32, firstSent: Bool, retransmissions: Int)
         case sequenceExhausted
     }
     public enum Event {
@@ -44,38 +82,55 @@ public final class MessageTransport {
         public let blocked: Bool
         public let probing: Bool
         public let estimatedQueueDelay: TimeInterval
+        /// Bytes waiting for a first transmission or a retransmission, by message priority.
+        public let queuedBytes: [Priority: Int]
         /// Admitted messages whose deadline elapsed before any datagram was accepted by I/O.
-        public let expiredBeforeFirstSend: [UnreliablePriority: UInt64]
+        public let expiredBeforeFirstSend: [Priority: UInt64]
+
+        /// How long a message admitted now at `priority` waits behind what is already queued.
+        public func queueDelay(for priority: Priority) -> TimeInterval {
+            let ahead = queuedBytes.reduce(0) { $0 + ($1.key.rawValue >= priority.rawValue ? $1.value : 0) }
+            return Double(ahead) * 8 / bitsPerSecond
+        }
     }
 
     private final class Message {
         let data: Data
         let count: Int
         let capacity: Int
+        /// Retransmissions stop here. Infinite for a message that must arrive.
         let deadline: TimeInterval
-        let priority: UnreliablePriority
+        let priority: Priority
+        let key: Int?
+        let onOutcome: ((Outcome) -> Void)?
         var firstDeadline: TimeInterval?
         var cursor = 0
         var retries: Set<Int> = []
+        /// Consecutive timeouts per fragment, for retransmission backoff.
+        var timeouts: [Int: Int] = [:]
+        /// Fragments neither acknowledged nor given up on.
         var remaining: Int
-        var retransmissions = 0
-        var timeouts = 0
+        var abandoned = false
 
         init(
-            _ data: Data, mtu: Int, deadline: TimeInterval, firstDeadline: TimeInterval?,
-            priority: UnreliablePriority = .normal
+            _ data: Data, mtu: Int, now: TimeInterval, delivery: Delivery,
+            onOutcome: ((Outcome) -> Void)?
         ) {
-            self.priority = priority
+            priority = delivery.priority
+            key = delivery.replacing
+            self.onOutcome = onOutcome
             self.data = data
-            capacity = data.count <= mtu - 9 ? mtu - 9 : mtu - 13
+            capacity =
+                data.count <= mtu - Wire.singleHeader
+                ? mtu - Wire.singleHeader : mtu - Wire.fragmentHeader
             count = (data.count + capacity - 1) / capacity
             remaining = count
-            self.deadline = deadline
-            self.firstDeadline = firstDeadline
+            deadline = now + delivery.retryBudget
+            firstDeadline = delivery.firstSendDeadline
         }
 
         func size(_ index: Int) -> Int { min(capacity, data.count - index * capacity) }
-        var header: Int { count == 1 ? 9 : 13 }
+        var header: Int { count == 1 ? Wire.singleHeader : Wire.fragmentHeader }
         var queuedBytes: Int {
             let fresh = max(0, data.count - cursor * capacity) + (count - cursor) * header
             return retries.reduce(fresh) { $0 + size($1) + header }
@@ -85,22 +140,21 @@ public final class MessageTransport {
     private struct Attempt {
         let key: Wire.Fragment
         var expires: TimeInterval?
-        let retry: Bool
     }
 
     public let datagramLimit: Int
     public private(set) var isClosed = false
 
     private let clock: () -> TimeInterval
-    private let dataHandler: (Channel, Data) -> Void
+    private let dataHandler: (Data) -> Void
     private let ioHandler: (IORequest) -> Bool
     var onDeliveryConfirmed: (() -> Void)?
     private var receiver = Receiver()
-    private var r: [UInt32: Message] = [:]
-    private var u: [UInt32: Message] = [:]
-    private var lastR: UInt32 = 0
-    private var lastU: UInt32 = 0
-    private var expiredBeforeFirstSend: [UnreliablePriority: UInt64] = [:]
+    private var messages: [UInt32: Message] = [:]
+    private var lastMessage: UInt32 = 0
+    private var replaceable: [Int: UInt32] = [:]
+    private var outcomes: [(handler: (Outcome) -> Void, outcome: Outcome)] = []
+    private var expiredBeforeFirstSend: [Priority: UInt64] = [:]
     private var lastPacket: UInt32 = 0
     private var attempts: [UInt32: Attempt] = [:]
     private var highConfirmed: [UInt32] = []
@@ -156,10 +210,12 @@ public final class MessageTransport {
 
     /// Return false for sendDatagram only if the datagram was not accepted.
     /// After that, signal writable to resume. Other request return values are ignored.
-    /// Data callbacks run synchronously. The adapter owns peer selection and session isolation.
+    /// Data and outcome callbacks run synchronously, and may send or cancel. Messages arrive in
+    /// the order they complete, not the order they were sent. The adapter owns peer selection
+    /// and session isolation.
     public init?(
         datagramLimit: Int = 1200, clock: @escaping () -> TimeInterval,
-        dataHandler: @escaping (Channel, Data) -> Void,
+        dataHandler: @escaping (Data) -> Void,
         ioHandler: @escaping (IORequest) -> Bool
     ) {
         guard datagramLimit >= 64 else { return nil }
@@ -174,55 +230,60 @@ public final class MessageTransport {
         deliverySampleAt = creditAt
     }
 
-    private var queuedBytes: Int {
-        r.values.reduce(0) { $0 + $1.queuedBytes } + u.values.reduce(0) { $0 + $1.queuedBytes }
-    }
+    private var queuedBytes: Int { messages.values.reduce(0) { $0 + $1.queuedBytes } }
+    private var queueDelay: TimeInterval { Double(queuedBytes) * 8 / rate }
 
     public var statistics: Statistics {
+        var queued: [Priority: Int] = [:]
+        for msg in messages.values { queued[msg.priority, default: 0] += msg.queuedBytes }
         return Statistics(
             bitsPerSecond: rate, roundTripTime: rtt,
             acceptedDataPackets: lastPacket, blocked: blocked, probing: probeAt != nil,
-            estimatedQueueDelay: Double(queuedBytes) * 8 / rate, expiredBeforeFirstSend: expiredBeforeFirstSend)
+            estimatedQueueDelay: queueDelay, queuedBytes: queued,
+            expiredBeforeFirstSend: expiredBeforeFirstSend)
     }
 
     /// Attempts admission without waiting for network credit or acknowledgement.
-    /// Reliable deadlines include queueing time. On failure, delivery is unknown.
+    /// `onOutcome` reports how the message ended, once, unless the transport closes first.
     @discardableResult
-    public func send(_ data: Data, mode: Mode) -> SendResult {
+    public func send(
+        _ data: Data, delivery: Delivery = Delivery(), onOutcome: ((Outcome) -> Void)? = nil
+    ) -> SendResult {
         let now = clock()
         if !running && !isClosed { expire(now) }
         guard !isClosed else { return .closed }
-        guard !data.isEmpty else { return .invalidLength }
-        switch mode {
-        case .reliable:
-            guard data.count <= datagramLimit - 9 else { return .invalidLength }
-            guard r.count < 256 else { return .backpressure }
-            guard lastR < .max else {
-                close(.sequenceExhausted)
-                return .closed
-            }
-            lastR += 1
-            r[lastR] = Message(data, mtu: datagramLimit, deadline: now + 2, firstDeadline: nil)
-        case .unreliable(let budget, let deadline, let priority):
-            guard data.count <= Wire.maxMessage else { return .invalidLength }
-            guard budget.isFinite, budget >= 0, deadline?.isFinite != false else {
-                return .invalidTime
-            }
-            guard deadline.map({ now < $0 }) ?? true else { return .invalidTime }
-            guard u.count < 256, u.values.reduce(data.count, { $0 + $1.data.count }) <= 4 << 20
-            else {
-                return .backpressure
-            }
-            guard lastU < .max else {
-                close(.sequenceExhausted)
-                return .closed
-            }
-            lastU += 1
-            u[lastU] = Message(
-                data, mtu: datagramLimit, deadline: now + budget, firstDeadline: deadline, priority: priority)
+        guard !data.isEmpty, data.count <= Wire.maxMessage else { return .invalidLength }
+        guard delivery.retryBudget >= 0, delivery.firstSendDeadline?.isFinite != false else {
+            return .invalidTime
         }
+        guard delivery.firstSendDeadline.map({ now < $0 }) ?? true else { return .invalidTime }
+        // The newest value wins even if it then finds no room: the old one is stale either way.
+        if let key = delivery.replacing, let old = replaceable[key] { finish(old, .cancelled) }
+        guard messages.count < 256,
+            messages.values.reduce(data.count, { $0 + $1.data.count }) <= 4 << 20
+        else {
+            drive()
+            return .backpressure
+        }
+        guard lastMessage < .max else {
+            close(.sequenceExhausted)
+            return .closed
+        }
+        lastMessage += 1
+        messages[lastMessage] = Message(
+            data, mtu: datagramLimit, now: now, delivery: delivery, onOutcome: onOutcome)
+        if let key = delivery.replacing { replaceable[key] = lastMessage }
+        let id = MessageID(rawValue: lastMessage)
         drive()
-        return .queued
+        return .queued(id)
+    }
+
+    /// Stops sending and retransmitting a message. Fragments already sent can still complete at
+    /// the peer, so the application must tolerate the message arriving anyway.
+    public func cancelMessage(_ id: MessageID) {
+        guard !isClosed else { return }
+        finish(id.rawValue, .cancelled)
+        drive()
     }
 
     public func handleEvent(_ event: Event) {
@@ -231,18 +292,20 @@ public final class MessageTransport {
         drive()
     }
 
-    /// Keeps acknowledged reliable messages in the receive window until delivery resumes.
-    public func setReliableDeliveryPaused(_ paused: Bool) {
-        receiver.paused = paused
-        drive()
+    /// Ends a message. Its transmissions in flight are forgotten as they time out.
+    private func finish(_ id: UInt32, _ outcome: Outcome) {
+        guard let msg = messages.removeValue(forKey: id) else { return }
+        if let key = msg.key, replaceable[key] == id { replaceable[key] = nil }
+        if let handler = msg.onOutcome { outcomes.append((handler, outcome)) }
     }
 
     private func close(_ reason: Failure?) {
         guard !isClosed else { return }
         isClosed = true
         receiver = Receiver()
-        r.removeAll()
-        u.removeAll()
+        messages.removeAll()
+        replaceable.removeAll()
+        outcomes.removeAll()
         attempts.removeAll()
         events.removeAll()
         if armed != nil {
@@ -283,8 +346,9 @@ public final class MessageTransport {
             }
             expire(now)
             guard !isClosed else { return }
-            if let data = receiver.popReliable() {
-                dataHandler(.reliable, data)
+            if !outcomes.isEmpty {
+                let (handler, outcome) = outcomes.removeFirst()
+                handler(outcome)
                 continue
             }
             var wake = nextDeadline(now)
@@ -292,7 +356,7 @@ public final class MessageTransport {
                 let ackReady = ackDue.map { $0 <= now } ?? false
                 let key = ackReady ? nil : candidate(now)
                 if ackReady || key != nil {
-                    let msg = key.flatMap(message)
+                    let msg = key.flatMap { messages[$0.id] }
                     let cost = key.map { msg!.size($0.index) + msg!.header } ?? 13
                     if credit + 1e-7 >= Double(cost) {
                         if ackReady {
@@ -322,16 +386,14 @@ public final class MessageTransport {
         }
     }
 
-    private func message(_ key: Wire.Fragment) -> Message? { key.reliable ? r[key.id] : u[key.id] }
-
     private func receive(_ bytes: Data, _ now: TimeInterval) {
         switch Wire.decode(bytes, mtu: datagramLimit) {
         case .ack(let number, let bits):
             guard number <= lastPacket else { return }
             acknowledge(number, bits, now)
-        case .data(let number, let key, let count, let payload):
+        case .data(let number, let key, let count, let lifetime, let payload):
             let (accepted, duplicate, complete) = receiver.accept(
-                key, count: count, data: payload, now: now)
+                key, count: count, lifetime: lifetime, data: payload, now: now)
             guard accepted else { return }
             let gap = UInt64(number) != UInt64(largest) + 1
             if number > largest {
@@ -341,9 +403,9 @@ public final class MessageTransport {
                 bitmap |= UInt64(1) << (largest - number)
             }
             ackCount += 1
-            let urgent = key.reliable || duplicate || gap || ackCount >= 8
+            let urgent = duplicate || gap || ackCount >= 8
             ackDue = min(ackDue ?? .infinity, urgent ? now : now + 0.005)
-            if let complete { dataHandler(.unreliable, complete) }
+            if let complete { dataHandler(complete) }
         case nil: break
         }
     }
@@ -389,14 +451,11 @@ public final class MessageTransport {
         }
         if !confirmed.isEmpty {
             for key in confirmed {
-                guard let msg = message(key) else { continue }
+                guard let msg = messages[key.id] else { continue }
                 msg.retries.remove(key.index)
+                msg.timeouts[key.index] = nil
                 msg.remaining -= 1
-                if key.reliable {
-                    r.removeValue(forKey: key.id)
-                } else if msg.remaining == 0 {
-                    u.removeValue(forKey: key.id)
-                }
+                if msg.remaining == 0 { finish(key.id, msg.abandoned ? .expired : .delivered) }
             }
             attempts = attempts.filter { !confirmed.contains($0.value.key) }
         }
@@ -409,62 +468,57 @@ public final class MessageTransport {
     }
 
     private func viable(_ msg: Message, _ now: TimeInterval) -> Bool {
-        now + statistics.estimatedQueueDelay + (rtt ?? 0.1) / 2 < msg.deadline
+        now + queueDelay + (rtt ?? 0.1) / 2 < msg.deadline
     }
 
     private func lose(_ number: UInt32, _ attempt: Attempt, _ now: TimeInterval, timeout: Bool) {
         suspectedLosses.insert(number)
         attempts[number]?.expires = nil
         let key = attempt.key
-        guard let msg = message(key) else {
+        guard let msg = messages[key.id] else {
             attempts.removeValue(forKey: number)
             return
         }
-        if key.reliable {
-            if timeout { msg.timeouts = min(5, msg.timeouts + 1) }
-            msg.retries.insert(key.index)
-        } else if !attempt.retry && viable(msg, now) {
+        // Retransmit as often as the budget allows. The lost attempt stays on record so a late
+        // acknowledgement can still confirm the fragment.
+        if viable(msg, now) {
+            if timeout { msg.timeouts[key.index] = min(5, msg.timeouts[key.index, default: 0] + 1) }
             msg.retries.insert(key.index)
         } else {
             abandon(key, msg)
         }
     }
 
+    /// Gives up on one fragment. The message can no longer complete, but its other fragments
+    /// still run their course: a loss verdict can be wrong, and the fragment may have arrived.
     private func abandon(_ key: Wire.Fragment, _ msg: Message) {
         attempts = attempts.filter { $0.value.key != key }
         msg.retries.remove(key.index)
+        msg.timeouts[key.index] = nil
         msg.remaining -= 1
-        if msg.remaining == 0 { u.removeValue(forKey: key.id) }
+        msg.abandoned = true
+        if msg.remaining == 0 { finish(key.id, .expired) }
     }
 
     private func expire(_ now: TimeInterval) {
-        if let (sequence, msg) = r.lazy.filter({ $0.value.deadline <= now }).min(by: { $0.key < $1.key }) {
-            close(.reliableDeadline(
-                firstByte: msg.data[msg.data.startIndex], sequence: sequence,
-                firstSent: msg.cursor > 0, retransmissions: msg.retransmissions))
-            return
-        }
         receiver.expire(now)
-        for (id, msg) in u {
+        for (id, msg) in messages {
             if let firstDeadline = msg.firstDeadline, firstDeadline <= now {
                 if msg.cursor == 0 { expiredBeforeFirstSend[msg.priority, default: 0] += 1 }
-                u.removeValue(forKey: id)
-            } else if msg.cursor == msg.count && msg.deadline <= now {
-                u.removeValue(forKey: id)
+                finish(id, .expired)
             } else if now >= msg.deadline {
-                for index in msg.retries {
-                    abandon(.init(reliable: false, id: id, index: index), msg)
-                }
+                // Fragments still in flight are settled by their acknowledgement or timeout.
+                for index in msg.retries { abandon(.init(id: id, index: index), msg) }
             }
         }
         for (number, attempt) in attempts {
             if let deadline = attempt.expires, deadline <= now {
                 lose(number, attempt, now, timeout: true)
-            } else if attempt.expires == nil && message(attempt.key) == nil {
+            } else if attempt.expires == nil && messages[attempt.key.id] == nil {
                 attempts.removeValue(forKey: number)
             }
         }
-        if attempts.isEmpty && r.isEmpty && u.isEmpty {
+        if attempts.isEmpty && messages.isEmpty {
             progressAt = nil
             probeAt = nil
         }
@@ -536,25 +590,19 @@ public final class MessageTransport {
 
     private func candidate(_ now: TimeInterval) -> Wire.Fragment? {
         if let probeAt, now < probeAt { return nil }
-        if let oldest = r.keys.min() {
-            for id in r.keys.sorted() where id - oldest < 32 {
-                let msg = r[id]!
-                if msg.cursor == 0 || !msg.retries.isEmpty {
-                    return .init(reliable: true, id: id, index: 0)
-                }
-            }
-        }
-        let ordered = u.sorted {
+        guard let oldest = messages.keys.min() else { return nil }
+        let ordered = messages.sorted {
             if $0.value.priority == $1.value.priority { return $0.key < $1.key }
             return $0.value.priority.rawValue > $1.value.priority.rawValue
         }
-        for (id, msg) in ordered {
+        // Stay within the receiver's duplicate window of the oldest message still in play.
+        for (id, msg) in ordered where id - oldest < Wire.messageWindow {
             while let index = msg.retries.min() {
-                let key = Wire.Fragment(reliable: false, id: id, index: index)
+                let key = Wire.Fragment(id: id, index: index)
                 if viable(msg, now) { return key }
                 abandon(key, msg)
             }
-            if msg.cursor < msg.count { return .init(reliable: false, id: id, index: msg.cursor) }
+            if msg.cursor < msg.count { return .init(id: id, index: msg.cursor) }
         }
         return nil
     }
@@ -566,25 +614,23 @@ public final class MessageTransport {
         }
         let start = msg.data.startIndex + key.index * msg.capacity
         let bytes = Wire.data(
-            lastPacket + 1, key, msg.count, msg.data[start..<(start + msg.size(key.index))])
+            lastPacket + 1, key, msg.count, lifetime: msg.deadline - clock(),
+            msg.data[start..<(start + msg.size(key.index))])
         guard ioHandler(.sendDatagram(bytes)) else {
             blocked = true
             return
         }
         lastPacket += 1
-        let retry = msg.retries.remove(key.index) != nil
-        if retry {
-            msg.retransmissions += 1
-        } else {
+        if msg.retries.remove(key.index) == nil {
             msg.cursor += 1
             if msg.cursor == msg.count { msg.firstDeadline = nil }
         }
         let sent = clock()
         lastDataSend = sent
-        let timeout = min(0.5, rto * Double(1 << msg.timeouts))
+        let timeout = min(0.5, rto * Double(1 << msg.timeouts[key.index, default: 0]))
         deliveryRecords[Int(lastPacket) % deliveryRecords.count] = DeliveryRecord(
             number: lastPacket, sent: sent, bytes: bytes.count)
-        attempts[lastPacket] = Attempt(key: key, expires: sent + timeout, retry: retry)
+        attempts[lastPacket] = Attempt(key: key, expires: sent + timeout)
         if progressAt == nil { progressAt = sent }
         if probeAt != nil {
             probeAt = sent + probeInterval
@@ -597,8 +643,7 @@ public final class MessageTransport {
     private func nextDeadline(_ now: TimeInterval) -> TimeInterval {
         var wake = receiver.nextExpiry ?? .infinity
         if !blocked, let ackDue, ackDue > now { wake = min(wake, ackDue) }
-        for msg in r.values { wake = min(wake, msg.deadline) }
-        for msg in u.values {
+        for msg in messages.values {
             wake = min(wake, msg.firstDeadline ?? .infinity)
             if msg.deadline > now { wake = min(wake, msg.deadline) }
         }

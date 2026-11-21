@@ -7,8 +7,8 @@ import Foundation
 
 /// The controlling peer's half of the pointer protocol, which `PointerControlServer` orders.
 ///
-/// Moves and scrolls are unreliable and may overtake a reliable button change, so every move
-/// carries the sequence of the last button it follows.
+/// Messages arrive in no particular order, so every move and button change carries the
+/// sequence of the button change it follows.
 struct PointerControlClient {
     /// The remote display's size in pixels, once the server has granted control.
     private(set) var displaySize: CGSize?
@@ -40,9 +40,10 @@ struct PointerControlClient {
 
     mutating func press(_ button: PointerButton) -> PointerMessage? {
         guard displaySize != nil else { return nil }
+        let previous = buttonSequence
         sequence += 1
         buttonSequence = sequence
-        return .button(sequence: sequence, action: button, position: position)
+        return .button(sequence: sequence, afterButton: previous, action: button, position: position)
     }
 
     func scroll(lines: Int) -> PointerMessage? {

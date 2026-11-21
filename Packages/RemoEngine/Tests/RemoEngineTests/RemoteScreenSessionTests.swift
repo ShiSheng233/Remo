@@ -140,10 +140,10 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .init(rawValue: port!)!)
     var controls = 0
     let client = try await NetworkMessageSession(connection: NWConnection(to: endpoint, using: .udp)) {
-        _, data in
+        data in
         if (try? ControlMessage(decoding: data)) != nil { controls += 1 }
     } closeHandler: { _ in }
-    try client.send(MessageKind.screenHello.encoded, mode: .reliable)
+    try client.send(MessageKind.screenHello.encoded, delivery: .essential)
     try await Task.sleep(for: .seconds(5))
     #expect(reason == nil)
     #expect(controls >= 4)

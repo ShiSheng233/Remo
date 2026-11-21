@@ -69,7 +69,7 @@ final class ServerConnection {
     private var acknowledgedReferences = 0
     private var backpressureDrops: UInt64 = 0
     private var codecDrops: UInt64 = 0
-    private var checkpointSkips: UInt64 = 0
+    private var keyFrameWaits: UInt64 = 0
     private var captureSkips = 0
     private var videoBytes = 0
     private var previousFrames: UInt64 = 0
@@ -94,10 +94,10 @@ final class ServerConnection {
         let setup = Task { [self] in
             do {
                 session = try await NetworkMessageSession(connection: connection) {
-                    [weak self] channel, bytes in
-                    self?.receive(channel, bytes)
+                    [weak self] bytes in
+                    self?.receive(bytes)
                 } closeHandler: { [weak self] reason in
-                    self?.stop("connection closed: \(reason.diagnosticDescription)", failed: true)
+                    self?.stop("connection closed: \(reason)", failed: true)
                 }
             } catch {
                 stop("connection setup: \(error)", failed: true)
@@ -161,12 +161,13 @@ final class ServerConnection {
         self.encoder = encoder
         video = VideoSession(
             encoder: encoder,
-            send: { [weak self] data, mode in
+            send: { [weak self] data, delivery, onOutcome in
                 guard let self, !stopping, let session else {
                     throw NetworkMessageSession.SendError.closed
                 }
-                try session.send(data, mode: mode)
+                return try session.send(data, delivery: delivery, onOutcome: onOutcome)
             },
+            cancel: { [weak self] in self?.session?.cancelMessage($0) },
             onFrame: { _, _, _ in },
             onEvent: { [weak self] event in
                 guard let self else { return }
@@ -182,46 +183,44 @@ final class ServerConnection {
             onFailure: { [weak self] error in self?.stop("video failed: \(error)", failed: true) })
     }
 
-    private func receive(_ channel: MessageTransport.Channel, _ bytes: Data) {
+    private func receive(_ bytes: Data) {
         guard !stopping, let first = bytes.first,
             let kind = MessageKind(rawValue: first)
         else { return }
-        if video?.receive(channel, bytes) == true {
+        if video?.receive(bytes) == true {
             switch kind {
-            case .videoAcknowledgement, .videoRefresh, .keyFrameRequest, .videoRecoveryRequest, .keyFrameProgress:
+            case .videoAcknowledgement, .videoRecoveryRequest:
                 if active && !stopping { lastSeen = .now }
             default: break
             }
             return
         }
-        switch (channel, kind) {
-        case (.reliable, .hello), (.reliable, .screenHello):
+        switch kind {
+        case .hello, .screenHello:
             guard bytes.count == 1 else { return }
             if !active { context.onEvent(.streamingStarted(peer: peer)) }
             active = true
             trace.write(peer, "hello accepted")
-        case (_, .heartbeat):
-            guard channel == .unreliable, bytes.count == 1, active else {
-                trace.write(
-                    peer,
-                    "heartbeat ignored active=\(active) channel=\(channel) bytes=\(bytes.count)")
+        case .heartbeat:
+            guard bytes.count == 1, active else {
+                trace.write(peer, "heartbeat ignored active=\(active) bytes=\(bytes.count)")
                 return
             }
             heartbeats += 1
             trace.write(peer, "heartbeat accepted count=\(heartbeats)")
-        case (.reliable, .goodbye) where bytes.count == 1:
+        case .goodbye where bytes.count == 1:
             stop("client left", failed: false)
-        case (.reliable, .pointerHello) where active && bytes.count == 1:
+        case .pointerHello where active && bytes.count == 1:
             lastSeen = .now
             guard let pointer = context.pointer, let session, let ready = pointer.begin(for: pointerPeer)
             else { return }
             do {
-                try session.send(ready.encoded, mode: .reliable)
+                try session.send(ready.encoded, delivery: ready.delivery)
             } catch {
                 pointer.end(for: pointerPeer)
             }
-        case (_, .pointerInput) where active:
-            guard context.pointer?.receive(bytes, on: channel, from: pointerPeer) == true else { return }
+        case .pointerInput where active:
+            guard context.pointer?.receive(bytes, from: pointerPeer) == true else { return }
         default: return
         }
         lastSeen = .now
@@ -241,7 +240,8 @@ final class ServerConnection {
                     do {
                         try session.send(
                             ControlMessage(sequence: controls + 1).encoded,
-                            mode: .unreliable(sendWithin: SessionTiming.controlInterval))
+                            delivery: .retrying(
+                                sendWithin: SessionTiming.controlInterval, replacing: .control))
                         controls += 1
                         nextControl = now + SessionTiming.controlInterval
                     } catch NetworkMessageSession.SendError.backpressure {
@@ -277,13 +277,14 @@ final class ServerConnection {
                 for try await packet in capture.audioMessages {
                     audioSourceGaps += packet.sequence - nextSequence
                     nextSequence = packet.sequence + 1
+                    // Audio waits only behind other high-priority messages.
                     audioQueuePeak = max(
-                        audioQueuePeak, .seconds(session.statistics.estimatedQueueDelay))
+                        audioQueuePeak, .seconds(session.statistics.queueDelay(for: .high)))
                     guard !Task.isCancelled, !stopping else { return }
                     do {
                         try session.send(
                             packet.encoded,
-                            mode: .unreliable(
+                            delivery: .retrying(
                                 sendWithin: SessionTiming.audioDeadline, priority: .high))
                         audioQueued += 1
                     } catch NetworkMessageSession.SendError.backpressure {
@@ -355,7 +356,12 @@ final class ServerConnection {
             let bytes = try await video.sendFrame(
                 pixels, presentationTime: pts,
                 duration: CMTime(value: 1, timescale: context.framesPerSecond))
-            if bytes == 0 { checkpointSkips += 1 }
+            if bytes == 0 {
+                keyFrameWaits += 1
+                // This picture was not sent. Offer it again once the key frame has arrived,
+                // even if the desktop is still by then.
+                lastCaptureSend = nil
+            }
             videoBytes += bytes
         } catch VideoCodecError.frameDropped {
             codecDrops += 1
@@ -368,7 +374,7 @@ final class ServerConnection {
         let elapsed = now - lastReport
         guard elapsed >= SessionTiming.reportInterval else { return }
         let seconds = elapsed / .seconds(1)
-        let queued = frames - backpressureDrops - codecDrops - checkpointSkips
+        let queued = frames - backpressureDrops - codecDrops - keyFrameWaits
         let audio =
             sendsAudio
             ? ServerStatistics.Audio(
@@ -382,7 +388,7 @@ final class ServerConnection {
             videoBitsPerSecond: Double(videoBytes - previousBytes) * 8 / seconds,
             framesGenerated: frames, framesQueued: queued, backpressureDrops: backpressureDrops,
             codecDrops: codecDrops, encoderBitRate: targetBitRate,
-            captureSkips: captureSkips, checkpointSkips: checkpointSkips,
+            captureSkips: captureSkips, keyFrameWaits: keyFrameWaits,
             acknowledgedReferences: acknowledgedReferences, controlsSent: controls,
             heartbeatsReceived: heartbeats, dataPacketsAccepted: transport.acceptedDataPackets - previousAcceptedDataPackets,
             newAckAge: lastNewAck.map { sampledAt - $0 }, blocked: transport.blocked, probing: transport.probing,

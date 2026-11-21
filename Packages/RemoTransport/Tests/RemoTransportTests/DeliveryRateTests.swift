@@ -18,7 +18,7 @@ private final class LimitedLink {
     init() {
         for side in 0..<2 {
             endpoints.append(MessageTransport(
-                clock: { [unowned self] in now }, dataHandler: { _, _ in },
+                clock: { [unowned self] in now }, dataHandler: { _ in },
                 ioHandler: { [unowned self] request in handle(request, from: side) })!)
         }
     }
@@ -59,10 +59,10 @@ private final class LimitedLink {
                 }
             }
             if tick.isMultiple(of: 33) {
-                endpoints[0].send(Data(count: frameBytes(budget)), mode: .unreliable(retryBudget: 0.08))
+                endpoints[0].send(Data(count: frameBytes(budget)), delivery: .init(retryBudget: 0.08))
             }
             if tick.isMultiple(of: 20) {
-                endpoints[0].send(Data(count: 250), mode: .unreliable(retryBudget: 0, firstSendDeadline: now + 0.1))
+                endpoints[0].send(Data(count: 250), delivery: .init(retryBudget: 0, firstSendDeadline: now + 0.1))
             }
             tick += 1
         }

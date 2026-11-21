@@ -5,18 +5,29 @@ import RemoTransport
 
 /// A single stream per direction. Confine the session, callbacks and transport to one actor.
 /// Forward application messages to receive; a false return leaves the message to the application.
+///
+/// A predicted frame is worth sending only for a moment, so it gets a short retry budget. A key
+/// frame is what everything after it depends on, so it is retried until it arrives and nothing
+/// else is encoded in the meantime.
 final class VideoSession {
     enum Failure: Error { case closed, encoderUnavailable, encoderBusy }
     enum Event {
         case acknowledged(frame: UInt64, token: LongTermReferenceToken)
         case requestedRecovery(after: UInt64, firstAvailable: UInt64, request: VideoRecoveryRequest)
-        case reliableKeyFrame(frame: UInt64, bytes: Int)
+        case sentKeyFrame(frame: UInt64, bytes: Int)
+        case settledKeyFrame(frame: UInt64, delivered: Bool)
         case encodedRefresh(frame: UInt64, reference: LongTermReferenceToken?)
         case decodedRefresh(frame: UInt64, idr: Bool)
     }
 
+    /// Admits one message and returns its handle, if the link tracks messages.
+    typealias Send = (
+        Data, MessageTransport.Delivery, ((MessageTransport.Outcome) -> Void)?
+    ) throws -> MessageTransport.MessageID?
+
     private var encoder: VideoEncoder?
-    private let send: (Data, MessageTransport.Mode) throws -> Void
+    private let send: Send
+    private let cancel: (MessageTransport.MessageID) -> Void
     private let onFrame: (UInt64, DecodedVideoFrame, Int) -> Void
     private let onEvent: (Event) -> Void
     private let onFailure: (Error) -> Void
@@ -37,21 +48,25 @@ final class VideoSession {
     private var requestedLevel: VideoRecoveryRequest.Level = .ltr
     private var receivedRecovery: VideoRecoveryRequest?
     private var confirmedDecodedFrame: UInt64 = 0
-    private var wantsCheckpoint = false
-    private var outgoing: KeyFrameSender?
-    private var incoming: KeyFrameReceiver?
-    private var progress: Data?
+    /// The key frame still on its way. Frames encoded now would only depend on it.
+    private var keyFrameInFlight: UInt64?
+    /// The newest key frame the peer has in full. Its requests from before that are stale.
+    private var deliveredEpoch: UInt64 = 0
+    /// Recent frames that may still be queued, to withdraw when a refresh supersedes them.
+    private var recentFrames: [MessageTransport.MessageID] = []
     private var pendingAck: Data?
     private var queue: [VideoFrameMessage] = []
     private var decoding = false
 
     init(
-        encoder: VideoEncoder? = nil, send: @escaping (Data, MessageTransport.Mode) throws -> Void,
+        encoder: VideoEncoder? = nil, send: @escaping Send,
+        cancel: @escaping (MessageTransport.MessageID) -> Void = { _ in },
         onFrame: @escaping (UInt64, DecodedVideoFrame, Int) -> Void,
         onEvent: @escaping (Event) -> Void = { _ in }, onFailure: @escaping (Error) -> Void
     ) {
         self.encoder = encoder
         self.send = send
+        self.cancel = cancel
         self.onFrame = onFrame
         self.onEvent = onEvent
         self.onFailure = onFailure
@@ -62,9 +77,8 @@ final class VideoSession {
         queue.removeAll()
         decoder = nil
         format = nil
-        outgoing = nil
-        incoming = nil
-        progress = nil
+        keyFrameInFlight = nil
+        recentFrames.removeAll()
     }
 
     /// Re-encode the source independently on the next submission, including an unchanged desktop.
@@ -72,7 +86,7 @@ final class VideoSession {
         if !closed { refresh = .keyFrame }
     }
 
-    /// Returns admitted video bytes, or zero when waiting for a reliable IDR to be decoded.
+    /// Returns admitted video bytes, or zero while a key frame is still on its way to the peer.
     /// Encode one source frame at a time, in PTS order.
     nonisolated(nonsending) func sendFrame(
         _ pixels: CVPixelBuffer, presentationTime: CMTime,
@@ -81,18 +95,14 @@ final class VideoSession {
     ) async throws -> Int {
         guard !closed else { throw Failure.closed }
         guard let encoder else { throw Failure.encoderUnavailable }
-        if let outgoing {
-            try outgoing.pump(send: send)
-            return 0
-        }
+        guard keyFrameInFlight == nil else { return 0 }
         guard !encoding else { throw Failure.encoderBusy }
         guard presentationTime.isNumeric, presentationTime.epoch == 0, duration.isNumeric,
             duration.epoch == 0, duration.value > 0
         else { throw VideoCodecError.invalidFrame }
         encoding = true
         defer { encoding = false }
-        let checkpoint = wantsCheckpoint
-        let request: VideoEncoder.Refresh = checkpoint ? .keyFrame : refresh
+        let request = refresh
         let tokens =
             newAcknowledgement || request == .recover ? acknowledged.map { [$0.token] } ?? [] : []
         refresh = .none
@@ -121,16 +131,32 @@ final class VideoSession {
             newAcknowledgement = false
         }
         let packet = try VideoFrameMessage.serialize(sample, id: id, epoch: sentEpoch, kind: kind)
-        if checkpoint {
-            guard sync else { throw WireFormatError.invalid }
-            let transfer = try KeyFrameSender(id: id, bytes: packet)
-            outgoing = transfer
-            wantsCheckpoint = false
-            onEvent(.reliableKeyFrame(frame: id, bytes: packet.count))
-            try transfer.pump(send: send)
+        if kind != .predicted {
+            // Whatever is still queued belongs to the chain this frame replaces.
+            recentFrames.forEach(cancel)
+            recentFrames.removeAll()
+        }
+        let message: MessageTransport.MessageID?
+        if sync {
+            keyFrameInFlight = id
+            do {
+                message = try send(packet, .untilDelivered()) { [weak self] outcome in
+                    self?.settleKeyFrame(id, delivered: outcome == .delivered)
+                }
+            } catch {
+                // The encoder has moved on to this key frame, so the next frame must be one too.
+                keyFrameInFlight = nil
+                refresh = .keyFrame
+                throw error
+            }
+            onEvent(.sentKeyFrame(frame: id, bytes: packet.count))
         } else {
-            try send(
-                packet, .unreliable(retryFor: retryBudget, sendWithin: firstSendLimit))
+            message = try send(
+                packet, .retrying(for: retryBudget, sendWithin: firstSendLimit), nil)
+        }
+        if let message {
+            recentFrames.append(message)
+            if recentFrames.count > 8 { recentFrames.removeFirst() }
         }
         if request != .none {
             onEvent(.encodedRefresh(frame: id, reference: sync ? nil : tokens.first))
@@ -138,31 +164,34 @@ final class VideoSession {
         return packet.count
     }
 
+    private func settleKeyFrame(_ id: UInt64, delivered: Bool) {
+        guard !closed, keyFrameInFlight == id else { return }
+        keyFrameInFlight = nil
+        if delivered {
+            deliveredEpoch = id
+        } else {
+            refresh = .keyFrame
+        }
+        onEvent(.settledKeyFrame(frame: id, delivered: delivered))
+    }
+
     @discardableResult
-    func receive(
-        _ channel: MessageTransport.Channel, _ message: Data,
-        isolation: isolated any Actor = #isolation
-    ) -> Bool {
+    func receive(_ message: Data, isolation: isolated any Actor = #isolation) -> Bool {
         let type = message.first.flatMap(MessageKind.init(rawValue:)).flatMap { $0.isVideo ? $0 : nil }
         guard !closed else { return type != nil }
         do {
-            try flushProgress()
-            try outgoing?.pump(send: send)
             guard let type else {
                 // Other application traffic can drive recovery between video frames.
-                if let lastRequest, incoming == nil,
-                    SuspendingClock.Instant.now - lastRequestTime >= .seconds(1)
-                {
+                if let lastRequest, SuspendingClock.Instant.now - lastRequestTime >= .seconds(1) {
                     try requestRecovery(lastRequest, allowLTR: decoder != nil, repeatRequest: true)
                 }
                 return false
             }
             var ready: VideoFrameMessage?
-            switch (channel, type) {
-            case (.unreliable, .videoFrame):
-                let packet = try VideoFrameMessage(message)
-                if incoming == nil { ready = packet }
-            case (_, .videoAcknowledgement):
+            switch type {
+            case .videoFrame:
+                ready = try VideoFrameMessage(message)
+            case .videoAcknowledgement:
                 var body = message.dropFirst()
                 let epoch = try body.take(UInt64.self)
                 let frame = try body.take(UInt64.self)
@@ -176,80 +205,30 @@ final class VideoSession {
                 acknowledged = (frame, token)
                 newAcknowledgement = true
                 onEvent(.acknowledged(frame: frame, token: token))
-            case (.unreliable, .videoRecoveryRequest):
+            case .videoRecoveryRequest:
                 let request = try VideoRecoveryRequest(message)
+                // A request from before the peer had the latest key frame asks for what it
+                // has since been given.
                 guard request.round > confirmedDecodedFrame, request.round <= nextID,
-                    request.supersedes(receivedRecovery)
+                    request.epoch >= deliveredEpoch, request.supersedes(receivedRecovery)
                 else { return false }
                 receivedRecovery = request
-                guard outgoing == nil && !wantsCheckpoint else { return true }
+                guard keyFrameInFlight == nil else { return true }
                 switch request.level {
                 case .ltr where request.epoch == sentEpoch && acknowledged != nil:
                     if refresh != .keyFrame { refresh = .recover }
                 case .ltr, .idr: refresh = .keyFrame
-                case .reliableIDR: wantsCheckpoint = true
-                }
-            // Older clients send these requests on the reliable channel.
-            case (.reliable, .videoRefresh):
-                var body = message.dropFirst()
-                let epoch = try body.take(UInt64.self)
-                let allowLTR = try body.take(UInt8.self)
-                guard body.isEmpty, allowLTR <= 1 else { throw WireFormatError.invalid }
-                guard outgoing == nil && !wantsCheckpoint else { return true }
-                refresh =
-                    epoch == sentEpoch && allowLTR == 1 && acknowledged != nil
-                        && refresh != .keyFrame
-                    ? .recover : .keyFrame
-            case (.reliable, .keyFrameRequest):
-                guard message.count == 1 else { throw WireFormatError.invalid }
-                if outgoing == nil { wantsCheckpoint = true }
-            case (.reliable, .keyFrameProgress):
-                var body = message.dropFirst()
-                let id = try body.take(UInt64.self)
-                let offset = Int(try body.take(UInt32.self))
-                guard body.isEmpty else { throw WireFormatError.invalid }
-                if let outgoing, outgoing.id == id {
-                    if try outgoing.advance(to: offset) {
-                        confirmedDecodedFrame = max(confirmedDecodedFrame, id)
-                        self.outgoing = nil
-                    } else {
-                        try outgoing.pump(send: send)
-                    }
-                }
-            case (.reliable, .keyFrameChunk):
-                var body = message.dropFirst()
-                let id = try body.take(UInt64.self)
-                let total = Int(try body.take(UInt32.self))
-                let offset = Int(try body.take(UInt32.self))
-                guard (1...KeyFrameReceiver.limit).contains(total) else {
-                    throw WireFormatError.invalid
-                }
-                if offset == 0 {
-                    guard incoming == nil else { throw WireFormatError.invalid }
-                    incoming = KeyFrameReceiver(id: id, total: total)
-                    queue.removeAll()
-                }
-                guard incoming?.id == id, incoming?.total == total else {
-                    throw WireFormatError.invalid
-                }
-                try incoming!.append(body, offset: offset)
-                let count = offset + body.count
-                if count == total {
-                    let packet = try VideoFrameMessage(incoming!.bytes)
-                    guard packet.kind == .idr, packet.id == id, id > lastDecoded else {
-                        throw WireFormatError.invalid
-                    }
-                    ready = packet
-                } else {
-                    try acknowledgeProgress(id, count)
                 }
             default: throw WireFormatError.invalid
             }
             if let packet = ready {
                 guard packet.id > lastDecoded else { return true }
                 // Bound pending decode work. A discarded dependency is detected by the ID gap.
+                // A key frame goes last: the sender waited for it and won't offer it again.
                 if queue.count == 4 {
-                    let discard = queue.firstIndex { $0.kind == .predicted } ?? queue.startIndex
+                    let discard =
+                        queue.firstIndex { $0.kind == .predicted }
+                        ?? queue.firstIndex { $0.kind != .idr } ?? queue.startIndex
                     queue.remove(at: discard)
                 }
                 queue.append(packet)
@@ -279,25 +258,8 @@ final class VideoSession {
     /// Repeated calls share the same retry timer and escalation as observed frame gaps.
     func requestRefresh() throws {
         guard !closed else { throw Failure.closed }
-        guard incoming == nil else { return }
         try requestRecovery(
             lastRequest ?? lastDecoded, allowLTR: decoder != nil, repeatRequest: true)
-    }
-
-    private func acknowledgeProgress(_ id: UInt64, _ offset: Int) throws {
-        var message = MessageKind.keyFrameProgress.encoded
-        message.put(id)
-        message.put(UInt32(offset))
-        progress = message
-        try flushProgress()
-    }
-
-    private func flushProgress() throws {
-        guard let message = progress else { return }
-        progress = nil
-        do { try send(message, .reliable) } catch NetworkMessageSession.SendError.backpressure {
-            progress = message
-        }
     }
 
     private func requestRecovery(_ id: UInt64, allowLTR: Bool, repeatRequest: Bool = false) throws {
@@ -312,18 +274,16 @@ final class VideoSession {
             if recoveryRequests >= 3 && elapsed < .milliseconds(500) { return }
         }
         let attempt = recoveryRequests + 1
-        if attempt >= 4 {
-            requestedLevel = .reliableIDR
-        } else if !allowLTR || attempt >= 3 {
-            requestedLevel = .idr
-        }
+        if !allowLTR || attempt >= 3 { requestedLevel = .idr }
         // Every successful decode advances the identity of the next recovery round.
         let request = VideoRecoveryRequest(
             round: lastDecoded + 1, attempt: attempt, epoch: receivedEpoch, level: requestedLevel)
         lastRequest = id
         lastRequestTime = now
         do {
-            try send(request.encoded, .unreliable(sendWithin: .milliseconds(250)))
+            _ = try send(
+                request.encoded,
+                .retrying(sendWithin: .milliseconds(250), replacing: .videoRecoveryRequest), nil)
         } catch NetworkMessageSession.SendError.backpressure {
             return
         }
@@ -351,7 +311,6 @@ final class VideoSession {
         let frame: DecodedVideoFrame
         do { frame = try await decoder.decode(packet.sample(format: format)) } catch {
             guard !closed else { return }
-            if incoming?.id == packet.id { throw error }
             // Decoder state may be damaged. Only a fresh IDR is safe now.
             self.decoder = nil
             self.format = nil
@@ -373,15 +332,11 @@ final class VideoSession {
         }
         if let pendingAck {
             do {
-                try send(pendingAck, .unreliable(retryBudget: 0))
+                _ = try send(pendingAck, .retrying(replacing: .videoAcknowledgement), nil)
                 self.pendingAck = nil
             } catch NetworkMessageSession.SendError.backpressure {
                 // Retry the latest usable reference on the next decoded frame.
             }
-        }
-        if let transfer = incoming, transfer.id == packet.id {
-            incoming = nil
-            try acknowledgeProgress(transfer.id, transfer.total)
         }
         if recovering { onEvent(.decodedRefresh(frame: packet.id, idr: packet.kind == .idr)) }
         onFrame(packet.id, frame, packet.bytes.count)
@@ -396,7 +351,9 @@ extension VideoSession.Event {
         case .requestedRecovery(let last, let available, let request):
             "recovery requested lastDecoded=\(last) nextAvailable=\(available)"
                 + " round=\(request.round) attempt=\(request.attempt) level=\(request.level)"
-        case .reliableKeyFrame(let id, let bytes): "reliable IDR frame=\(id) bytes=\(bytes)"
+        case .sentKeyFrame(let id, let bytes): "key frame=\(id) bytes=\(bytes) sent until delivered"
+        case .settledKeyFrame(let id, let delivered):
+            "key frame=\(id) \(delivered ? "delivered" : "abandoned")"
         case .encodedRefresh(let id, let reference):
             "recovery encoded frame=\(id) kind=\(reference.map { "LTR-P ackToken=\($0.rawValue)" } ?? "IDR")"
         case .decodedRefresh(let id, let idr):

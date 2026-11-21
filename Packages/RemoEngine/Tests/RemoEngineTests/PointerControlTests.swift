@@ -14,7 +14,7 @@ import Testing
     let messages: [PointerMessage] = [
         .ready(position: position, width: 1512, height: 982),
         .move(sequence: 4, afterButton: 3, position: position),
-        .button(sequence: 5, action: .rightClick, position: position),
+        .button(sequence: 5, afterButton: 3, action: .rightClick, position: position),
         .scroll(lines: -3),
     ]
     for message in messages {
@@ -25,11 +25,18 @@ import Testing
         }
     }
     let invalid = PointerMessage.button(
-        sequence: 1, action: .leftClick, position: CGPoint(x: CGFloat.nan, y: 0))
+        sequence: 1, afterButton: 0, action: .leftClick, position: CGPoint(x: CGFloat.nan, y: 0))
     #expect(throws: WireFormatError.self) { try PointerMessage(decoding: invalid.encoded) }
+    let selfReferential = PointerMessage.button(
+        sequence: 4, afterButton: 4, action: .leftClick, position: position)
+    #expect(throws: WireFormatError.self) { try PointerMessage(decoding: selfReferential.encoded) }
+    // Button changes must arrive; a move only matters while it is fresh.
+    #expect(messages[2].delivery.retryBudget == .infinity)
+    #expect(messages[1].delivery.retryBudget == 0 && messages[1].delivery.firstSendDeadline != nil)
+    #expect(messages[1].delivery.replacing != nil && messages[3].delivery.replacing == nil)
 }
 
-@Test @MainActor func pointerMovesRespectButtonOrderAndReliableClickPositions() {
+@Test @MainActor func pointerMovesRespectButtonOrderAndClickPositions() {
     let start = CGPoint(x: 0.1, y: 0.2)
     let dragged = CGPoint(x: 0.5, y: 0.6)
     let end = CGPoint(x: 0.7, y: 0.8)
@@ -41,25 +48,53 @@ import Testing
         emit: { events.append($0) })
     #expect(server.begin(for: id) != nil)
 
-    func send(_ input: PointerMessage, _ channel: MessageTransport.Channel) {
-        server.receive(input.encoded, on: channel, from: id)
+    func send(_ input: PointerMessage) {
+        server.receive(input.encoded, from: id)
     }
-    send(.move(sequence: 4, afterButton: 2, position: dragged), .unreliable)
-    send(.move(sequence: 3, afterButton: 2, position: start), .unreliable)
+    send(.move(sequence: 4, afterButton: 2, position: dragged))
+    send(.move(sequence: 3, afterButton: 2, position: start))
     #expect(events.isEmpty)
-    send(.button(sequence: 2, action: .leftDown, position: start), .reliable)
-    // The final unreliable move at sequence 5 never arrives.
-    send(.button(sequence: 6, action: .leftUp, position: end), .reliable)
-    send(.move(sequence: 5, afterButton: 2, position: dragged), .unreliable)
-    send(.button(sequence: 8, action: .rightClick, position: clicked), .unreliable)
-    send(.button(sequence: 8, action: .rightClick, position: clicked), .reliable)
-    send(.scroll(lines: -3), .unreliable)
+    send(.button(sequence: 2, afterButton: 0, action: .leftDown, position: start))
+    // The final move at sequence 5 arrives only after the button is released.
+    send(.button(sequence: 6, afterButton: 2, action: .leftUp, position: end))
+    send(.move(sequence: 5, afterButton: 2, position: dragged))
+    send(.button(sequence: 8, afterButton: 6, action: .rightClick, position: clicked))
+    send(.button(sequence: 8, afterButton: 6, action: .rightClick, position: clicked))
+    send(.scroll(lines: -3))
 
     #expect(events == [
         .button(.leftDown, start), .move(dragged, dragging: true),
         .move(end, dragging: true), .button(.leftUp, end),
         .button(.rightClick, clicked), .scroll(lines: -3),
     ])
+}
+
+@Test @MainActor func buttonChangesApplyInOrderHoweverTheyArrive() {
+    let down = CGPoint(x: 0.1, y: 0.2)
+    let up = CGPoint(x: 0.3, y: 0.4)
+    let clicked = CGPoint(x: 0.5, y: 0.6)
+    let id = UUID()
+    var events: [PointerControlServer.Event] = []
+    let server = PointerControlServer(
+        initialState: { .ready(position: .zero, width: 1512, height: 982) },
+        emit: { events.append($0) })
+    #expect(server.begin(for: id) != nil)
+    func send(_ input: PointerMessage) { server.receive(input.encoded, from: id) }
+
+    // A whole drag and the click after it arrive back to front, with a move in between.
+    send(.button(sequence: 9, afterButton: 5, action: .rightClick, position: clicked))
+    send(.move(sequence: 7, afterButton: 5, position: clicked))
+    send(.button(sequence: 5, afterButton: 2, action: .leftUp, position: up))
+    #expect(events.isEmpty)
+    send(.button(sequence: 2, afterButton: 0, action: .leftDown, position: down))
+    #expect(events == [
+        .button(.leftDown, down), .move(up, dragging: true), .button(.leftUp, up),
+        .move(clicked, dragging: false), .button(.rightClick, clicked),
+    ])
+    // Duplicates and anything older than what has been applied change nothing.
+    send(.button(sequence: 5, afterButton: 2, action: .leftUp, position: up))
+    send(.button(sequence: 4, afterButton: 2, action: .leftClick, position: down))
+    #expect(events.count == 5)
 }
 
 @Test @MainActor func closingPointerSessionReleasesDragAndAllowsNewOwner() {
@@ -72,16 +107,18 @@ import Testing
         emit: { events.append($0) })
     #expect(server.begin(for: owner) != nil)
     #expect(server.begin(for: viewer) == nil)
-    let input = PointerMessage.button(sequence: 1, action: .leftDown, position: position).encoded
-    server.receive(input, on: .reliable, from: viewer)
+    let input = PointerMessage.button(
+        sequence: 1, afterButton: 0, action: .leftDown, position: position
+    ).encoded
+    server.receive(input, from: viewer)
     #expect(events.isEmpty)
-    server.receive(input, on: .reliable, from: owner)
+    server.receive(input, from: owner)
     server.end(for: viewer)
     #expect(events == [.button(.leftDown, position)])
     server.end(for: owner)
     #expect(events == [.button(.leftDown, position), .button(.leftUp, position)])
     #expect(server.begin(for: viewer) != nil)
-    server.receive(input, on: .reliable, from: viewer)
+    server.receive(input, from: viewer)
     #expect(events.last == .button(.leftDown, position))
     server.stop()
     #expect(events.last == .button(.leftUp, position))
@@ -105,9 +142,7 @@ import Testing
 
     func send(_ message: PointerMessage?) throws {
         let message = try #require(message)
-        let channel: MessageTransport.Channel =
-            if case .reliable = message.mode { .reliable } else { .unreliable }
-        server.receive(message.encoded, on: channel, from: id)
+        server.receive(message.encoded, from: id)
     }
     try send(client.move(by: CGVector(dx: 100, dy: -50)))
     try send(client.press(.leftDown))

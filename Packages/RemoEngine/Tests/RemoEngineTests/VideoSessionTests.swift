@@ -14,7 +14,7 @@ import Testing
 }
 
 @Test(arguments: [false, true]) @MainActor
-func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
+func delayedBootstrapAndLostRefreshFrames(loseAllLTR: Bool) async throws {
     let encoder = try VideoEncoder(
         width: 320, height: 240, framesPerSecond: 30,
         bitRate: 1_000_000, enableLongTermReferences: true)
@@ -27,12 +27,15 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     let pixels = try #require(buffer)
     var receiver: VideoSession!
     var sender: VideoSession!
+    // A key frame the link is still retransmitting: not yet with the receiver.
+    var inFlight: (data: Data, settle: (MessageTransport.Outcome) -> Void)?
+    var waits = 0
+    var keyFrames = 0
     var lostRecoveryRequest = false
-    var lostInitial = false
+    var delayedInitial = false
     var lostDelta = false
     var lostRefresh = false
     var bootstrapped = false
-    var reliableIDR = false
     var recovered = false
     var confirmed = false
     var lastID: UInt64 = 0
@@ -41,52 +44,46 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     var framesAfterRecovery = 0
     sender = VideoSession(
         encoder: encoder,
-        send: { data, mode in
-            if case .reliable = mode {
-                receiver.receive(.reliable, data)
-                return
-            }
+        send: { data, delivery, onOutcome in
             let frame = try VideoFrameMessage(data)
             expectedPTS[frame.id] = submittedPTS
-            if !lostInitial && frame.kind == .idr {
-                lostInitial = true
-                return
+            #expect(inFlight == nil, "Nothing is sent while a key frame is on its way")
+            if frame.kind == .idr {
+                #expect(delivery.retryBudget == .infinity)
+                let settle = try #require(onOutcome)
+                keyFrames += 1
+                if !delayedInitial {
+                    delayedInitial = true
+                    inFlight = (data, settle)
+                } else {
+                    receiver.receive(data)
+                    settle(.delivered)
+                }
+                return nil
             }
+            #expect(delivery.retryBudget < 1 && onOutcome == nil)
             if bootstrapped && confirmed && !lostDelta && frame.kind == .predicted {
                 lostDelta = true
-                return
+                return nil
             }
             if lostDelta && (loseAllLTR || !lostRefresh) && frame.kind == .ltrRefresh {
                 lostRefresh = true
-                return
+                return nil
             }
-            if lostDelta && loseAllLTR && frame.kind == .idr { return }
-            receiver.receive(.unreliable, data)
+            receiver.receive(data)
+            return nil
         }, onFrame: { _, _, _ in Issue.record("Unexpected reverse video") },
-        onEvent: {
-            if case .acknowledged = $0 { confirmed = true }
-            if case .reliableKeyFrame(let id, _) = $0 {
-                expectedPTS[id] = submittedPTS
-                reliableIDR = true
-            }
-        }, onFailure: { Issue.record("Sender failed: \($0)") })
+        onEvent: { if case .acknowledged = $0 { confirmed = true } },
+        onFailure: { Issue.record("Sender failed: \($0)") })
     receiver = VideoSession(
-        send: { data, mode in
-            let recovery = data.first == MessageKind.videoRecoveryRequest.rawValue
-            if recovery || data.first == MessageKind.videoAcknowledgement.rawValue {
-                guard case .unreliable(let retries, _, _) = mode else {
-                    throw WireFormatError.invalid
-                }
-                #expect(retries == 0)
-                if recovery && !lostRecoveryRequest {
-                    lostRecoveryRequest = true
-                    return
-                }
-                sender.receive(.unreliable, data)
-            } else {
-                guard case .reliable = mode else { throw WireFormatError.invalid }
-                sender.receive(.reliable, data)
+        send: { data, delivery, _ in
+            #expect(delivery.retryBudget == 0 && delivery.replacing != nil)
+            if data.first == MessageKind.videoRecoveryRequest.rawValue && !lostRecoveryRequest {
+                lostRecoveryRequest = true
+                return nil
             }
+            sender.receive(data)
+            return nil
         },
         onFrame: { id, frame, _ in
             #expect(id > lastID)
@@ -115,16 +112,77 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
             CVPixelBufferGetBytesPerRowOfPlane(pixels, 1) * 120)
         CVPixelBufferUnlockBaseAddress(pixels, [])
         submittedPTS = CMTime(value: Int64(index), timescale: 30)
-        _ = try await sender.sendFrame(
+        let waiting = inFlight != nil
+        let bytes = try await sender.sendFrame(
             pixels, presentationTime: submittedPTS,
             duration: CMTime(value: 1, timescale: 30))
+        if waiting {
+            #expect(bytes == 0)
+            waits += 1
+            // The stalled receiver asks for video, which must not start a second key frame.
+            try receiver.requestRefresh()
+            if waits == 5, let held = inFlight {
+                inFlight = nil
+                receiver.receive(held.data)
+                held.settle(.delivered)
+            }
+        }
         try await Task.sleep(nanoseconds: 5_000_000)
         if framesAfterRecovery >= 3 { break }
     }
-    #expect(lostRecoveryRequest && lostInitial && bootstrapped && confirmed)
-    #expect(lostDelta && lostRefresh && recovered)
-    #expect(reliableIDR == loseAllLTR)
+    #expect(delayedInitial && waits == 5 && bootstrapped && confirmed)
+    #expect(lostRecoveryRequest && lostDelta && lostRefresh && recovered)
+    // Losing every LTR refresh ends in one more key frame, which is sent until it arrives.
+    #expect(keyFrames == (loseAllLTR ? 2 : 1))
     #expect(framesAfterRecovery >= 3)
+}
+
+@Test @MainActor func abandonedKeyFramesAreReplacedAndStaleRequestsIgnored() async throws {
+    let encoder = try VideoEncoder(
+        width: 320, height: 180, framesPerSecond: 30, bitRate: 300_000, enableLongTermReferences: true)
+    var frames: [VideoFrameMessage] = []
+    var settle: ((MessageTransport.Outcome) -> Void)?
+    let session = VideoSession(
+        encoder: encoder,
+        send: { data, _, onOutcome in
+            frames.append(try VideoFrameMessage(data))
+            settle = onOutcome
+            return nil
+        },
+        onFrame: { _, _, _ in }, onFailure: { Issue.record("Unexpected failure: \($0)") })
+    defer { session.close() }
+    var buffer: CVPixelBuffer?
+    try #require(CVPixelBufferCreate(
+        nil, 320, 180, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary, &buffer) == kCVReturnSuccess)
+    let pixels = try #require(buffer)
+    var index: Int64 = 0
+    func encode() async throws -> Int {
+        index += 1
+        return try await session.sendFrame(
+            pixels, presentationTime: CMTime(value: index, timescale: 30),
+            duration: CMTime(value: 1, timescale: 30))
+    }
+    func request(epoch: UInt64, attempt: UInt64) -> Bool {
+        session.receive(
+            VideoRecoveryRequest(round: 1, attempt: attempt, epoch: epoch, level: .idr).encoded)
+    }
+    #expect(try await encode() > 0)
+    #expect(try await encode() == 0 && frames.map(\.kind) == [.idr])
+    // The link gave up on the key frame, so the next frame has to be one.
+    settle?(.expired)
+    #expect(try await encode() > 0)
+    #expect(frames.map(\.kind) == [.idr, .idr] && frames[1].epoch > frames[0].epoch)
+    // A request made before the key frame arrived is answered by the key frame itself.
+    #expect(request(epoch: frames[0].epoch, attempt: 1))
+    settle?(.delivered)
+    #expect(!request(epoch: frames[0].epoch, attempt: 2))
+    #expect(try await encode() > 0)
+    #expect(frames.map(\.kind) == [.idr, .idr, .predicted])
+    // A request about the delivered key frame is a real one.
+    #expect(request(epoch: frames[1].epoch, attempt: 3))
+    #expect(try await encode() > 0)
+    #expect(frames.last?.kind == .idr)
 }
 
 @Test @MainActor func ltrAcknowledgementsAdvanceOnlyWithinTheCurrentEpoch() async throws {
@@ -133,7 +191,12 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     var frames: [VideoFrameMessage] = []
     var accepted: [UInt64] = []
     let session = VideoSession(
-        encoder: encoder, send: { data, _ in frames.append(try VideoFrameMessage(data)) },
+        encoder: encoder,
+        send: { data, _, onOutcome in
+            frames.append(try VideoFrameMessage(data))
+            onOutcome?(.delivered)
+            return nil
+        },
         onFrame: { _, _, _ in },
         onEvent: { if case .acknowledged(let frame, _) = $0 { accepted.append(frame) } },
         onFailure: { Issue.record("Unexpected failure: \($0)") })
@@ -153,15 +216,15 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
         message.put(epoch)
         message.put(frame)
         message.put(Int64(frame))
-        session.receive(.unreliable, message)
+        session.receive(message)
     }
     try await encode(0)
     try await encode(1)
     let epoch = frames[0].epoch
     try #require(frames[1].epoch == epoch)
     acknowledge(epoch: epoch, frame: frames[1].id)
-    let staleRecovery = VideoRecoveryRequest(round: frames[1].id, attempt: 7, epoch: epoch, level: .reliableIDR)
-    #expect(!session.receive(.unreliable, staleRecovery.encoded))
+    let staleRecovery = VideoRecoveryRequest(round: frames[1].id, attempt: 7, epoch: epoch, level: .idr)
+    #expect(!session.receive(staleRecovery.encoded))
     acknowledge(epoch: epoch, frame: frames[0].id)
     acknowledge(epoch: epoch, frame: frames[1].id)
     session.requestKeyFrame()
@@ -181,56 +244,23 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
         return try VideoRecoveryRequest(message.encoded)
     }
     let current = try request(10, 3, .idr)
-    #expect(try !request(9, 8, .reliableIDR).supersedes(current))
-    #expect(try !request(10, 2, .reliableIDR).supersedes(current))
+    #expect(try !request(9, 8, .idr).supersedes(current))
+    #expect(try !request(10, 2, .idr).supersedes(current))
     #expect(!current.supersedes(current))
     #expect(try !request(10, 4, .ltr).supersedes(current))
     #expect(try request(10, 4, .idr).supersedes(current))
-    #expect(try request(10, 4, .reliableIDR).supersedes(current))
     #expect(try request(11, 1, .ltr).supersedes(current))
-}
-
-@Test func recoveryChunksRespectCreditAndRetryBackpressure() throws {
-    let data = Data((0..<16_385).map { UInt8(truncatingIfNeeded: $0) })
-    let sender = try KeyFrameSender(id: 37, bytes: data)
-    var receiver = KeyFrameReceiver(id: 37, total: data.count)
-    var paused = true
-    var confirmed = 0
-    var firstPass = true
-    while confirmed < data.count {
-        try sender.pump { chunk, mode in
-            guard case .reliable = mode else { throw WireFormatError.invalid }
-            guard chunk.count <= 55 else { throw NetworkMessageSession.SendError.invalidLength }
-            if paused {
-                paused = false
-                throw NetworkMessageSession.SendError.backpressure
-            }
-            var body = chunk
-            try #require(try body.take(UInt8.self) == MessageKind.keyFrameChunk.rawValue)
-            try #require(try body.take(UInt64.self) == receiver.id)
-            try #require(try body.take(UInt32.self) == UInt32(data.count))
-            let offset = try body.take(UInt32.self)
-            try receiver.append(body, offset: Int(offset))
-        }
-        let submitted = receiver.bytes.count
-        if firstPass {
-            try #require(submitted == 0 && !paused)
-            firstPass = false
-            continue
-        }
-        try #require(submitted > confirmed && submitted <= confirmed + 4096)
-        #expect(try sender.advance(to: submitted) == (submitted == data.count))
-        confirmed = submitted
-    }
-    #expect(receiver.bytes == data)
 }
 
 @Test func stalledVideoCanRequestRecoveryBeforeTheFirstDecodedFrame() throws {
     var requests: [Data] = []
     let session = VideoSession(
-        send: { data, mode in
-            guard case .unreliable(0, .some, _) = mode else { throw WireFormatError.invalid }
+        send: { data, delivery, _ in
+            guard delivery.retryBudget == 0, delivery.firstSendDeadline != nil else {
+                throw WireFormatError.invalid
+            }
             requests.append(data)
+            return nil
         }, onFrame: { _, _, _ in }, onFailure: { Issue.record("Unexpected failure: \($0)") })
     try session.requestRefresh()
     try session.requestRefresh()
@@ -242,7 +272,12 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     let encoder = try VideoEncoder(width: 320, height: 180, framesPerSecond: 30, bitRate: 300_000)
     var latest: VideoFrameMessage?
     let session = VideoSession(
-        encoder: encoder, send: { data, _ in latest = try VideoFrameMessage(data) },
+        encoder: encoder,
+        send: { data, _, onOutcome in
+            latest = try VideoFrameMessage(data)
+            onOutcome?(.delivered)
+            return nil
+        },
         onFrame: { _, _, _ in }, onFailure: { Issue.record("Unexpected failure: \($0)") })
     defer { session.close() }
     var buffer: CVPixelBuffer?

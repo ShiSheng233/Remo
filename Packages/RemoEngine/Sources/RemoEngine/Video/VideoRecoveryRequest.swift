@@ -1,7 +1,7 @@
 import Foundation
 
 struct VideoRecoveryRequest {
-    enum Level: UInt8 { case ltr, idr, reliableIDR }
+    enum Level: UInt8 { case ltr, idr }
 
     /// The first frame after the last successful decode. One-based, including bootstrap.
     let round: UInt64

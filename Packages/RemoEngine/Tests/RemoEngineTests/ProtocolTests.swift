@@ -4,10 +4,7 @@ import Testing
 @testable import RemoEngine
 
 @Test func onlyVideoKindsGoToTheVideoSession() {
-    let video: Set<MessageKind> = [
-        .videoFrame, .videoAcknowledgement, .videoRefresh, .keyFrameRequest, .keyFrameChunk,
-        .keyFrameProgress, .videoRecoveryRequest,
-    ]
+    let video: Set<MessageKind> = [.videoFrame, .videoAcknowledgement, .videoRecoveryRequest]
     for kind in MessageKind.allCases {
         #expect(kind.isVideo == video.contains(kind), "\(kind)")
     }

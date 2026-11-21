@@ -1,22 +1,26 @@
 import Foundation
 
 struct Receiver {
+    /// How long a partial message outlives the sender's retries, for datagrams still in flight.
+    static let grace: TimeInterval = 0.5
+    static let maxAssemblies = 32
+    static let maxBufferedBytes = 4 << 20
+
     private struct Assembly {
         let count: Int
-        let deadline: TimeInterval
+        /// When the sender stops retransmitting, as far as its fragments have said.
+        var retryEnd: TimeInterval
         var parts: [Int: Data] = [:]
         var size = 0
+        var deadline: TimeInterval { retryEnd + Receiver.grace }
     }
 
-    private var nextReliable: UInt64 = 1
-    private var reliable: [UInt32: Data] = [:]
-    private var highestUnreliable: UInt32 = 0
+    private var highest: UInt32 = 0
     private var finished: Set<UInt32> = []
     private var assemblies: [UInt32: Assembly] = [:]
     private var buffered = 0
-    var paused = false
 
-    var nextExpiry: TimeInterval? { assemblies.values.map(\.deadline).min() }
+    var nextExpiry: TimeInterval? { assemblies.values.map(\.deadline).filter(\.isFinite).min() }
 
     private mutating func remove(_ id: UInt32) {
         buffered -= assemblies.removeValue(forKey: id)?.size ?? 0
@@ -29,55 +33,50 @@ struct Receiver {
         }
     }
 
-    mutating func popReliable() -> Data? {
-        guard !paused, let id = UInt32(exactly: nextReliable),
-            let data = reliable.removeValue(forKey: id)
-        else { return nil }
-        nextReliable += 1
-        return data
-    }
-
-    /// Returns whether to acknowledge, whether this is a duplicate, and any complete U message.
-    mutating func accept(_ key: Wire.Fragment, count: Int, data: Data, now: TimeInterval) -> (
-        Bool, Bool, Data?
-    ) {
+    /// Returns whether to acknowledge, whether this is a duplicate, and any complete message.
+    /// A fragment that isn't acknowledged was not kept, so the sender retries it.
+    mutating func accept(
+        _ key: Wire.Fragment, count: Int, lifetime: TimeInterval, data: Data, now: TimeInterval
+    ) -> (Bool, Bool, Data?) {
         let id = key.id
-        if key.reliable {
-            guard UInt64(id) >= nextReliable else { return (true, true, nil) }
-            guard UInt64(id) < nextReliable + 32 else { return (false, false, nil) }
-            if let previous = reliable[id] { return (previous == data, true, nil) }
-            reliable[id] = Data(data)
-            return (true, false, nil)
-        }
-
-        if id > highestUnreliable {
-            highestUnreliable = id
-            if id > 1024 {
-                let floor = id - 1023
+        if id > highest {
+            highest = id
+            if id > Wire.messageWindow {
+                // The sender has finished with everything this far behind.
+                let floor = id - (Wire.messageWindow - 1)
                 finished = finished.filter { $0 >= floor }
                 for old in assemblies.keys where old < floor { remove(old) }
             }
         }
-        if highestUnreliable - id >= 1024 || finished.contains(id) { return (true, true, nil) }
+        if highest - id >= Wire.messageWindow || finished.contains(id) { return (true, true, nil) }
         if let existing = assemblies[id] {
             guard existing.count == count else { return (false, false, nil) }
-            if let previous = existing.parts[key.index] { return (previous == data, true, nil) }
+            if let previous = existing.parts[key.index] {
+                guard previous == data else { return (false, true, nil) }
+                assemblies[id]!.retryEnd = max(existing.retryEnd, now + lifetime)
+                return (true, true, nil)
+            }
         }
         if count == 1 {
             finished.insert(id)
             return (true, false, data)
         }
-        while (assemblies[id] == nil && assemblies.count >= 32) || buffered + data.count > 4 << 20 {
+        // Make room only at the expense of messages their sender has stopped retrying. Dropping
+        // one it still retries would acknowledge fragments of a message that never completes.
+        while (assemblies[id] == nil && assemblies.count >= Self.maxAssemblies)
+            || buffered + data.count > Self.maxBufferedBytes
+        {
             guard
-                let oldest = assemblies.min(by: {
-                    ($0.value.deadline, $0.key) < ($1.value.deadline, $1.key)
+                let stale = assemblies.filter({ $0.key != id && $0.value.retryEnd <= now }).min(by: {
+                    ($0.value.retryEnd, $0.key) < ($1.value.retryEnd, $1.key)
                 })?.key
-            else { break }
-            remove(oldest)
-            finished.insert(oldest)
-            if oldest == id { return (true, false, nil) }
+            else { return (false, false, nil) }
+            remove(stale)
+            finished.insert(stale)
         }
-        if assemblies[id] == nil { assemblies[id] = Assembly(count: count, deadline: now + 0.5) }
+        // Mutate in place: a copy of the assembly would copy every part on each fragment.
+        if assemblies[id] == nil { assemblies[id] = Assembly(count: count, retryEnd: now + lifetime) }
+        assemblies[id]!.retryEnd = max(assemblies[id]!.retryEnd, now + lifetime)
         assemblies[id]!.parts[key.index] = Data(data)
         assemblies[id]!.size += data.count
         buffered += data.count

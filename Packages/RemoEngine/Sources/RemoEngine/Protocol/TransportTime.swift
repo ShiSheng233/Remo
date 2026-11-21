@@ -19,15 +19,24 @@ extension Duration {
     }
 }
 
-extension MessageTransport.Mode {
-    /// Retries for `retryFor` after admission, and drops what can't be sent within `sendWithin`.
-    static func unreliable(
-        retryFor budget: Duration = .zero, sendWithin limit: Duration? = nil,
-        priority: MessageTransport.UnreliablePriority = .normal
+/// State where a newer message makes an unfinished older one worthless.
+enum ReplaceableMessage: Int {
+    case heartbeat, control, pointerHello, pointerMove, videoAcknowledgement, videoRecoveryRequest
+}
+
+extension MessageTransport.Delivery {
+    /// Retries for `budget` after admission, and drops what can't be sent within `sendWithin`.
+    static func retrying(
+        for budget: Duration = .zero, sendWithin limit: Duration? = nil,
+        priority: MessageTransport.Priority = .normal, replacing key: ReplaceableMessage? = nil
     ) -> Self {
         let now = TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1e9
-        return .unreliable(
+        return Self(
             retryBudget: budget.timeInterval,
-            firstSendDeadline: limit.map { now + $0.timeInterval }, priority: priority)
+            firstSendDeadline: limit.map { now + $0.timeInterval }, priority: priority,
+            replacing: key?.rawValue)
     }
+
+    /// A small message the session depends on: retried until it arrives, ahead of media.
+    static var essential: Self { .untilDelivered(priority: .high) }
 }

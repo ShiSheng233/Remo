@@ -28,10 +28,7 @@ enum MessageKind: UInt8, CaseIterable {
     /// `VideoFrameMessage`.
     case videoFrame = 0x40
     case videoAcknowledgement = 0x41
-    case videoRefresh = 0x42
-    case keyFrameRequest = 0x43
-    case keyFrameChunk = 0x44
-    case keyFrameProgress = 0x45
+    // 0x42...0x45 carried the retired reliable key frame transfer. Not to be reused.
     case videoRecoveryRequest = 0x46
 
     /// Kinds that `VideoSession` handles.
