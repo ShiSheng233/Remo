@@ -183,25 +183,38 @@ public final class RemoteScreenClient {
         counters = Counters()
         setState(.connecting)
         trace.write(nil, "client opening")
+        await stream(link)
+        trace.write(nil, "client stop failure=\(failure.map { "\($0)" } ?? "none")")
+        playback?.stop()
+        playback = nil
+        video?.close()
+        video = nil
+        if let session = transport {
+            // Without the goodbye, the server holds the capture and pointer until it times out.
+            // Keep the link open long enough to send and retry it; nothing else is processed.
+            if (try? session.send(SessionMessage.goodbye.encoded, mode: .reliable)) != nil {
+                let roundTrip = session.statistics.roundTripTime ?? 0.1
+                await linger(min(0.25, max(0.05, roundTrip * 2)))
+            }
+            transport = nil
+            session.cancel()
+        }
+        setState(.idle)
+    }
+
+    /// Waits even though the session task is already cancelled.
+    private func linger(_ seconds: TimeInterval) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { continuation.resume() }
+        }
+    }
+
+    private func stream(_ link: Link) async {
         let setupTimeout = Task { [weak self, configuration] in
             try await Task.sleep(nanoseconds: UInt64(configuration.setupTimeout * 1e9))
             self?.fail(.setupTimedOut)
         }
-        defer {
-            setupTimeout.cancel()
-            trace.write(nil, "client stop failure=\(failure.map { "\($0)" } ?? "none")")
-            playback?.stop()
-            playback = nil
-            video?.close()
-            video = nil
-            let session = transport
-            transport = nil
-            if let session {
-                try? session.send(SessionMessage.goodbye.encoded, mode: .reliable)
-                session.cancel()
-            }
-            setState(.idle)
-        }
+        defer { setupTimeout.cancel() }
 
         let session: NetworkMessageSession
         do {
