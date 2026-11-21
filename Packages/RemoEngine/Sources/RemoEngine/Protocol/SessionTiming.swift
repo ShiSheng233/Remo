@@ -9,9 +9,9 @@ enum SessionTiming {
     static let heartbeatInterval = Duration.milliseconds(400)
     /// The server drops a client after missing about five heartbeats.
     static let clientTimeout = Duration.seconds(2)
-    /// The server proves it is alive at this interval, even when no video is flowing.
+    /// The server sends a disposable control after this much outbound data silence.
     static let controlInterval = Duration.seconds(1)
-    /// The client gives up after missing about four controls and all video.
+    /// The client gives up after this much server silence.
     static let serverTimeout = Duration.seconds(4)
     /// The client asks for a refresh when no frame has decoded for this long.
     static let videoStall = Duration.seconds(2)

@@ -104,6 +104,9 @@ public final class MessageTransport {
     private var events: [Event] = []
     private var armed: TimeInterval?
     private var credit: Double
+    private var lastDataSend: TimeInterval
+    /// Time since I/O accepted a data datagram, or since initialization before the first send.
+    public var dataSendIdleTime: TimeInterval { clock() - lastDataSend }
     private var creditAt: TimeInterval
     private var rate = 4_000_000.0
     private var recoveryCeiling = 0.0
@@ -156,6 +159,7 @@ public final class MessageTransport {
         self.ioHandler = ioHandler
         credit = Double(2 * self.datagramLimit)
         creditAt = clock()
+        lastDataSend = creditAt
         sampleAt = creditAt
         deliverySampleAt = creditAt
     }
@@ -558,6 +562,7 @@ public final class MessageTransport {
             if msg.cursor == msg.count { msg.firstDeadline = nil }
         }
         let sent = clock()
+        lastDataSend = sent
         let timeout = min(0.5, rto * Double(1 << msg.timeouts))
         deliveryRecords[Int(lastPacket) % deliveryRecords.count] = DeliveryRecord(
             number: lastPacket, sent: sent, bytes: bytes.count)

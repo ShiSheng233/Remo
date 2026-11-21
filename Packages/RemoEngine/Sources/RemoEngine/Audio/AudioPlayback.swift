@@ -22,7 +22,7 @@ final class AudioPlayback {
         worker = AudioPlaybackWorker(engine: engine, traceDirectory: traceDirectory, onError: onError)
     }
 
-    func receive(_ message: Data) { worker.receive(message) }
+    func receive(_ packet: AudioMessage) { worker.receive(packet) }
     func stop() { worker.stop() }
 }
 
@@ -61,9 +61,9 @@ private final class AudioPlaybackWorker: @unchecked Sendable {
         engine.connect(node, to: engine.mainMixerNode, format: OpusFormat.pcm)
     }
 
-    func receive(_ message: Data) {
+    func receive(_ packet: AudioMessage) {
         serial.async { [weak self] in
-            guard let self, let packet = try? AudioMessage(decoding: message), queue.insert(packet) else { return }
+            guard let self, queue.insert(packet) else { return }
             if !running { startAfterBuffering() }
         }
     }

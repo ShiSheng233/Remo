@@ -75,7 +75,7 @@ private func captureSample(offset: Int, length: Int) throws -> CMSampleBuffer {
     let player = AudioPlayback(engine: engine) { Issue.record("Playback failed: \($0)") }
     defer { player.stop() }
     let packetizer = try AudioPacketizer()
-    try packetizer.append(captureSample(offset: 0, length: 2880)) { player.receive($0.encoded) }
+    try packetizer.append(captureSample(offset: 0, length: 2880)) { player.receive($0) }
     for _ in 0..<100 where !engine.isRunning { try await Task.sleep(nanoseconds: 5_000_000) }
     try #require(engine.isRunning)
     let rendered = try #require(AVAudioPCMBuffer(pcmFormat: OpusFormat.pcm, frameCapacity: 960))
@@ -199,7 +199,7 @@ func playbackUsesPLCAndReturnsToDecodedAudio(losses: Int) throws {
     let player = AudioPlayback(engine: engine) { Issue.record("Playback failed: \($0)") }
     defer { player.stop() }
     let packetizer = try AudioPacketizer()
-    try packetizer.append(captureSample(offset: 0, length: 960 * 18)) { player.receive($0.encoded) }
+    try packetizer.append(captureSample(offset: 0, length: 960 * 18)) { player.receive($0) }
     for _ in 0..<150 where !engine.isRunning { try await Task.sleep(nanoseconds: 5_000_000) }
     try #require(engine.isRunning)
     let pcm = try #require(AVAudioPCMBuffer(pcmFormat: OpusFormat.pcm, frameCapacity: 960))
@@ -224,7 +224,7 @@ func playbackUsesPLCAndReturnsToDecodedAudio(losses: Int) throws {
     try engine.enableManualRenderingMode(.offline, format: OpusFormat.pcm, maximumFrameCount: 960)
     let player = AudioPlayback(engine: engine) { Issue.record("Playback failed: \($0)") }
     let packetizer = try AudioPacketizer()
-    try packetizer.append(captureSample(offset: 0, length: 960)) { player.receive($0.encoded) }
+    try packetizer.append(captureSample(offset: 0, length: 960)) { player.receive($0) }
     player.stop()
     try await Task.sleep(nanoseconds: 250_000_000)
     #expect(!engine.isRunning)

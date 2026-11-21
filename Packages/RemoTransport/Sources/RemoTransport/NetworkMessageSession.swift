@@ -150,6 +150,11 @@ public final class NetworkMessageSession {
         }
     }
 
+    public var dataSendIdleTime: TimeInterval {
+        owner.preconditionIsolated()
+        return transport.dataSendIdleTime
+    }
+
     public var statistics: MessageTransport.Statistics {
         owner.preconditionIsolated()
         return transport.statistics

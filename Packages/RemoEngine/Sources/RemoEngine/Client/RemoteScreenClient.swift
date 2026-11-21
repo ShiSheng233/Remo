@@ -83,7 +83,6 @@ public final class RemoteScreenClient {
     private var pointer = PointerControlClient()
     private var lastSeen = Instant.now
     private var lastFrame = Instant.now
-    private var receivedControl = false
     private var counters = Counters()
 
     private struct Counters {
@@ -179,7 +178,6 @@ public final class RemoteScreenClient {
     private func session(_ link: Link) async {
         audioDisabled = false
         pointer = PointerControlClient()
-        receivedControl = false
         counters = Counters()
         setState(.connecting)
         trace.write(nil, "client opening")
@@ -296,7 +294,7 @@ public final class RemoteScreenClient {
                 fail(.noVideo)
                 return
             }
-            if receivedControl, now - lastFrame >= SessionTiming.videoStall {
+            if now - lastFrame >= SessionTiming.videoStall {
                 try video?.requestRefresh()
             }
             do {
@@ -320,10 +318,15 @@ public final class RemoteScreenClient {
 
     private func receive(_ channel: MessageTransport.Channel, _ data: Data) {
         // Video first: it also uses unrelated messages to retry lost refresh requests.
-        guard isRunning, video?.receive(channel, data) != true, let byte = data.first else {
+        guard isRunning, let byte = data.first else { return }
+        if video?.receive(channel, data) == true {
+            lastSeen = .now
             return
         }
-        if channel == .unreliable, byte == MessageKind.audio.rawValue, !audioDisabled {
+        if channel == .unreliable, byte == MessageKind.audio.rawValue {
+            guard let packet = try? AudioMessage(decoding: data) else { return }
+            lastSeen = .now
+            guard !audioDisabled else { return }
             if playback == nil {
                 playback = AudioPlayback(
                     traceDirectory: configuration.diagnostics.audioTraceDirectory
@@ -333,19 +336,18 @@ public final class RemoteScreenClient {
                     configuration.diagnostics.info(nil, "Audio playback failed: \(error)")
                 }
             }
-            playback?.receive(data)
+            playback?.receive(packet)
             return
         }
-        guard channel == .reliable else { return }
         switch MessageKind(rawValue: byte) {
         case .control:
             guard let control = try? ControlMessage(decoding: data) else { return }
             counters.controls += 1
-            counters.latestControl = control.sequence
-            receivedControl = true
+            counters.latestControl = max(counters.latestControl, control.sequence)
             lastSeen = .now
-        case .pointerReady:
+        case .pointerReady where channel == .reliable:
             if pointer.receiveReady(data), let size = pointer.displaySize {
+                lastSeen = .now
                 onEvent(.pointerAvailable(displaySize: size))
             }
         default: break

@@ -146,8 +146,7 @@ final class VideoSession {
             try flushProgress()
             try outgoing?.pump(send: send)
             guard let type else {
-                // An active screen session also receives periodic application controls when
-                // every U frame, including a refresh, is lost before reassembly.
+                // Other application traffic can drive recovery between video frames.
                 if let lastRequest, incoming == nil,
                     SuspendingClock.Instant.now - lastRequestTime >= .seconds(1)
                 {

@@ -221,10 +221,11 @@ final class ServerConnection {
                 break
             }
             if active {
-                if now >= nextControl {
+                if now >= nextControl, session.dataSendIdleTime >= SessionTiming.controlInterval.timeInterval {
                     do {
                         try session.send(
-                            ControlMessage(sequence: controls + 1).encoded, mode: .reliable)
+                            ControlMessage(sequence: controls + 1).encoded,
+                            mode: .unreliable(sendWithin: SessionTiming.controlInterval))
                         controls += 1
                         nextControl = now + SessionTiming.controlInterval
                     } catch NetworkMessageSession.SendError.backpressure {

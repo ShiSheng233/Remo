@@ -18,7 +18,14 @@ private final class SteppingSource: ScreenFrameSource {
     private(set) var started = 0
     private var step: Int64 = 0
 
+    let firstFrameAt: SuspendingClock.Instant
+
+    init(delay: Duration = .zero) {
+        firstFrameAt = .now + delay
+    }
+
     func latestFrame() throws -> ScreenFrame? {
+        guard .now >= firstFrameAt else { return nil }
         step += 1
         var buffer: CVPixelBuffer?
         CVPixelBufferCreate(
@@ -39,7 +46,8 @@ private final class SteppingSource: ScreenFrameSource {
     nonisolated(nonsending) func stop() async throws {}
 }
 
-@Test @MainActor func clientReceivesACustomSourceOverLoopback() async throws {
+@Test(arguments: [false, true]) @MainActor
+func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     var sources: [SteppingSource] = []
     var port: UInt16?
     var disconnects: [(reason: String, failed: Bool)] = []
@@ -47,7 +55,7 @@ private final class SteppingSource: ScreenFrameSource {
     let server = try await RemoteScreenServer(
         configuration: .init(
             source: .custom {
-                let source = SteppingSource()
+                let source = SteppingSource(delay: delayedVideo ? .seconds(5) : .zero)
                 sources.append(source)
                 return source
             })
@@ -67,7 +75,11 @@ private final class SteppingSource: ScreenFrameSource {
     var clientStatistics: ClientStatistics?
     var frames = 0
     var client: RemoteScreenClient!
+    let (recoveries, recoveryEvents) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
     client = RemoteScreenClient(
+        configuration: .init(requestsPointerControl: false, diagnostics: .init { event in
+            if event.message.hasPrefix("recovery requested lastDecoded=0 ") { recoveryEvents.yield(()) }
+        }),
         onFrame: { frame in
             #expect(CVPixelBufferGetWidth(frame.pixels) == 320)
             frames += 1
@@ -83,12 +95,21 @@ private final class SteppingSource: ScreenFrameSource {
     let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .init(rawValue: port!)!)
     let failure = await client.run(.udp(endpoint))
 
+    recoveryEvents.finish()
+    if delayedVideo {
+        var iterator = recoveries.makeAsyncIterator()
+        let requestedFirstFrame = await iterator.next() != nil
+        #expect(requestedFirstFrame)
+        #expect(clientStatistics.map { $0.controlsReceived > 0 } == true)
+    } else {
+        #expect(serverStatistics?.controlsSent == 0)
+    }
     #expect(failure == nil)
     #expect(states == [.connecting, .waitingForVideo, .streaming, .idle])
     #expect(frames == 45)
     // One source for the one client, started when it asked for video.
     #expect(sources.count == 1)
-    #expect(clientStatistics.map { $0.framesDecoded > 0 && $0.controlsReceived > 0 } == true)
+    #expect(clientStatistics.map { $0.framesDecoded > 0 } == true)
     #expect(serverStatistics.map { $0.framesQueued > 0 && $0.heartbeatsReceived > 0 } == true)
     // The goodbye ends the server's side cleanly.
     for _ in 0..<100 where disconnects.isEmpty { try await Task.sleep(nanoseconds: 10_000_000) }
