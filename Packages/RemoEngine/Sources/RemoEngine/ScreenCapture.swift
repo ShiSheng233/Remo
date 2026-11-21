@@ -21,8 +21,8 @@ public struct ScreenFrame {
 }
 
 /// Frames for a server to stream, such as a display capture. The server polls it at its own
-/// frame rate, sends only new pictures, re-sends a still one periodically so a client can
-/// recover, and scales them down when the link is slow.
+/// frame rate, sends only new pictures and re-sends a still one periodically so a client can
+/// recover. The size stays fixed for the whole session.
 ///
 /// A server starts one source per client and calls it only from the main actor.
 public protocol ScreenFrameSource: AnyObject {

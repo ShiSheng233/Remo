@@ -159,50 +159,6 @@ func lostBootstrapAndRefreshFrames(loseAllLTR: Bool) async throws {
     #expect(requests == [expected])
 }
 
-@Test @MainActor func resolutionChangeStartsANewDecodableEpoch() async throws {
-    func encoder(_ width: Int) throws -> VideoEncoder {
-        try VideoEncoder(
-            width: width, height: 180, framesPerSecond: 30, bitRate: 500_000,
-            enableLongTermReferences: true)
-    }
-    var received: [Int] = []
-    var epochs: [UInt64] = []
-    var sender: VideoSession!
-    let receiver = VideoSession(
-        send: { data, _ in sender.receive(.reliable, data) },
-        onFrame: { _, frame, _ in received.append(CVPixelBufferGetWidth(frame.pixels)) },
-        onFailure: { Issue.record("Decode failed: \($0)") })
-    sender = try VideoSession(
-        encoder: encoder(320),
-        send: { data, _ in
-            let packet = try VideoPacket(data)
-            if packet.kind == .idr { epochs.append(packet.epoch) }
-            receiver.receive(.unreliable, data)
-        }, onFrame: { _, _, _ in }, onFailure: { Issue.record("Send failed: \($0)") })
-    defer {
-        sender.close()
-        receiver.close()
-        sender = nil
-    }
-    for (index, width) in [320, 240].enumerated() {
-        if index == 1 { try #require(try sender.replaceEncoder(encoder(width))) }
-        var pixels: CVPixelBuffer?
-        try #require(
-            CVPixelBufferCreate(
-                nil, width, 180, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary, &pixels
-            ) == kCVReturnSuccess)
-        _ = try await sender.sendFrame(
-            #require(pixels), presentationTime: CMTime(value: Int64(index), timescale: 30),
-            duration: CMTime(value: 1, timescale: 30))
-        for _ in 0..<100 where received.count <= index {
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
-    }
-    #expect(received == [320, 240])
-    #expect(epochs == [1, 2])
-}
-
 @Test @MainActor func higherBitRateRefreshesAnUnchangedPicture() async throws {
     let encoder = try VideoEncoder(width: 320, height: 180, framesPerSecond: 30, bitRate: 300_000)
     var latest: VideoPacket?

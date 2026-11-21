@@ -69,19 +69,6 @@ final class VideoSession {
         if !closed { refresh = .keyFrame }
     }
 
-    /// Switch at a frame boundary. The next IDR carries the new configuration and starts a new epoch.
-    /// Returns false while an encode or reliable checkpoint is in progress.
-    func replaceEncoder(_ replacement: VideoEncoder) throws -> Bool {
-        guard !closed else { throw Failure.closed }
-        guard !encoding, outgoing == nil else { return false }
-        encoder = replacement
-        refresh = .keyFrame
-        acknowledged = nil
-        newAcknowledgement = false
-        sentEpoch = 0
-        return true
-    }
-
     /// Returns admitted video bytes, or zero when waiting for a reliable IDR to be decoded.
     /// Encode one source frame at a time, in PTS order.
     nonisolated(nonsending) func sendFrame(

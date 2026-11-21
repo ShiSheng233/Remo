@@ -51,11 +51,6 @@ final class ServerConnection {
     private var lastQualityRefresh: UInt64 = 0
     private var lastImageChange: UInt64 = 0
     private var refreshWhenStill = false
-    #if os(macOS)
-        private var scaler: ScreenScaler?
-        private var resolutionDivisor = 1
-        private var lastResolutionChange: UInt64 = 0
-    #endif
 
     // Audio
     private var audioSendTask: Task<Void, Never>?
@@ -299,9 +294,6 @@ final class ServerConnection {
             targetBitRate = target
             lastRateUpdate = now
         }
-        #if os(macOS)
-            try adaptResolution(source, video: video, budget: budget, now: now)
-        #endif
         // Skip before encoding so congestion does not break the prediction chain.
         guard let frame = try source.latestFrame() else { return }
         let capturePTS = frame.timestamp
@@ -332,51 +324,9 @@ final class ServerConnection {
         }
         previousCapturePTS = capturePTS
         lastCaptureSend = now
-        #if os(macOS)
-            let pixels = try scaler?.resize(frame.pixels) ?? frame.pixels
-        #else
-            let pixels = frame.pixels
-        #endif
         try await submit(
-            pixels, pts: CMTime(value: Int64(now), timescale: 1_000_000_000), video: video)
+            frame.pixels, pts: CMTime(value: Int64(now), timescale: 1_000_000_000), video: video)
     }
-
-    #if os(macOS)
-        private func adaptResolution(
-            _ source: any ScreenFrameSource, video: VideoSession, budget: Double, now: UInt64
-        ) throws {
-            guard now - lastResolutionChange >= 3_000_000_000 else { return }
-            // Separate up/down thresholds to avoid repeatedly restarting the reference chain.
-            let divisor: Int
-            if budget < 300_000 {
-                divisor = 4
-            } else if budget < 1_000_000 && resolutionDivisor < 4 {
-                divisor = 2
-            } else if budget > 1_800_000 {
-                divisor = 1
-            } else if budget > 600_000 && resolutionDivisor == 4 {
-                divisor = 2
-            } else {
-                return
-            }
-            guard divisor != resolutionDivisor else { return }
-            lastResolutionChange = now
-            let width = max(2, source.width / (2 * divisor) * 2)
-            let height = max(2, source.height / (2 * divisor) * 2)
-            let newScaler = divisor == 1 ? nil : try ScreenScaler(width: width, height: height)
-            let replacement = try VideoEncoder(
-                width: width, height: height, framesPerSecond: Int(context.framesPerSecond),
-                bitRate: targetBitRate, enableLongTermReferences: true)
-            guard try video.replaceEncoder(replacement) else { return }
-            encoder = replacement
-            scaler = newScaler
-            resolutionDivisor = divisor
-            refreshBitRate = targetBitRate
-            lastQualityRefresh = now
-            refreshWhenStill = false
-            log("screen encode size=\(width)x\(height) budget=\(Int(budget)) bps")
-        }
-    #endif
 
     private func submit(_ pixels: CVPixelBuffer, pts: CMTime, video: VideoSession) async throws {
         frames += 1
