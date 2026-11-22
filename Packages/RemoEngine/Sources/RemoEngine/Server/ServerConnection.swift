@@ -56,6 +56,9 @@ final class ServerConnection {
     private var lastQualityRefresh: Instant?
     private var lastImageChange = Instant.now
     private var refreshWhenStill = false
+    /// Steps taken so far in sharpening the picture that is at rest now.
+    private var sharpening = 0
+    private var stillInterval = Duration.milliseconds(500)
 
     // Audio
     private var audioSendTask: Task<Void, Never>?
@@ -321,47 +324,80 @@ final class ServerConnection {
         // Skip before encoding so congestion does not break the prediction chain.
         guard let frame = try source.latestFrame() else { return }
         let capturePTS = frame.timestamp
-        if capturePTS != previousCapturePTS {
+        let changed = capturePTS != previousCapturePTS
+        if changed {
             lastImageChange = now
             refreshWhenStill = true
+            sharpening = 0
+            stillInterval = .milliseconds(500)
         }
-        // Refresh a still desktop periodically so a lost frame can be recovered.
-        guard capturePTS != previousCapturePTS
-            || now.hasElapsed(.milliseconds(500), since: lastCaptureSend)
-        else {
-            return
-        }
+        // Send a still desktop again periodically so a lost frame can be recovered.
+        guard changed || now.hasElapsed(stillInterval, since: lastCaptureSend) else { return }
         if Duration.seconds(stats.estimatedQueueDelay) > .milliseconds(50) {
             captureSkips += 1
             return
         }
-        let settled =
-            Double(targetBitRate) <= budget && refreshWhenStill
-            && now - lastImageChange >= .seconds(1)
-        let improved =
-            targetBitRate >= refreshBitRate * 3 / 2
-            || (targetBitRate == maximum && refreshBitRate < targetBitRate)
-        if (improved || settled) && now.hasElapsed(.seconds(5), since: lastQualityRefresh) {
-            video.requestKeyFrame()
-            lastQualityRefresh = now
-            refreshBitRate = targetBitRate
-            refreshWhenStill = false
-            log("screen quality refresh encoderBps=\(targetBitRate)")
+        var maximumQP: Int?
+        if encoder?.supportsQuantizerLimit == true {
+            // A picture that has come to rest is sharpened by ordinary frames, a step at a
+            // time. Each is a fraction of a key frame, and losing one costs nothing but itself.
+            if !changed, now - lastImageChange >= .seconds(1) {
+                let steps = Self.sharpeningSteps(for: targetBitRate)
+                maximumQP = steps[min(sharpening, steps.count - 1)]
+            }
+        } else {
+            // Without a quantizer limit only a key frame makes a still picture any finer.
+            let settled =
+                Double(targetBitRate) <= budget && refreshWhenStill
+                && now - lastImageChange >= .seconds(1)
+            let improved =
+                targetBitRate >= refreshBitRate * 3 / 2
+                || (targetBitRate == maximum && refreshBitRate < targetBitRate)
+            if (improved || settled) && now.hasElapsed(.seconds(5), since: lastQualityRefresh) {
+                video.requestKeyFrame()
+                lastQualityRefresh = now
+                refreshBitRate = targetBitRate
+                refreshWhenStill = false
+                log("screen quality refresh encoderBps=\(targetBitRate)")
+            }
         }
         previousCapturePTS = capturePTS
         lastCaptureSend = now
         // Stamp frames with the send time; a still picture sent again is a new frame.
-        try await submit(
+        let bytes = try await submit(
             frame.pixels, pts: CMTime(value: (now - started).nanoseconds, timescale: 1_000_000_000),
-            video: video)
+            video: video,
+            retryFor: SessionTiming.frameRetryBudget(
+                roundTrip: stats.roundTripTime.map(Duration.seconds)),
+            maximumQP: maximumQP)
+        if let maximumQP, bytes > 0 {
+            if sharpening < Self.sharpeningSteps(for: targetBitRate).count {
+                log("still picture sharpened maxQP=\(maximumQP) bytes=\(bytes)")
+            }
+            sharpening += 1
+            // Give the link time to pay for one step before the next.
+            stillInterval = max(
+                .milliseconds(500), .seconds(Double(bytes) * 8 / Double(targetBitRate) * 1.5))
+        }
     }
 
-    private func submit(_ pixels: CVPixelBuffer, pts: CMTime, video: VideoSession) async throws {
+    /// Quantizer limits for sharpening a still picture, coarsest first. Moving pictures and
+    /// key frames stop at 34. A slow link is not asked for the finest steps.
+    private static func sharpeningSteps(for bitRate: Int) -> [Int] {
+        bitRate < 500_000 ? [32] : bitRate < 1_000_000 ? [32, 29] : [32, 29, 26]
+    }
+
+    /// Returns the bytes admitted, or zero if the frame was dropped or held back.
+    private func submit(
+        _ pixels: CVPixelBuffer, pts: CMTime, video: VideoSession, retryFor retryBudget: Duration,
+        maximumQP: Int?
+    ) async throws -> Int {
         frames += 1
         do {
             let bytes = try await video.sendFrame(
                 pixels, presentationTime: pts,
-                duration: CMTime(value: 1, timescale: context.framesPerSecond))
+                duration: CMTime(value: 1, timescale: context.framesPerSecond),
+                retryFor: retryBudget, maximumQP: maximumQP)
             if bytes == 0 {
                 keyFrameWaits += 1
                 // This picture was not sent. Offer it again once the key frame has arrived,
@@ -369,11 +405,13 @@ final class ServerConnection {
                 lastCaptureSend = nil
             }
             videoBytes += bytes
+            return bytes
         } catch VideoCodecError.frameDropped {
             codecDrops += 1
         } catch NetworkMessageSession.SendError.backpressure {
             backpressureDrops += 1
         }
+        return 0
     }
 
     private func report(_ session: NetworkMessageSession, now: Instant) {

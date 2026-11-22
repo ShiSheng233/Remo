@@ -25,4 +25,21 @@ enum SessionTiming {
     static let connectionSetupTimeout = Duration.seconds(5)
     /// Statistics are reported at this interval.
     static let reportInterval = Duration.seconds(1)
+
+    /// Beyond this round trip a retransmitted frame arrives no sooner than a refresh would.
+    private static let retransmissionLimit = Duration.milliseconds(120)
+
+    /// How long the server retransmits the fragments of a predicted frame: long enough to
+    /// notice one loss and repair it.
+    static func frameRetryBudget(roundTrip: Duration?) -> Duration {
+        guard let roundTrip, roundTrip <= retransmissionLimit else { return .milliseconds(80) }
+        return max(.milliseconds(80), roundTrip * 3 / 2 + .milliseconds(60))
+    }
+
+    /// How long the client waits for a missing frame before it gives the frames behind it up
+    /// and asks for a refresh. Zero when no retransmission could arrive in time.
+    static func framePatience(roundTrip: Duration?) -> Duration {
+        guard let roundTrip else { return .milliseconds(40) }
+        return roundTrip <= retransmissionLimit ? roundTrip + .milliseconds(20) : .zero
+    }
 }

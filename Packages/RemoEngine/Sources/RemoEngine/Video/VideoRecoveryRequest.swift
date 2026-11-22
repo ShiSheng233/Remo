@@ -7,7 +7,11 @@ struct VideoRecoveryRequest {
     let round: UInt64
     let attempt: UInt64
     let epoch: UInt64
+    /// `.idr` when the receiver knows a long-term reference can't help it.
     let level: Level
+    /// The newest key frame or reference refresh the receiver had looked at when it asked. A
+    /// request made with a refresh in hand says that refresh was no use.
+    let refreshSeen: UInt64
 
     var encoded: Data {
         var data = MessageKind.videoRecoveryRequest.encoded
@@ -15,6 +19,7 @@ struct VideoRecoveryRequest {
         data.put(attempt)
         data.put(epoch)
         data.put(level.rawValue)
+        data.put(refreshSeen)
         return data
     }
 
@@ -34,9 +39,10 @@ extension VideoRecoveryRequest {
         round = try body.take(UInt64.self)
         attempt = try body.take(UInt64.self)
         epoch = try body.take(UInt64.self)
-        guard let level = Level(rawValue: try body.take(UInt8.self)),
-            round > 0, attempt > 0, body.isEmpty
+        guard let level = Level(rawValue: try body.take(UInt8.self)), round > 0, attempt > 0
         else { throw WireFormatError.invalid }
         self.level = level
+        refreshSeen = try body.take(UInt64.self)
+        guard body.isEmpty else { throw WireFormatError.invalid }
     }
 }

@@ -11,8 +11,15 @@ public final class VideoEncoder {
     }
 
     private var changeDetector = FrameChangeDetector()
+    /// Key frames are the largest thing a session sends, and a lost or slow one freezes the
+    /// picture. They are encoded no finer than moving pictures, and sharpened afterwards.
+    private static let coarseQP = 34
+    private static let unlimitedQP = 51
     private let defaultMinimumQP: Int
     private var appliedMinimumQP: Int?
+    private var appliedMaximumQP = VideoEncoder.unlimitedQP
+    /// Whether `encode` can honor a `maximumQP`.
+    public private(set) var supportsQuantizerLimit = false
     private var hasEncodedFrame = false
     private let longTermReferences: Bool
     private let session: VTCompressionSession
@@ -64,6 +71,7 @@ public final class VideoEncoder {
             {
                 floor = max(0, number.intValue)
                 appliedMinimumQP = floor
+                supportsQuantizerLimit = true
             }
         }
         defaultMinimumQP = floor
@@ -92,9 +100,13 @@ public final class VideoEncoder {
 
     /// Pass new acknowledgements on normal submissions. For recovery, supply tokens the receiver
     /// can still use in the current prediction chain, even if they were acknowledged previously.
+    ///
+    /// `maximumQP` makes a predicted frame of a still picture at least that fine, which sharpens
+    /// what a coarser frame left behind. It is ignored for key frames and moving pictures.
     public nonisolated(nonsending) func encode(
         _ pixels: CVPixelBuffer, presentationTime: CMTime, duration: CMTime = .invalid,
-        refresh: Refresh, acknowledgedReferences: [LongTermReferenceToken] = []
+        refresh: Refresh, acknowledgedReferences: [LongTermReferenceToken] = [],
+        maximumQP: Int? = nil
     ) async throws -> CMSampleBuffer {
         guard longTermReferences || acknowledgedReferences.isEmpty else {
             throw VideoCodecError.invalidConfiguration
@@ -119,18 +131,24 @@ public final class VideoEncoder {
         }
         if #available(macOS 13.0, iOS 16.0, *), let appliedMinimumQP {
             let independent = options[kVTEncodeFrameOptionKey_ForceKeyFrame] != nil || !hasEncodedFrame
-            let applyFloor = changeDetector.isMoving(pixels, at: presentationTime.seconds)
-            let minimum = independent || !applyFloor ? defaultMinimumQP : max(34, defaultMinimumQP)
+            let moving = changeDetector.isMoving(pixels, at: presentationTime.seconds)
+            let coarse = max(Self.coarseQP, defaultMinimumQP)
+            let minimum = independent || moving ? coarse : defaultMinimumQP
+            let maximum = independent || moving ? Self.unlimitedQP : max(minimum, maximumQP ?? Self.unlimitedQP)
+            // Keep the floor at or below the ceiling at every step.
+            if maximum >= appliedMaximumQP { try limit(maximum: maximum) }
             if minimum != appliedMinimumQP {
                 let status = VTSessionSetProperty(
                     session, key: kVTCompressionPropertyKey_MinAllowedFrameQP, value: minimum as CFNumber)
                 if status == kVTPropertyNotSupportedErr || status == kVTPropertyReadOnlyErr {
                     self.appliedMinimumQP = nil
+                    supportsQuantizerLimit = false
                 } else {
                     try check(status, "set minimum predicted frame QP")
                     self.appliedMinimumQP = minimum
                 }
             }
+            if maximum < appliedMaximumQP { try limit(maximum: maximum) }
         }
         let sample: CMSampleBuffer = try await withCheckedThrowingContinuation { continuation in
             let status = VTCompressionSessionEncodeFrame(
@@ -158,5 +176,18 @@ public final class VideoEncoder {
         }
         hasEncodedFrame = true
         return sample
+    }
+
+    @available(macOS 13.0, iOS 16.0, *)
+    private func limit(maximum: Int) throws {
+        guard supportsQuantizerLimit, maximum != appliedMaximumQP else { return }
+        let status = VTSessionSetProperty(
+            session, key: kVTCompressionPropertyKey_MaxAllowedFrameQP, value: maximum as CFNumber)
+        if status == kVTPropertyNotSupportedErr || status == kVTPropertyReadOnlyErr {
+            supportsQuantizerLimit = false
+        } else {
+            try check(status, "set maximum frame QP")
+            appliedMaximumQP = maximum
+        }
     }
 }

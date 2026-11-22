@@ -237,6 +237,10 @@ public final class RemoteScreenClient {
                     return try session.send(data, delivery: delivery, onOutcome: onOutcome)
                 },
                 cancel: { [weak self] in self?.transport?.cancelMessage($0) },
+                patience: { [weak self] in
+                    SessionTiming.framePatience(
+                        roundTrip: self?.transport?.statistics.roundTripTime.map(Duration.seconds))
+                },
                 onFrame: { [weak self] id, frame, bytes in
                     self?.present(VideoFrame(frame), id: id, bytes: bytes)
                 },
