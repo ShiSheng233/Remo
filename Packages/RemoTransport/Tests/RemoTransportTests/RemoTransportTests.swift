@@ -220,7 +220,7 @@ private func number(of datagram: Data) -> UInt32 {
     a.endpoint.send(Data([11]), delivery: .untilDelivered())
     a.drain(to: b)
     // The acknowledgement of the first transmission is lost.
-    b.advance(to: 0.005)
+    b.advance(to: MessageTransport.delayedAckInterval)
     #expect(b.packets == [Wire.ack(1, 1)])
     b.packets.removeAll()
     for _ in 0..<70 {
@@ -415,15 +415,17 @@ private func number(of datagram: Data) -> UInt32 {
 
 @Test func delayedAckThresholdAndNoAckLoop() {
     let a = Port(Clock())
-    for i in 1...7 {
+    let threshold = MessageTransport.ackPacketThreshold
+    for i in 1..<threshold {
         a.endpoint.handleEvent(.datagram(packet(UInt32(i), UInt32(i), 1)))
     }
-    #expect(a.packets.isEmpty && a.deadline == 0.005)
-    a.endpoint.handleEvent(.datagram(packet(8, 8, 1)))
-    #expect(a.packets == [Wire.ack(8, 255)] && a.deadline == nil)
-    a.endpoint.handleEvent(.datagram(packet(9, 9, 1)))
-    a.advance(to: 0.005)
-    #expect(a.packets.last == Wire.ack(9, 511))
+    #expect(a.packets.isEmpty && a.deadline == MessageTransport.delayedAckInterval)
+    a.endpoint.handleEvent(.datagram(packet(UInt32(threshold), UInt32(threshold), 1)))
+    let mask = (UInt64(1) << threshold) - 1
+    #expect(a.packets == [Wire.ack(UInt32(threshold), mask)] && a.deadline == nil)
+    a.endpoint.handleEvent(.datagram(packet(UInt32(threshold + 1), UInt32(threshold + 1), 1)))
+    a.advance(to: MessageTransport.delayedAckInterval)
+    #expect(a.packets.last == Wire.ack(UInt32(threshold + 1), (UInt64(1) << (threshold + 1)) - 1))
     let b = Port(a.clock)
     a.drain(to: b)
     #expect(b.packets.isEmpty && b.deadline == nil)
@@ -571,7 +573,7 @@ private func number(of datagram: Data) -> UInt32 {
     a.writable = true
     a.endpoint.handleEvent(.writable)
     a.drain(to: b)
-    b.advance(to: 0.005)
+    b.advance(to: MessageTransport.delayedAckInterval)
     b.drain(to: a)
     #expect(b.messages == [Data([3])] && log.last == "third delivered")
 }

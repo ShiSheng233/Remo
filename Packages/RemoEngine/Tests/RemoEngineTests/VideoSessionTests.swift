@@ -412,7 +412,9 @@ func delayedBootstrapAndLostFrames(scenario: LossScenario) async throws {
     var requests: [Data] = []
     let session = VideoSession(
         send: { data, delivery, _ in
-            guard delivery.retryBudget == 0, delivery.firstSendDeadline != nil else {
+            guard delivery.retryBudget > 0, delivery.retryBudget < 1,
+                delivery.priority == .high, delivery.firstSendDeadline != nil
+            else {
                 throw WireFormatError.invalid
             }
             requests.append(data)

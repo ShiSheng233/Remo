@@ -5,7 +5,7 @@
     import ScreenCaptureKit
 
     /// Captures the main display, and optionally system audio, with ScreenCaptureKit.
-    final class DisplayCapture: AudioSource {
+    final class DisplayCapture: NotifyingScreenFrameSource, AudioSource {
         /// A resolved display and capture size, made before any client connects.
         struct Configuration {
             enum Failure: Error { case noMainDisplay, invalidConfiguration }
@@ -105,6 +105,7 @@
         }
 
         var audioMessages: AsyncThrowingStream<AudioMessage, Error> { output.audioMessages }
+        var frameArrivals: AsyncStream<Void> { output.frameArrivals }
 
         func latestFrame() throws -> ScreenFrame? {
             guard let sample = try output.latest().get(),
@@ -115,7 +116,7 @@
         }
 
         nonisolated(nonsending) func stop() async throws {
-            defer { output.finishAudio() }
+            defer { output.finish() }
             try await stream.stopCapture()
         }
 
@@ -127,6 +128,8 @@
             private let packetizer: AudioPacketizer?
             let audioMessages: AsyncThrowingStream<AudioMessage, Error>
             private let continuation: AsyncThrowingStream<AudioMessage, Error>.Continuation
+            let frameArrivals: AsyncStream<Void>
+            private let frameContinuation: AsyncStream<Void>.Continuation
 
             init(capturesAudio: Bool, audioTraceDirectory: URL?) throws {
                 packetizer =
@@ -136,11 +139,19 @@
                     sink = $0
                 }
                 continuation = sink
+                var frameSink: AsyncStream<Void>.Continuation!
+                frameArrivals = AsyncStream(bufferingPolicy: .bufferingNewest(1)) {
+                    frameSink = $0
+                }
+                frameContinuation = frameSink
                 super.init()
-                if !capturesAudio { finishAudio() }
+                if !capturesAudio { continuation.finish() }
             }
 
-            func finishAudio() { continuation.finish() }
+            func finish() {
+                continuation.finish()
+                frameContinuation.finish()
+            }
 
             func latest() -> Result<CMSampleBuffer?, Error> {
                 lock.lock()
@@ -153,6 +164,7 @@
                 defer { lock.unlock() }
                 result = .failure(error)
                 continuation.finish(throwing: error)
+                frameContinuation.finish()
             }
 
             func stream(
@@ -175,8 +187,15 @@
                     CMSampleBufferGetImageBuffer(sample) != nil
                 else { return }
                 lock.lock()
-                defer { lock.unlock() }
-                if case .success = result { result = .success(sample) }
+                let updated: Bool
+                if case .success = result {
+                    result = .success(sample)
+                    updated = true
+                } else {
+                    updated = false
+                }
+                lock.unlock()
+                if updated { frameContinuation.yield(()) }
             }
         }
     }

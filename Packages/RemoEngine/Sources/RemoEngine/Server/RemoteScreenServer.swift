@@ -28,15 +28,15 @@ public final class RemoteScreenServer {
 
     public struct Configuration: Sendable {
         public var source: Source
-        public var framesPerSecond: Int32 = 30
-        public var maximumVideoBitRate = 2_000_000
+        public var framesPerSecond: Int32 = 60
+        public var maximumVideoBitRate = 5_000_000
         /// Lets one client at a time drive the main display's pointer. Requires Accessibility access.
         public var allowsPointerControl = false
         public var diagnostics = Diagnostics()
 
         public init(
-            source: Source = .mainDisplay(), framesPerSecond: Int32 = 30,
-            maximumVideoBitRate: Int = 2_000_000, allowsPointerControl: Bool = false,
+            source: Source = .mainDisplay(), framesPerSecond: Int32 = 60,
+            maximumVideoBitRate: Int = 5_000_000, allowsPointerControl: Bool = false,
             diagnostics: Diagnostics = Diagnostics()
         ) {
             self.source = source

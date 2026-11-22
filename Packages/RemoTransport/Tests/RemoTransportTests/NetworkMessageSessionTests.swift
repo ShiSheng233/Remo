@@ -108,7 +108,9 @@ private actor SessionOwner {
 
 @Test @MainActor func sessionBackpressureAndCompletion() async throws {
     let driver = SimulatedConnection()
-    let session = try await NetworkMessageSession(driver: driver, datagramLimit: 64) { _ in
+    let session = try await NetworkMessageSession(
+        driver: driver, datagramLimit: 64, maxInFlightDatagrams: 2
+    ) { _ in
     } closeHandler: { _ in
     }
     defer { session.cancel() }
@@ -187,4 +189,34 @@ private actor SessionOwner {
     #expect(throws: NetworkMessageSession.SendError.closed) {
         try session.send(Data([1]), delivery: .untilDelivered())
     }
+}
+
+@Test @MainActor func sessionRunsTransportOffMainActorAndFitsIPv6WireGuardMTU() async throws {
+    // 20 (inner IPv4) + 8 (inner UDP) + defaultDatagramLimit, padded to 16 + 32 (WG) + 48 (outer IPv6/UDP) <= 1280.
+    let inner = 20 + 8 + MessageTransport.defaultDatagramLimit
+    let padded = ((inner + 15) / 16) * 16
+    #expect(padded + 32 + 48 <= 1280)
+
+    let driver = SimulatedConnection()
+    let (receiveThreads, receiveSignal) = AsyncStream<Bool>.makeStream()
+    let (deliveredOnMain, deliveredSignal) = AsyncStream<Bool>.makeStream()
+    driver.onReceive = {
+        receiveSignal.yield(Thread.isMainThread)
+    }
+    let session = try await NetworkMessageSession(driver: driver) { _ in
+        MainActor.preconditionIsolated()
+        deliveredSignal.yield(Thread.isMainThread)
+    } closeHandler: { _ in
+    }
+    defer { session.cancel() }
+    var receiveIterator = receiveThreads.makeAsyncIterator()
+    var deliveredIterator = deliveredOnMain.makeAsyncIterator()
+    // Discard the synchronous initial receive submitted during setup.
+    _ = await receiveIterator.next()
+    // Inbound datagram handling and follow-up receives run off the main thread, while complete
+    // message delivery returns to the owning actor.
+    driver.events?.yield(.received(Data([0, 0, 0, 0, 1, 0, 0, 0, 1, 99])))
+    let transportOnMain = await receiveIterator.next()
+    let callbackOnMain = await deliveredIterator.next()
+    #expect(transportOnMain == false && callbackOnMain == true)
 }

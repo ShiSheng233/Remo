@@ -13,6 +13,8 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
     private let tunnel: OpaquePointer
     private let queue = DispatchQueue(label: "Remo.WireGuard", qos: .userInitiated)
 
+    private static let maxPendingInbound = 128
+
     // Accessed only on queue.
     private var events: AsyncStream<ConnectionEvent>.Continuation?
     private var timer: (any DispatchSourceTimer)?
@@ -20,6 +22,9 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
     private var tunnelReady = false
     private var receiving = false
     private var wantsDatagram = false
+    private var pendingInbound: [Data] = []
+    private var pendingHead = 0
+    private var pendingCount: Int { pendingInbound.count - pendingHead }
 
     private var reportTimer: (any DispatchSourceTimer)?
     private var outerRx = 0
@@ -76,6 +81,7 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
     func receive() {
         queue.async {
             self.wantsDatagram = true
+            self.deliverIfReady()
             self.receiveIfNeeded()
         }
     }
@@ -102,6 +108,8 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
             self.events = nil
             self.timer?.cancel()
             self.timer = nil
+            self.pendingInbound.removeAll()
+            self.pendingHead = 0
             self.connection.cancel()
         }
     }
@@ -131,7 +139,11 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
     }
 
     private func receiveIfNeeded() {
-        guard events != nil, networkReady, !receiving, !tunnelReady || wantsDatagram else { return }
+        // Keep draining outer UDP datagrams continuously (up to a bounded queue) so WireGuard
+        // handshakes, rekeys, keepalives and incoming bursts never stall waiting on the consumer.
+        guard events != nil, networkReady, !receiving, pendingCount < Self.maxPendingInbound else {
+            return
+        }
         receiving = true
         connection.receiveMessage { [weak self] data, context, complete, error in
             guard let self, let events = self.events else { return }
@@ -156,6 +168,25 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
         }
     }
 
+    private func deliverIfReady() {
+        guard wantsDatagram, pendingHead < pendingInbound.count else { return }
+        let datagram = pendingInbound[pendingHead]
+        pendingHead += 1
+        if pendingHead == pendingInbound.count {
+            pendingInbound.removeAll(keepingCapacity: true)
+            pendingHead = 0
+        } else if pendingHead >= 64 {
+            pendingInbound.removeFirst(pendingHead)
+            pendingHead = 0
+        }
+        wantsDatagram = false
+        if case .enqueued = events?.yield(.received(datagram)) {
+            deliveredRx += 1
+        } else {
+            receiveReasons["deliveryNotEnqueued", default: 0] += 1
+        }
+    }
+
     private func process(_ data: Data) {
         let result = data.withUnsafeBytes { bytes in
             remo_wg_receive(tunnel, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count)
@@ -175,15 +206,20 @@ nonisolated final class WireGuardDatagramConnection: DatagramConnection, @unchec
         if let reason = result.receive_reason {
             receiveReasons[String(cString: reason), default: 0] += 1
         }
-        if result.operation == RemoWireGuardDeliver, wantsDatagram, let bytes = result.bytes {
-            wantsDatagram = false
-            if case .enqueued = events?.yield(.received(Data(bytes: bytes, count: result.length))) {
-                deliveredRx += 1
+        if result.operation == RemoWireGuardDeliver, let bytes = result.bytes {
+            let datagram = Data(bytes: bytes, count: result.length)
+            if wantsDatagram {
+                wantsDatagram = false
+                if case .enqueued = events?.yield(.received(datagram)) {
+                    deliveredRx += 1
+                } else {
+                    receiveReasons["deliveryNotEnqueued", default: 0] += 1
+                }
+            } else if pendingCount < Self.maxPendingInbound {
+                pendingInbound.append(datagram)
             } else {
-                receiveReasons["deliveryNotEnqueued", default: 0] += 1
+                receiveReasons["inboundQueueFull", default: 0] += 1
             }
-        } else if result.operation == RemoWireGuardDeliver {
-            receiveReasons["deliveryNotRequested", default: 0] += 1
         } else if result.operation == RemoWireGuardSend {
             sendControl(result)
             var queued = remo_wg_receive(tunnel, nil, 0)

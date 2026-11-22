@@ -18,8 +18,8 @@ enum Command {
         Default UDP port: \(RemoProtocol.defaultPort)
         --resolution sets the test pattern size or caps the screen capture at WIDTHxHEIGHT pixels.
         Dimensions must be even (2...8192). Defaults: 640x360 test pattern, screen longest edge 1920.
-        --fps sets the server frame rate (1...240, default 30). Screen capture may run slower.
-        --max-video-bitrate sets the video bitrate ceiling in bits per second (default 2000000).
+        --fps sets the server frame rate (1...240, default 60). Screen capture runs VFR up to this rate.
+        --max-video-bitrate sets the video bitrate ceiling in bits per second (default 5000000).
         --screen streams the main display on the server and opens a video window on the client (macOS).
           Without it, the server streams a test pattern and the client verifies every frame of it.
         --audio includes system playback audio on a screen server (macOS 13 or later).
@@ -66,8 +66,8 @@ enum Command {
         let screen = present.contains("--screen")
         let audio = present.contains("--audio")
         var resolution: (width: Int, height: Int)?
-        var fps: Int32 = 30
-        var bitRate = 2_000_000
+        var fps: Int32 = 60
+        var bitRate = 5_000_000
         for option in ["--resolution", "--fps", "--max-video-bitrate"] {
             guard let index = args.firstIndex(of: option) else { continue }
             guard args.first == "server" else { fail("\(option) is a server option.") }

@@ -25,8 +25,22 @@ enum Repair {
         return (exp, log)
     }()
 
+    /// Full 256×256 GF(256) multiplication table (64 KB), built once so `accumulate` never
+    /// allocates per fragment or recomputes a row table on the hot path.
+    private static let multiplyTable: [UInt8] = {
+        var table = [UInt8](repeating: 0, count: 256 * 256)
+        for weight in 1..<256 {
+            let shift = Int(tables.log[weight])
+            let base = weight << 8
+            for byte in 1..<256 {
+                table[base | byte] = tables.exp[Int(tables.log[byte]) + shift]
+            }
+        }
+        return table
+    }()
+
     private static func multiply(_ a: UInt8, _ b: UInt8) -> UInt8 {
-        a == 0 || b == 0 ? 0 : tables.exp[Int(tables.log[Int(a)]) + Int(tables.log[Int(b)])]
+        multiplyTable[(Int(a) << 8) | Int(b)]
     }
 
     private static func inverse(_ a: UInt8) -> UInt8 {
@@ -38,13 +52,29 @@ enum Repair {
     }
 
     /// `target ^= weight * source`, over as many bytes as the two share.
+    private static func accumulate(
+        _ source: UnsafeBufferPointer<UInt8>, times weight: UInt8, into target: inout [UInt8]
+    ) {
+        guard weight != 0 else { return }
+        let count = min(source.count, target.count)
+        guard count > 0, let src = source.baseAddress else { return }
+        target.withUnsafeMutableBufferPointer { dst in
+            guard let out = dst.baseAddress else { return }
+            if weight == 1 {
+                for offset in 0..<count { out[offset] ^= src[offset] }
+                return
+            }
+            multiplyTable.withUnsafeBufferPointer { table in
+                let row = table.baseAddress! + (Int(weight) << 8)
+                for offset in 0..<count { out[offset] ^= row[Int(src[offset])] }
+            }
+        }
+    }
+
     private static func accumulate(_ source: Data, times weight: UInt8, into target: inout [UInt8]) {
         guard weight != 0 else { return }
-        let shift = Int(tables.log[Int(weight)])
-        var row = [UInt8](repeating: 0, count: 256)
-        for byte in 1..<256 { row[byte] = tables.exp[Int(tables.log[byte]) + shift] }
         source.withUnsafeBytes { bytes in
-            for offset in 0..<min(bytes.count, target.count) { target[offset] ^= row[Int(bytes[offset])] }
+            accumulate(bytes.bindMemory(to: UInt8.self), times: weight, into: &target)
         }
     }
 
@@ -90,15 +120,21 @@ enum Repair {
             let scale = inverse(matrix[column][column])
             if scale != 1 {
                 matrix[column] = matrix[column].map { multiply($0, scale) }
-                var scaled = [UInt8](repeating: 0, count: length)
-                accumulate(Data(mixed[column]), times: scale, into: &scaled)
-                mixed[column] = scaled
+                let rowOffset = Int(scale) << 8
+                mixed[column].withUnsafeMutableBufferPointer { dst in
+                    multiplyTable.withUnsafeBufferPointer { table in
+                        let row = table.baseAddress! + rowOffset
+                        for offset in 0..<dst.count { dst[offset] = row[Int(dst[offset])] }
+                    }
+                }
             }
-            let source = Data(mixed[column])
-            for row in 0..<size where row != column && matrix[row][column] != 0 {
-                let factor = matrix[row][column]
-                for index in 0..<size { matrix[row][index] ^= multiply(matrix[column][index], factor) }
-                accumulate(source, times: factor, into: &mixed[row])
+            let source = mixed[column]
+            source.withUnsafeBufferPointer { sourceBytes in
+                for row in 0..<size where row != column && matrix[row][column] != 0 {
+                    let factor = matrix[row][column]
+                    for index in 0..<size { matrix[row][index] ^= multiply(matrix[column][index], factor) }
+                    accumulate(sourceBytes, times: factor, into: &mixed[row])
+                }
             }
         }
         var rebuilt: [Int: Data] = [:]

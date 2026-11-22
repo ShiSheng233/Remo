@@ -10,3 +10,9 @@ public protocol ScreenFrameSource: AnyObject {
     func latestFrame() throws -> ScreenFrame?
     nonisolated(nonsending) func stop() async throws
 }
+
+/// Internal extension for push-based capture sources (such as ScreenCaptureKit) so the server
+/// wakes as soon as a new frame arrives instead of polling on a fixed timer.
+protocol NotifyingScreenFrameSource: ScreenFrameSource {
+    var frameArrivals: AsyncStream<Void> { get }
+}

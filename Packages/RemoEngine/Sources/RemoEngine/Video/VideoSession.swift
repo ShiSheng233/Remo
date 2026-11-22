@@ -405,7 +405,9 @@ final class VideoSession {
         do {
             _ = try send(
                 request.encoded,
-                .retrying(sendWithin: .milliseconds(250), replacing: .videoRecoveryRequest), nil)
+                .retrying(
+                    for: .milliseconds(250), sendWithin: .milliseconds(250), priority: .high,
+                    replacing: .videoRecoveryRequest), nil)
         } catch NetworkMessageSession.SendError.backpressure {
             return
         }
@@ -422,8 +424,13 @@ final class VideoSession {
         let recovering = lastRequest != nil || broken
         if let description = packet.format {
             pendingAck = nil
-            decoder = try VideoDecoder(format: description)
-            format = description
+            if decoder == nil
+                || format.map({ !CMFormatDescriptionEqual($0, otherFormatDescription: description) })
+                    ?? true
+            {
+                decoder = try VideoDecoder(format: description)
+                format = description
+            }
             receivedEpoch = packet.epoch
         }
         guard let decoder, let format, packet.epoch == receivedEpoch else {

@@ -47,10 +47,13 @@ final class ServerConnection {
 
     // Source
     private var source: (any ScreenFrameSource)?
+    private var frameForwardTask: Task<Void, Never>?
+    private var streamWake: AsyncStream<Void>.Continuation?
     private var encoder: VideoEncoder?
     private var previousCapturePTS = CMTime.invalid
     private var lastCaptureSend: Instant?
     private var targetBitRate: Int
+    private var encoderFrameRate: Int32
     private var lastRateUpdate: Instant?
     private var refreshBitRate: Int
     private var lastQualityRefresh: Instant?
@@ -91,6 +94,7 @@ final class ServerConnection {
         self.context = context
         trace = HeartbeatTrace(layer: "session", diagnostics: context.diagnostics)
         targetBitRate = context.maximumVideoBitRate
+        encoderFrameRate = context.framesPerSecond
         refreshBitRate = context.maximumVideoBitRate
     }
 
@@ -139,6 +143,10 @@ final class ServerConnection {
             }
         }
         audioSendTask?.cancel()
+        frameForwardTask?.cancel()
+        frameForwardTask = nil
+        streamWake?.finish()
+        streamWake = nil
         if let source {
             try? await source.stop()
             self.source = nil
@@ -156,6 +164,7 @@ final class ServerConnection {
         self.failed = failed
         context.pointer?.end(for: pointerPeer)
         setup?.cancel()
+        streamWake?.yield(())
         let idle = Instant.now - lastSeen
         trace.write(
             peer,
@@ -166,7 +175,7 @@ final class ServerConnection {
     private func prepareVideo(_ source: any ScreenFrameSource) throws {
         let encoder = try VideoEncoder(
             width: source.width, height: source.height,
-            framesPerSecond: Int(context.framesPerSecond), bitRate: targetBitRate,
+            framesPerSecond: Int(encoderFrameRate), bitRate: targetBitRate,
             enableLongTermReferences: true)
         self.encoder = encoder
         video = VideoSession(
@@ -210,6 +219,7 @@ final class ServerConnection {
             guard bytes.count == 1 else { return }
             if !active { context.onEvent(.streamingStarted(peer: peer)) }
             active = true
+            streamWake?.yield(())
             trace.write(peer, "hello accepted")
         case .heartbeat:
             guard bytes.count == 1, active else {
@@ -239,6 +249,10 @@ final class ServerConnection {
     private func stream(_ session: NetworkMessageSession) async throws {
         var nextFrame = Instant.now
         var nextControl = nextFrame
+        let (wakes, wakeSink) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        streamWake = wakeSink
+        var wakeIterator = wakes.makeAsyncIterator()
+        var eventDriven = false
         while !stopping {
             let now = Instant.now
             if now - lastSeen >= SessionTiming.clientTimeout {
@@ -267,16 +281,58 @@ final class ServerConnection {
                     if let capture = source as? any AudioSource {
                         startAudio(capture, session: session)
                     }
+                    if let notifying = source as? any NotifyingScreenFrameSource {
+                        eventDriven = true
+                        let arrivals = notifying.frameArrivals
+                        frameForwardTask = Task {
+                            for await _ in arrivals { wakeSink.yield(()) }
+                            wakeSink.yield(())
+                        }
+                    }
                 }
                 guard let source, let video else { throw VideoSession.Failure.closed }
-                try await send(source, video: video, session: session, now: now)
+                try await send(source, video: video, session: session, now: now, eventDriven: eventDriven)
                 report(session, now: now)
             }
-            nextFrame += context.frameInterval
-            let sent = Instant.now
-            if nextFrame <= sent { nextFrame = sent + context.frameInterval }
-            try await Task.sleep(until: nextFrame, clock: .suspending)
+            if eventDriven {
+                let deadline = nextMaintenanceDeadline(from: Instant.now, nextControl: nextControl)
+                let timer = Task {
+                    try? await Task.sleep(until: deadline, clock: .suspending)
+                    wakeSink.yield(())
+                }
+                _ = await wakeIterator.next()
+                timer.cancel()
+            } else {
+                let interval = effectiveFrameInterval
+                nextFrame += interval
+                let sent = Instant.now
+                if nextFrame <= sent { nextFrame = sent + interval }
+                try await Task.sleep(until: nextFrame, clock: .suspending)
+            }
         }
+    }
+
+    /// Effective frame rate cap for current link conditions: full configured FPS on healthy
+    /// higher-bitrate links (e.g. 5 Mbps), stepping down to 30 fps when bitrate is tight or loss
+    /// is heavy so each frame gets twice the bit budget and half the per-second loss exposure.
+    private var effectiveFramesPerSecond: Int32 {
+        if context.framesPerSecond > 30 && (targetBitRate < 2_000_000 || protectedLoss >= 0.05) {
+            return 30
+        }
+        return context.framesPerSecond
+    }
+
+    private var effectiveFrameInterval: Duration {
+        .seconds(1) / Int(effectiveFramesPerSecond)
+    }
+
+    private func nextMaintenanceDeadline(from now: Instant, nextControl: Instant) -> Instant {
+        var deadline = now + .milliseconds(100)
+        if let lastCaptureSend {
+            deadline = min(deadline, lastCaptureSend + stillInterval)
+        }
+        deadline = min(deadline, nextControl, lastReport + SessionTiming.reportInterval)
+        return max(now + .milliseconds(5), deadline)
     }
 
     private func startAudio(_ capture: any AudioSource, session: NetworkMessageSession) {
@@ -307,7 +363,7 @@ final class ServerConnection {
 
     private func send(
         _ source: any ScreenFrameSource, video: VideoSession, session: NetworkMessageSession,
-        now: Instant
+        now: Instant, eventDriven: Bool
     ) async throws {
         let stats = session.statistics
         let budget = stats.bitsPerSecond
@@ -321,7 +377,7 @@ final class ServerConnection {
         // and is shared between the picture and its repair fragments.
         let target = min(
             maximum,
-            max(128_000, Int((budget * 0.85 - (sendsAudio ? Self.audioBitRate : 0)) / (1 + redundancy))))
+            max(128_000, Int((budget * 0.88 - (sendsAudio ? Self.audioBitRate : 0)) / (1 + redundancy))))
         if now.hasElapsed(.milliseconds(500), since: lastRateUpdate)
             && (abs(target - targetBitRate) > targetBitRate / 8
                 || (target == maximum && target != targetBitRate))
@@ -331,18 +387,31 @@ final class ServerConnection {
             targetBitRate = target
             lastRateUpdate = now
         }
+        let desiredFPS = effectiveFramesPerSecond
+        if desiredFPS != encoderFrameRate {
+            try encoder?.setExpectedFrameRate(Int(desiredFPS))
+            encoderFrameRate = desiredFPS
+        }
         // Skip before encoding so congestion does not break the prediction chain.
         guard let frame = try source.latestFrame() else { return }
         let capturePTS = frame.timestamp
         let changed = capturePTS != previousCapturePTS
+        let fastSharpen = targetBitRate >= 2_500_000
+        let settleDelay: Duration = fastSharpen ? .milliseconds(300) : .seconds(1)
+        let baseStillInterval: Duration = fastSharpen ? .milliseconds(250) : .milliseconds(500)
         if changed {
             lastImageChange = now
             refreshWhenStill = true
             sharpening = 0
-            stillInterval = .milliseconds(500)
+            stillInterval = baseStillInterval
         }
         // Send a still desktop again periodically so a lost frame can be recovered.
         guard changed || now.hasElapsed(stillInterval, since: lastCaptureSend) else { return }
+        if eventDriven, changed, desiredFPS < context.framesPerSecond,
+            !now.hasElapsed(effectiveFrameInterval - .milliseconds(2), since: lastCaptureSend)
+        {
+            return
+        }
         if Duration.seconds(stats.estimatedQueueDelay) > .milliseconds(50) {
             captureSkips += 1
             return
@@ -351,15 +420,17 @@ final class ServerConnection {
         if encoder?.supportsQuantizerLimit == true {
             // A picture that has come to rest is sharpened by ordinary frames, a step at a
             // time. Each is a fraction of a key frame, and losing one costs nothing but itself.
-            if !changed, now - lastImageChange >= .seconds(1) {
+            if !changed, now - lastImageChange >= settleDelay {
                 let steps = Self.sharpeningSteps(for: targetBitRate)
-                maximumQP = steps[min(sharpening, steps.count - 1)]
+                if sharpening < steps.count {
+                    maximumQP = steps[sharpening]
+                }
             }
         } else {
             // Without a quantizer limit only a key frame makes a still picture any finer.
             let settled =
                 Double(targetBitRate) <= budget && refreshWhenStill
-                && now - lastImageChange >= .seconds(1)
+                && now - lastImageChange >= settleDelay
             let improved =
                 targetBitRate >= refreshBitRate * 3 / 2
                 || (targetBitRate == maximum && refreshBitRate < targetBitRate)
@@ -381,13 +452,18 @@ final class ServerConnection {
                 roundTrip: stats.roundTripTime.map(Duration.seconds)),
             maximumQP: maximumQP, expectedLoss: protectedLoss)
         if let maximumQP, bytes > 0 {
-            if sharpening < Self.sharpeningSteps(for: targetBitRate).count {
+            let steps = Self.sharpeningSteps(for: targetBitRate)
+            if sharpening < steps.count {
                 log("still picture sharpened maxQP=\(maximumQP) bytes=\(bytes)")
             }
             sharpening += 1
-            // Give the link time to pay for one step before the next.
-            stillInterval = max(
-                .milliseconds(500), .seconds(Double(bytes) * 8 / Double(targetBitRate) * 1.5))
+            // Give the link time to pay for one step before the next, then relax to steady keepalive.
+            if sharpening < steps.count {
+                stillInterval = max(
+                    baseStillInterval, .seconds(Double(bytes) * 8 / Double(targetBitRate) * 1.5))
+            } else {
+                stillInterval = .milliseconds(500)
+            }
         }
     }
 
@@ -395,13 +471,18 @@ final class ServerConnection {
     /// gets its own share when it is sent: this is the average to budget for.
     private var videoRedundancy: Double {
         SessionTiming.frameRedundancy(
-            bytes: targetBitRate / 8 / max(1, Int(context.framesPerSecond)), loss: protectedLoss)
+            bytes: targetBitRate / 8 / max(1, Int(effectiveFramesPerSecond)), loss: protectedLoss)
     }
 
-    /// Quantizer limits for sharpening a still picture, coarsest first. Moving pictures and
-    /// key frames stop at 34. A slow link is not asked for the finest steps.
+    /// Quantizer limits for sharpening a still picture, coarsest first. Higher bitrates sharpen
+    /// faster and reach finer detail for crisp text.
     private static func sharpeningSteps(for bitRate: Int) -> [Int] {
-        bitRate < 500_000 ? [32] : bitRate < 1_000_000 ? [32, 29] : [32, 29, 26]
+        switch bitRate {
+        case ..<500_000: [32]
+        case ..<1_000_000: [32, 29]
+        case ..<2_500_000: [32, 29, 26]
+        default: [28, 24, 20]
+        }
     }
 
     /// Returns the bytes admitted, or zero if the frame was dropped or held back.
@@ -413,7 +494,7 @@ final class ServerConnection {
         do {
             let bytes = try await video.sendFrame(
                 pixels, presentationTime: pts,
-                duration: CMTime(value: 1, timescale: context.framesPerSecond),
+                duration: CMTime(value: 1, timescale: effectiveFramesPerSecond),
                 retryFor: retryBudget, maximumQP: maximumQP, expectedLoss: expectedLoss)
             if bytes == 0 {
                 keyFrameWaits += 1

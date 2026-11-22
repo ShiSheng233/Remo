@@ -9,7 +9,7 @@ public final class MessageTransport {
 
     /// How hard to try for one message. There is one kind of message: what used to be a
     /// reliable one is a message whose retry budget never runs out.
-    public struct Delivery {
+    public struct Delivery: Sendable {
         /// Lost fragments are retransmitted until this long after admission. Zero sends each
         /// fragment once. Infinity retransmits until the peer has the message or it is cancelled.
         public var retryBudget: TimeInterval
@@ -67,7 +67,7 @@ public final class MessageTransport {
             return nil
         }
     }
-    public enum Failure: Equatable {
+    public enum Failure: Equatable, Sendable {
         case sequenceExhausted
     }
     public enum Event {
@@ -81,7 +81,7 @@ public final class MessageTransport {
         case close(Failure)
     }
 
-    public struct Statistics {
+    public struct Statistics: Sendable {
         public let bitsPerSecond: Double
         public let roundTripTime: TimeInterval?
         /// The lowest round trip of the last several seconds: the path without any queueing.
@@ -308,9 +308,19 @@ public final class MessageTransport {
         return packets >= 20 && losses >= 3 ? min(1, Double(losses) / Double(packets)) : 0
     }
 
+    /// Fits inside IPv6's 1280-byte minimum MTU even after inner IPv4/UDP + WireGuard encapsulation
+    /// (20 + 8 + 1160 = 1188, padded to 1200, plus 32-byte WG + 48-byte outer IPv6/UDP = 1280).
+    public static let defaultDatagramLimit = 1160
+    /// Delayed ACK timer for in-order data. Kept under `tolerance / 2` (10 ms) so delayed ACKs
+    /// cannot look like queueing delay relative to immediate gap ACKs, while cutting reverse-path
+    /// ACK overhead over Wi-Fi and WireGuard.
+    static let delayedAckInterval: TimeInterval = 0.008
+    /// Send an immediate ACK after this many in-order data datagrams.
+    static let ackPacketThreshold = 10
+
     /// How many datagrams a message of `bytes` takes when it is sent with repair fragments,
     /// not counting those: what a share given as `Delivery.redundancy` is a share of.
-    public static func repairableFragments(in bytes: Int, datagramLimit: Int = 1200) -> Int {
+    public static func repairableFragments(in bytes: Int, datagramLimit: Int = defaultDatagramLimit) -> Int {
         let capacity = datagramLimit - Wire.repairableHeader
         return max(1, (bytes + capacity - 1) / capacity)
     }
@@ -321,7 +331,7 @@ public final class MessageTransport {
     /// the order they complete, not the order they were sent. The adapter owns peer selection
     /// and session isolation.
     public init?(
-        datagramLimit: Int = 1200, initialRate: Double = MessageTransport.initialRate,
+        datagramLimit: Int = defaultDatagramLimit, initialRate: Double = MessageTransport.initialRate,
         clock: @escaping () -> TimeInterval,
         dataHandler: @escaping (Data) -> Void,
         ioHandler: @escaping (IORequest) -> Bool
@@ -464,23 +474,21 @@ public final class MessageTransport {
             var wake = nextDeadline(now)
             if !blocked {
                 let ackReady = ackDue.map { $0 <= now } ?? false
-                let key = ackReady ? nil : candidate(now)
-                if ackReady || key != nil {
-                    let msg = key.flatMap { messages[$0.id] }
-                    let cost = key.map { msg!.size($0.index) + msg!.header } ?? 13
+                if ackReady {
+                    // ACKs are tiny control datagrams: do not charge them to outbound data pacing
+                    // credit or mix them into `windowBytes`.
+                    if ioHandler(.sendDatagram(Wire.ack(largest, bitmap))) {
+                        ackDue = nil
+                        ackCount = 0
+                    } else {
+                        blocked = true
+                    }
+                    continue
+                }
+                if let key = candidate(now), let msg = messages[key.id] {
+                    let cost = msg.size(key.index) + msg.header
                     if credit + 1e-7 >= Double(cost) {
-                        if ackReady {
-                            if ioHandler(.sendDatagram(Wire.ack(largest, bitmap))) {
-                                ackDue = nil
-                                ackCount = 0
-                                credit -= 13
-                                windowBytes += 13
-                            } else {
-                                blocked = true
-                            }
-                        } else if let key, let msg {
-                            transmit(key, msg)
-                        }
+                        transmit(key, msg)
                         continue
                     }
                     wake = min(wake, max(now.nextUp, now + (Double(cost) - credit) * 8 / rate))
@@ -523,8 +531,8 @@ public final class MessageTransport {
             bitmap |= UInt64(1) << (largest - number)
         }
         ackCount += 1
-        let urgent = duplicate || gap || ackCount >= 8
-        ackDue = min(ackDue ?? .infinity, urgent ? now : now + 0.005)
+        let urgent = duplicate || gap || ackCount >= Self.ackPacketThreshold
+        ackDue = min(ackDue ?? .infinity, urgent ? now : now + Self.delayedAckInterval)
         if let complete { dataHandler(complete) }
     }
 
@@ -550,7 +558,9 @@ public final class MessageTransport {
                     acknowledgedBytes += record.bytes
                     windowAcknowledged += record.bytes
                     confirmations += 1
-                    if sample == nil { sample = elapsed }
+                    // Sample RTT only when `largest` itself is newly acknowledged (RFC 9002), so
+                    // out-of-order older packets do not inflate RTT and variance.
+                    if offset == 0 { sample = elapsed }
                 }
             }
             guard let attempt = attempts[number] else { continue }
@@ -792,7 +802,7 @@ public final class MessageTransport {
                 // Probe upward only while the budget is being used, and gently near a rate
                 // that recently proved too much.
                 let nearMark = capacityMark.map { now - $0.at < 20 && rate >= $0.rate * 0.98 } ?? false
-                rate = min(100_000_000, probeCeiling, rate * (nearMark ? 1.002 : startup ? 1.05 : 1.02))
+                rate = min(100_000_000, probeCeiling, rate * (nearMark ? 1.002 : startup ? 1.08 : 1.03))
             }
             if rate >= recoveryCeiling { recoveryCeiling = 0 }
         } else if probeAt != nil {
