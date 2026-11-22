@@ -39,7 +39,7 @@ struct FrameChangeDetector {
                 previous[index] = luma
             }
         }
-        if hasPrevious && changed * 100 >= 4 * count { lastChange = time }
+        if hasPrevious && changed * 100 >= 2 * count { lastChange = time }
         // Bridge brief gaps in an animation while letting a settled desktop refine.
         return lastChange.map { time >= $0 && time - $0 < 0.12 } ?? false
     }

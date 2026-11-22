@@ -199,3 +199,61 @@ func deepBufferDoesNotHoldAStandingQueue(capacity: Double) {
     #expect(link.budget > 4_800_000)
     #expect(link.dropped == 0)
 }
+
+@Test func shortHighBitrateBurstsRampBudgetOnALowRTTLink() {
+    var now = 0.0
+    var wireFree = 0.0
+    var deadlines = [Double.infinity, Double.infinity]
+    var inbound = [[(arrival: Double, bytes: Data)](), []]
+    var dropped = 0
+    var endpoints: [MessageTransport] = []
+    for side in 0..<2 {
+        endpoints.append(MessageTransport(
+            clock: { now }, dataHandler: { _ in },
+            ioHandler: { req in
+                switch req {
+                case .setTimer(let deadline): deadlines[side] = deadline ?? .infinity
+                case .sendDatagram(let bytes):
+                    var arrival = now + 0.0025
+                    if side == 0 {
+                        if wireFree - now > 0.05 {
+                            dropped += 1
+                            return true
+                        }
+                        wireFree = max(wireFree, now) + Double(bytes.count) * 8 / 100_000_000
+                        arrival = wireFree + 0.0025
+                    }
+                    inbound[1 - side].append((arrival, bytes))
+                case .close(let failure): Issue.record("Unexpected transport close: \(failure)")
+                }
+                return true
+            })!)
+    }
+    // Repeat a desktop animation cycle: 1.2 s mostly still, then a 0.35 s high-detail burst.
+    for tick in 0..<9_000 {
+        now = Double(tick) / 1000
+        for side in 0..<2 {
+            while let packet = inbound[side].first, packet.arrival <= now {
+                inbound[side].removeFirst()
+                endpoints[side].handleEvent(.datagram(packet.bytes))
+            }
+            if deadlines[side] <= now {
+                deadlines[side] = .infinity
+                endpoints[side].handleEvent(.timer)
+            }
+        }
+        let phase = tick % 1550
+        if phase >= 1200, tick.isMultiple(of: 17), endpoints[0].statistics.estimatedQueueDelay <= 0.075 {
+            endpoints[0].send(Data(count: 65_000), delivery: .init(retryBudget: 0.1))
+        } else if tick.isMultiple(of: 500) {
+            endpoints[0].send(Data(count: 1_500), delivery: .init(retryBudget: 0.1))
+        }
+        if tick.isMultiple(of: 20) {
+            endpoints[0].send(
+                Data(count: 250),
+                delivery: .init(retryBudget: 0, firstSendDeadline: now + 0.1, priority: .high))
+        }
+    }
+    #expect(endpoints[0].statistics.bitsPerSecond > 20_000_000)
+    #expect(dropped == 0)
+}

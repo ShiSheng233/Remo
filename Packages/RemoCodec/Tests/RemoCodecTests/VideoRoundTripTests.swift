@@ -382,11 +382,49 @@ func recoveryAfterLostReference(acknowledge: Bool) async throws {
 }
 
 @Test func bitrateAdaptiveQuantizerFloorsRelaxAtHigherBitRates() {
-    #expect(VideoEncoder.motionMinimumQP(for: 500_000) == 34)
-    #expect(VideoEncoder.motionMinimumQP(for: 1_200_000) == 30)
-    #expect(VideoEncoder.motionMinimumQP(for: 2_000_000) == 26)
-    #expect(VideoEncoder.motionMinimumQP(for: 2_500_000) == 22)
-    #expect(VideoEncoder.motionMinimumQP(for: 5_000_000) == 18)
+    #expect(VideoEncoder.motionMinimumQP(for: 1_500_000) == 36)
+    #expect(VideoEncoder.motionMinimumQP(for: 5_000_000) == 34)
+    #expect(VideoEncoder.motionMinimumQP(for: 8_000_000) == 30)
+    #expect(VideoEncoder.motionMinimumQP(for: 12_000_000) == 26)
+    #expect(VideoEncoder.motionMinimumQP(for: 20_000_000) == 22)
     #expect(VideoEncoder.keyFrameMinimumQP(for: 2_000_000) == 34)
-    #expect(VideoEncoder.keyFrameMinimumQP(for: 5_000_000) == 30)
+    #expect(VideoEncoder.keyFrameMinimumQP(for: 5_000_000) == 32)
+    #expect(VideoEncoder.keyFrameMinimumQP(for: 10_000_000) == 30)
+}
+
+@Test func explicitMinimumQPShrinksDetailedFrame() async throws {
+    guard #available(macOS 13.0, iOS 16.0, *) else { return }
+    let encoder = try VideoEncoder(
+        width: width, height: height, framesPerSecond: 30, bitRate: 5_000_000)
+    guard encoder.supportsQuantizerLimit else { return }
+    let basePixels = try makePixels()
+    try fill(basePixels, index: 0)
+    _ = try await encoder.encode(
+        basePixels, presentationTime: CMTime(value: 0, timescale: 30),
+        duration: CMTime(value: 1, timescale: 30), refresh: .none)
+
+    func makeNoisyFrame(seed initial: UInt32) throws -> CVPixelBuffer {
+        let pixels = try makePixels()
+        try #require(CVPixelBufferLockBaseAddress(pixels, []) == kCVReturnSuccess)
+        defer { CVPixelBufferUnlockBaseAddress(pixels, []) }
+        let base = try #require(CVPixelBufferGetBaseAddressOfPlane(pixels, 0))
+            .assumingMemoryBound(to: UInt8.self)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0)
+        var seed = initial
+        for y in 0..<height {
+            for x in 0..<width {
+                seed = seed &* 1_664_525 &+ 1_013_904_223
+                base[y * stride + x] = 32 + UInt8(seed >> 25)
+            }
+        }
+        return pixels
+    }
+
+    let fine = try await encoder.encode(
+        try makeNoisyFrame(seed: 1), presentationTime: CMTime(value: 1, timescale: 30),
+        duration: CMTime(value: 1, timescale: 30), refresh: .none, minimumQP: nil)
+    let coarse = try await encoder.encode(
+        try makeNoisyFrame(seed: 2), presentationTime: CMTime(value: 2, timescale: 30),
+        duration: CMTime(value: 1, timescale: 30), refresh: .none, minimumQP: 46)
+    #expect(CMSampleBufferGetTotalSampleSize(coarse) < CMSampleBufferGetTotalSampleSize(fine))
 }

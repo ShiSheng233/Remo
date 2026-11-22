@@ -416,15 +416,20 @@ final class ServerConnection {
         {
             return
         }
-        if Duration.seconds(stats.estimatedQueueDelay) > .milliseconds(50) {
+        let maxQueueDelay: Duration = (stats.roundTripTime ?? 0.1) < 0.02 ? .milliseconds(90) : .milliseconds(75)
+        if Duration.seconds(stats.estimatedQueueDelay) > maxQueueDelay {
             captureSkips += 1
             return
         }
+        let minimumQP =
+            encoder?.supportsQuantizerLimit == true
+            ? Self.queuePressureMinimumQP(queueDelay: stats.estimatedQueueDelay, bitRate: targetBitRate)
+            : nil
         var maximumQP: Int?
         if encoder?.supportsQuantizerLimit == true {
             // A picture that has come to rest is sharpened by ordinary frames, a step at a
             // time. Each is a fraction of a key frame, and losing one costs nothing but itself.
-            if !changed, now - lastImageChange >= settleDelay {
+            if !changed, minimumQP == nil, now - lastImageChange >= settleDelay {
                 let steps = Self.sharpeningSteps(for: targetBitRate)
                 if sharpening < steps.count {
                     maximumQP = steps[sharpening]
@@ -454,7 +459,7 @@ final class ServerConnection {
             video: video,
             retryFor: SessionTiming.frameRetryBudget(
                 roundTrip: stats.roundTripTime.map(Duration.seconds)),
-            maximumQP: maximumQP, expectedLoss: protectedLoss)
+            minimumQP: minimumQP, maximumQP: maximumQP, expectedLoss: protectedLoss)
         if let maximumQP, bytes > 0 {
             let steps = Self.sharpeningSteps(for: targetBitRate)
             if sharpening < steps.count {
@@ -489,17 +494,31 @@ final class ServerConnection {
         }
     }
 
+    /// Raises the quantizer floor once the local send queue exceeds the transport's backlog
+    /// threshold (35 ms), trading moving-frame sharpness for compact frames so animations stay
+    /// fluid without starving pacer-limited bandwidth probing or hitting capture skips.
+    nonisolated static func queuePressureMinimumQP(queueDelay: TimeInterval, bitRate: Int) -> Int? {
+        guard queueDelay > 0.035 else { return nil }
+        let base = VideoEncoder.motionMinimumQP(for: bitRate)
+        switch queueDelay {
+        case ..<0.050: return min(45, base + 4)
+        case ..<0.065: return min(46, base + 8)
+        default: return min(48, base + 12)
+        }
+    }
+
     /// Returns the bytes admitted, or zero if the frame was dropped or held back.
     private func submit(
         _ pixels: CVPixelBuffer, pts: CMTime, video: VideoSession, retryFor retryBudget: Duration,
-        maximumQP: Int?, expectedLoss: Double
+        minimumQP: Int?, maximumQP: Int?, expectedLoss: Double
     ) async throws -> Int {
         frames += 1
         do {
             let bytes = try await video.sendFrame(
                 pixels, presentationTime: pts,
                 duration: CMTime(value: 1, timescale: effectiveFramesPerSecond),
-                retryFor: retryBudget, maximumQP: maximumQP, expectedLoss: expectedLoss)
+                retryFor: retryBudget, minimumQP: minimumQP, maximumQP: maximumQP,
+                expectedLoss: expectedLoss)
             if bytes == 0 {
                 keyFrameWaits += 1
                 // This picture was not sent. Offer it again once the key frame has arrived,

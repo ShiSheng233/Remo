@@ -563,3 +563,19 @@ func delayedBootstrapAndLostFrames(scenario: LossScenario) async throws {
     }
     #expect(clean.allSatisfy { $0.delivery.redundancy == 0 })
 }
+
+@Test func queuePressureRaisesQuantizerFloorAboveBacklogThreshold() {
+    #expect(ServerConnection.queuePressureMinimumQP(queueDelay: 0.0, bitRate: 5_000_000) == nil)
+    #expect(ServerConnection.queuePressureMinimumQP(queueDelay: 0.020, bitRate: 5_000_000) == nil)
+    #expect(ServerConnection.queuePressureMinimumQP(queueDelay: 0.035, bitRate: 5_000_000) == nil)
+    let low = ServerConnection.queuePressureMinimumQP(queueDelay: 0.040, bitRate: 5_000_000)
+    let mid = ServerConnection.queuePressureMinimumQP(queueDelay: 0.055, bitRate: 5_000_000)
+    let high = ServerConnection.queuePressureMinimumQP(queueDelay: 0.070, bitRate: 5_000_000)
+    #expect(low == 38)
+    #expect(mid == 42)
+    #expect(high == 46)
+    // Lower bitrate floor caps safely within HEVC QP bounds.
+    #expect(ServerConnection.queuePressureMinimumQP(queueDelay: 0.070, bitRate: 1_500_000) == 48)
+    // Higher LAN bitrate starts from a finer motion floor.
+    #expect(ServerConnection.queuePressureMinimumQP(queueDelay: 0.040, bitRate: 20_000_000) == 26)
+}

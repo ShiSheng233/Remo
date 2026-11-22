@@ -272,6 +272,12 @@ public final class MessageTransport {
     private var windowBytes = 0
     private var windowAcknowledged = 0
     private var windowPackets = 0
+    /// Whether the local pacer built a meaningful backlog (>35 ms) during the current 0.25 s window.
+    private var windowBacklogged = false
+    /// Earliest send time and latest ACK time of packets confirmed in the current window, used to
+    /// measure the active burst delivery rate when short UI animations saturate the pacer.
+    private var windowFirstConfirmedSend: TimeInterval?
+    private var windowLastConfirmedAt: TimeInterval?
     private var probeReducedRate = false
     // Recovery acts on a timeout immediately. Rate control waits one full observation
     // window so a later bitmap can clear that exact transmission, even after payload eviction.
@@ -398,6 +404,7 @@ public final class MessageTransport {
         messages[lastMessage] = Message(
             data, mtu: datagramLimit, now: now, delivery: delivery, onOutcome: onOutcome)
         if let key = delivery.replacing { replaceable[key] = lastMessage }
+        if queueDelay > 0.035 { windowBacklogged = true }
         let id = MessageID(rawValue: lastMessage)
         drive()
         return .queued(id)
@@ -563,6 +570,8 @@ public final class MessageTransport {
                 if elapsed <= 2 {
                     windowAcknowledged += record.bytes
                     confirmations += 1
+                    windowFirstConfirmedSend = min(windowFirstConfirmedSend ?? record.sent, record.sent)
+                    windowLastConfirmedAt = max(windowLastConfirmedAt ?? now, now)
                     // Sample RTT only when `largest` itself is newly acknowledged (RFC 9002), so
                     // out-of-order older packets do not inflate RTT and variance.
                     if offset == 0 { sample = elapsed }
@@ -707,6 +716,9 @@ public final class MessageTransport {
             windowBytes = 0
             windowAcknowledged = 0
             windowPackets = 0
+            windowBacklogged = false
+            windowFirstConfirmedSend = nil
+            windowLastConfirmedAt = nil
             windowFastestRTT = nil
             agingLosses = suspectedLosses
             suspectedLosses.removeAll(keepingCapacity: true)
@@ -837,15 +849,46 @@ public final class MessageTransport {
             probeAt == nil, lossTrial == nil, now >= holdUntil
         {
             healthyFeedbackTime += min(interval, 0.5)
+            // When the local pacer itself was backlogged (>35 ms) during a clean 0.25 s window and
+            // we are not draining after a congestion backoff, measure the active burst delivery rate
+            // so short high-bitrate desktop bursts (like opening a Dock grid) prove link capacity
+            // without waiting for a full quiet-free second to lift the 1 s average.
+            let nearMark = capacityMark.map { now - $0.at < 20 && rate >= $0.rate * 0.98 } ?? false
+            var pacerLimited = false
+            var burstRate = 0.0
+            if history.count >= 2, recoveryCeiling == 0, !nearMark, windowBacklogged,
+                confirmations >= 8, windowAcknowledged >= 8 * datagramLimit,
+                let firstSend = windowFirstConfirmedSend, let lastAck = windowLastConfirmedAt
+            {
+                let activeSpan = min(interval, max(0.06, lastAck - firstSend - (minimumRTT ?? 0)))
+                burstRate = Double(windowAcknowledged) * 8 / activeSpan
+                if burstRate >= rate * 0.70 {
+                    pacerLimited = true
+                    deliveryRate = max(deliveryRate, min(rate, burstRate))
+                }
+            }
             if min(recoveryCeiling, probeCeiling) > rate && healthyFeedbackTime >= 0.5 {
                 // The queue has emptied: return to what the link was just shown to carry.
                 rate = min(recoveryCeiling, probeCeiling, rate * 1.15)
                 healthyFeedbackTime = 0
-            } else if (queued || utilized) && probeCeiling > rate {
-                // Probe upward only while the budget is being used, and gently near a rate
-                // that recently proved too much.
-                let nearMark = capacityMark.map { now - $0.at < 20 && rate >= $0.rate * 0.98 } ?? false
-                rate = min(100_000_000, probeCeiling, rate * (nearMark ? 1.002 : startup ? 1.05 : 1.02))
+            } else if (queued || utilized || pacerLimited) && (pacerLimited || probeCeiling > rate) {
+                // Probe upward when the budget is used. Ramp aggressively when the pacer itself
+                // is bottlenecking clean bursts (especially on low-RTT LAN paths during startup),
+                // and gently near a recently confirmed capacity mark.
+                let lowRTT = (minimumRTT ?? .infinity) < 0.02
+                let step: Double
+                let ceiling: Double
+                if nearMark {
+                    step = 1.002
+                    ceiling = probeCeiling
+                } else if pacerLimited {
+                    step = startup ? (lowRTT ? 2.0 : 1.50) : (lowRTT ? 1.40 : 1.20)
+                    ceiling = max(probeCeiling, min(rate, burstRate) * step)
+                } else {
+                    step = startup ? 1.05 : 1.02
+                    ceiling = probeCeiling
+                }
+                rate = min(100_000_000, ceiling, rate * step)
             }
             if rate >= recoveryCeiling { recoveryCeiling = 0 }
         } else if probeAt != nil {

@@ -31,21 +31,21 @@ public final class VideoEncoder {
     static func keyFrameMinimumQP(for bitRate: Int) -> Int {
         switch bitRate {
         case ..<3_000_000: 34
-        case ..<4_500_000: 32
+        case ..<8_000_000: 32
         default: 30
         }
     }
 
-    /// Motion quantizer floor scales smoothly with the target bit rate so moderate desktop motion
-    /// on 2.5–5 Mbps links spends available headroom on sharper detail rather than stalling rate
-    /// probing behind an artificial QP ceiling.
-    static func motionMinimumQP(for bitRate: Int) -> Int {
+    /// Motion quantizer floor trades moving-frame sharpness for fluid frame rate on constrained
+    /// links (e.g. 5 Mbps, where 1920×1200 @ 60 fps averages ~10 KB/frame) and relaxes on higher
+    /// bandwidth LAN links. Still pictures sharpen afterwards via `maximumQP`.
+    public static func motionMinimumQP(for bitRate: Int) -> Int {
         switch bitRate {
-        case ..<800_000: 34
-        case ..<1_500_000: 30
-        case ..<2_200_000: 26
-        case ..<3_000_000: 22
-        default: 18
+        case ..<2_500_000: 36
+        case ..<6_000_000: 34
+        case ..<10_000_000: 30
+        case ..<16_000_000: 26
+        default: 22
         }
     }
 
@@ -126,11 +126,12 @@ public final class VideoEncoder {
                 value: framesPerSecond as CFNumber), "set encoder frame rate")
     }
 
-    /// Best-effort peak bitrate guardrail (1.25x average over a 0.5 s window) to curb bursts after
-    /// scene cuts or long still periods. Returns false if the active encoder does not support it.
+    /// Best-effort peak bitrate guardrail (2.0x average over a 1.0 s window) to curb runaway VBV
+    /// explosions after long still periods without forcing VideoToolbox to drop frames during short
+    /// UI animations (such as opening a Dock grid or switching spaces).
     private static func setDataRateLimits(on session: VTCompressionSession, bitRate: Int) throws -> Bool {
-        let period = 0.5
-        let bytes = max(16_384, Int(Double(bitRate) * 1.25 / 8.0 * period))
+        let period = 1.0
+        let bytes = max(65_536, Int(Double(bitRate) * 2.0 / 8.0 * period))
         let limits = [NSNumber(value: bytes), NSNumber(value: period)] as CFArray
         let status = VTSessionSetProperty(
             session, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
@@ -155,12 +156,14 @@ public final class VideoEncoder {
     /// Pass new acknowledgements on normal submissions. For recovery, supply tokens the receiver
     /// can still use in the current prediction chain, even if they were acknowledged previously.
     ///
-    /// `maximumQP` makes a predicted frame of a still picture at least that fine, which sharpens
-    /// what a coarser frame left behind. It is ignored for key frames and moving pictures.
+    /// `minimumQP` optionally raises the quantizer floor (for example, under send-queue pressure)
+    /// to keep frames small and fluid instead of skipping them. `maximumQP` makes a predicted
+    /// frame of a still picture at least that fine, which sharpens what a coarser frame left
+    /// behind; it is ignored for key frames, moving pictures, and when `minimumQP` is raised.
     public nonisolated(nonsending) func encode(
         _ pixels: CVPixelBuffer, presentationTime: CMTime, duration: CMTime = .invalid,
         refresh: Refresh, acknowledgedReferences: [LongTermReferenceToken] = [],
-        maximumQP: Int? = nil
+        minimumQP: Int? = nil, maximumQP: Int? = nil
     ) async throws -> CMSampleBuffer {
         guard longTermReferences || acknowledgedReferences.isEmpty else {
             throw VideoCodecError.invalidConfiguration
@@ -191,8 +194,11 @@ public final class VideoEncoder {
                 ? Self.keyFrameMinimumQP(for: bitRate)
                 : Self.motionMinimumQP(for: bitRate)
             let coarse = max(targetFloor, defaultMinimumQP)
-            let minimum = independent || moving ? coarse : defaultMinimumQP
-            let maximum = independent || moving ? Self.unlimitedQP : max(minimum, maximumQP ?? Self.unlimitedQP)
+            let baseMinimum = independent || moving ? coarse : defaultMinimumQP
+            let minimum = min(Self.unlimitedQP, max(baseMinimum, minimumQP ?? defaultMinimumQP))
+            let maximum =
+                independent || moving || minimumQP != nil
+                ? Self.unlimitedQP : max(minimum, maximumQP ?? Self.unlimitedQP)
             // Keep the floor at or below the ceiling at every step.
             if maximum >= appliedMaximumQP { try limit(maximum: maximum) }
             if minimum != appliedMinimumQP {

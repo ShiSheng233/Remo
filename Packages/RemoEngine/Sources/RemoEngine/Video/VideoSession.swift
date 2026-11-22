@@ -112,7 +112,8 @@ final class VideoSession {
     nonisolated(nonsending) func sendFrame(
         _ pixels: CVPixelBuffer, presentationTime: CMTime,
         duration: CMTime, retryFor retryBudget: Duration = .milliseconds(80),
-        sendWithin firstSendLimit: Duration? = nil, maximumQP: Int? = nil, expectedLoss: Double = 0
+        sendWithin firstSendLimit: Duration? = nil, minimumQP: Int? = nil, maximumQP: Int? = nil,
+        expectedLoss: Double = 0
     ) async throws -> Int {
         guard !closed else { throw Failure.closed }
         guard let encoder else { throw Failure.encoderUnavailable }
@@ -132,7 +133,8 @@ final class VideoSession {
         do {
             sample = try await encoder.encode(
                 pixels, presentationTime: presentationTime, duration: duration,
-                refresh: request, acknowledgedReferences: tokens, maximumQP: maximumQP)
+                refresh: request, acknowledgedReferences: tokens,
+                minimumQP: minimumQP, maximumQP: maximumQP)
         } catch {
             if refresh == .none { refresh = request }
             if !tokens.isEmpty { newAcknowledgement = true }
