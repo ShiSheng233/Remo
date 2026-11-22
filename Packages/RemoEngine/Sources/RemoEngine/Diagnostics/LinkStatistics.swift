@@ -8,6 +8,8 @@ public struct LinkStatistics: Sendable {
     public let minimumRoundTripTime: Duration?
     /// The share of data datagrams lost over about the last second.
     public let lossRatio: Double
+    /// The part of `lossRatio` that sending less would not remove.
+    public let linkLossRatio: Double
     /// Estimated sending budget in bits per second.
     public let bitsPerSecond: Double
     public let queueDelay: Duration
@@ -18,6 +20,7 @@ public struct LinkStatistics: Sendable {
         roundTripTime = statistics.roundTripTime.map(Duration.seconds)
         minimumRoundTripTime = statistics.minimumRoundTripTime.map(Duration.seconds)
         lossRatio = statistics.lossRatio
+        linkLossRatio = statistics.linkLossRatio
         bitsPerSecond = statistics.bitsPerSecond
         queueDelay = .seconds(statistics.estimatedQueueDelay)
         audioExpiredBeforeFirstSend = statistics.expiredBeforeFirstSend[.high, default: 0]

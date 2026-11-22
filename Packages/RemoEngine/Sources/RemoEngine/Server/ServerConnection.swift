@@ -59,6 +59,10 @@ final class ServerConnection {
     /// Steps taken so far in sharpening the picture that is at rest now.
     private var sharpening = 0
     private var stillInterval = Duration.milliseconds(500)
+    /// The link's own loss as last seen, fading over seconds so that a quiet moment between
+    /// losses does not take the protection away.
+    private var protectedLoss = 0.0
+    private var protectedLossAt = Instant.now
 
     // Audio
     private var audioSendTask: Task<Void, Never>?
@@ -308,10 +312,16 @@ final class ServerConnection {
         let stats = session.statistics
         let budget = stats.bitsPerSecond
         let maximum = context.maximumVideoBitRate
+        protectedLoss = max(
+            stats.linkLossRatio, protectedLoss * pow(0.5, (now - protectedLossAt) / .seconds(5)))
+        protectedLossAt = now
+        let redundancy = videoRedundancy
         // Audio is sent first whatever the video does, so it comes off the top. The rest keeps
-        // a margin for retransmissions and for frames larger than the encoder was asked for.
+        // a margin for retransmissions and for frames larger than the encoder was asked for,
+        // and is shared between the picture and its repair fragments.
         let target = min(
-            maximum, max(128_000, Int(budget * 0.85 - (sendsAudio ? Self.audioBitRate : 0))))
+            maximum,
+            max(128_000, Int((budget * 0.85 - (sendsAudio ? Self.audioBitRate : 0)) / (1 + redundancy))))
         if now.hasElapsed(.milliseconds(500), since: lastRateUpdate)
             && (abs(target - targetBitRate) > targetBitRate / 8
                 || (target == maximum && target != targetBitRate))
@@ -369,7 +379,7 @@ final class ServerConnection {
             video: video,
             retryFor: SessionTiming.frameRetryBudget(
                 roundTrip: stats.roundTripTime.map(Duration.seconds)),
-            maximumQP: maximumQP)
+            maximumQP: maximumQP, expectedLoss: protectedLoss)
         if let maximumQP, bytes > 0 {
             if sharpening < Self.sharpeningSteps(for: targetBitRate).count {
                 log("still picture sharpened maxQP=\(maximumQP) bytes=\(bytes)")
@@ -381,6 +391,13 @@ final class ServerConnection {
         }
     }
 
+    /// What repair fragments add to a frame of the size the encoder is aiming for. Each frame
+    /// gets its own share when it is sent: this is the average to budget for.
+    private var videoRedundancy: Double {
+        SessionTiming.frameRedundancy(
+            bytes: targetBitRate / 8 / max(1, Int(context.framesPerSecond)), loss: protectedLoss)
+    }
+
     /// Quantizer limits for sharpening a still picture, coarsest first. Moving pictures and
     /// key frames stop at 34. A slow link is not asked for the finest steps.
     private static func sharpeningSteps(for bitRate: Int) -> [Int] {
@@ -390,14 +407,14 @@ final class ServerConnection {
     /// Returns the bytes admitted, or zero if the frame was dropped or held back.
     private func submit(
         _ pixels: CVPixelBuffer, pts: CMTime, video: VideoSession, retryFor retryBudget: Duration,
-        maximumQP: Int?
+        maximumQP: Int?, expectedLoss: Double
     ) async throws -> Int {
         frames += 1
         do {
             let bytes = try await video.sendFrame(
                 pixels, presentationTime: pts,
                 duration: CMTime(value: 1, timescale: context.framesPerSecond),
-                retryFor: retryBudget, maximumQP: maximumQP)
+                retryFor: retryBudget, maximumQP: maximumQP, expectedLoss: expectedLoss)
             if bytes == 0 {
                 keyFrameWaits += 1
                 // This picture was not sent. Offer it again once the key frame has arrived,
@@ -432,6 +449,7 @@ final class ServerConnection {
             videoBitsPerSecond: Double(videoBytes - previousBytes) * 8 / seconds,
             framesGenerated: frames, framesQueued: queued, backpressureDrops: backpressureDrops,
             codecDrops: codecDrops, encoderBitRate: targetBitRate,
+            videoRedundancy: videoRedundancy,
             captureSkips: captureSkips, keyFrameWaits: keyFrameWaits,
             acknowledgedReferences: acknowledgedReferences, controlsSent: controls,
             heartbeatsReceived: heartbeats, dataPacketsAccepted: transport.acceptedDataPackets - previousAcceptedDataPackets,

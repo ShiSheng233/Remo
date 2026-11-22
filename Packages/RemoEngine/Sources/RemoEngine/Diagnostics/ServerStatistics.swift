@@ -18,6 +18,8 @@ public struct ServerStatistics: Sendable {
     public let codecDrops: UInt64
     /// The adaptive encoder bit rate.
     public let encoderBitRate: Int
+    /// Repair fragments added to predicted frames, as a share of each frame.
+    public let videoRedundancy: Double
     /// Source frames skipped because the send queue was too deep.
     public let captureSkips: Int
     /// Frames withheld while a key frame was still on its way to the client.
@@ -39,7 +41,7 @@ extension ServerStatistics: CustomStringConvertible {
     public var description: String {
         var details =
             "generated=\(framesGenerated) queued=\(framesQueued) backpressureDrops=\(backpressureDrops) codecDrops=\(codecDrops)"
-            + " encoderBps=\(encoderBitRate) captureSkips=\(captureSkips) keyFrameWaits=\(keyFrameWaits)"
+            + " encoderBps=\(encoderBitRate) fec=\(Int((videoRedundancy * 100).rounded()))% captureSkips=\(captureSkips) keyFrameWaits=\(keyFrameWaits)"
             + " ltrAcks=\(acknowledgedReferences) controlsQueued=\(controlsSent) heartbeatsRx=\(heartbeatsReceived)"
         if let audio, audio.packetsQueued > 0 || audio.backpressureDrops > 0 {
             details +=

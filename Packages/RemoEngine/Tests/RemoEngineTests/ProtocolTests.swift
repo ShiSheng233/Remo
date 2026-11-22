@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 
+import RemoTransport
+
 @testable import RemoEngine
 
 @Test func onlyVideoKindsGoToTheVideoSession() {
@@ -16,5 +18,26 @@ import Testing
     #expect(message.encoded.count == 9)
     for invalid in [message.encoded.dropLast(), message.encoded + [0], MessageKind.heartbeat.encoded] {
         #expect(throws: WireFormatError.self) { try ControlMessage(decoding: invalid) }
+    }
+}
+
+@Test func frameRedundancyFollowsLossAndFrameSize() {
+    let frame = 8000
+    #expect(MessageTransport.repairableFragments(in: frame) == 7)
+    // Too little loss to act on, and a frame that would have to be sent twice.
+    #expect(SessionTiming.frameRedundancy(bytes: frame, loss: 0.005) == 0)
+    #expect(SessionTiming.frameRedundancy(bytes: 1000, loss: 0.1) == 0)
+    // One repair fragment makes seven arrive whole 98 times in 100 at 3% loss. At 10% it
+    // takes three.
+    #expect(SessionTiming.frameRedundancy(bytes: frame, loss: 0.03) == 1.0 / 7)
+    #expect(SessionTiming.frameRedundancy(bytes: frame, loss: 0.1) == 3.0 / 7)
+    // Never more than half the frame again, however bad the link.
+    #expect(SessionTiming.frameRedundancy(bytes: 2000, loss: 0.3) == 0.5)
+    #expect(SessionTiming.frameRedundancy(bytes: frame, loss: 1) == 3.0 / 7)
+    var previous = 0.0
+    for loss in stride(from: 0.0, through: 0.3, by: 0.01) {
+        let share = SessionTiming.frameRedundancy(bytes: 20_000, loss: loss)
+        #expect(share >= previous && share <= 0.5)
+        previous = share
     }
 }

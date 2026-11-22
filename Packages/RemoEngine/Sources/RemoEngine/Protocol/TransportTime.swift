@@ -26,15 +26,17 @@ enum ReplaceableMessage: Int {
 
 extension MessageTransport.Delivery {
     /// Retries for `budget` after admission, and drops what can't be sent within `sendWithin`.
+    /// `redundancy` adds repair fragments, as a share of the message's own.
     static func retrying(
         for budget: Duration = .zero, sendWithin limit: Duration? = nil,
-        priority: MessageTransport.Priority = .normal, replacing key: ReplaceableMessage? = nil
+        priority: MessageTransport.Priority = .normal, replacing key: ReplaceableMessage? = nil,
+        redundancy: Double = 0
     ) -> Self {
         let now = TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1e9
         return Self(
             retryBudget: budget.timeInterval,
             firstSendDeadline: limit.map { now + $0.timeInterval }, priority: priority,
-            replacing: key?.rawValue)
+            replacing: key?.rawValue, redundancy: redundancy)
     }
 
     /// A small message the session depends on: retried until it arrives, ahead of media.

@@ -8,6 +8,8 @@ struct Receiver {
 
     private struct Assembly {
         let count: Int
+        /// The size of the last data fragment, for a message sent with repair fragments.
+        let last: Int?
         /// When the sender stops retransmitting, as far as its fragments have said.
         var retryEnd: TimeInterval
         var parts: [Int: Data] = [:]
@@ -35,8 +37,11 @@ struct Receiver {
 
     /// Returns whether to acknowledge, whether this is a duplicate, and any complete message.
     /// A fragment that isn't acknowledged was not kept, so the sender retries it.
+    /// `last` is given for a message sent with repair fragments, which completes as soon as
+    /// any `count` of its fragments are here.
     mutating func accept(
-        _ key: Wire.Fragment, count: Int, lifetime: TimeInterval, data: Data, now: TimeInterval
+        _ key: Wire.Fragment, count: Int, last: Int? = nil, lifetime: TimeInterval, data: Data,
+        now: TimeInterval
     ) -> (Bool, Bool, Data?) {
         let id = key.id
         if id > highest {
@@ -48,16 +53,20 @@ struct Receiver {
                 for old in assemblies.keys where old < floor { remove(old) }
             }
         }
-        if highest - id >= Wire.messageWindow || finished.contains(id) { return (true, true, nil) }
+        if highest - id >= Wire.messageWindow || finished.contains(id) {
+            // Fragments beyond the ones that completed a repairable message are expected, and
+            // say nothing about the sender having missed an acknowledgement.
+            return (true, last == nil, nil)
+        }
         if let existing = assemblies[id] {
-            guard existing.count == count else { return (false, false, nil) }
+            guard existing.count == count, existing.last == last else { return (false, false, nil) }
             if let previous = existing.parts[key.index] {
                 guard previous == data else { return (false, true, nil) }
                 assemblies[id]!.retryEnd = max(existing.retryEnd, now + lifetime)
                 return (true, true, nil)
             }
         }
-        if count == 1 {
+        if count == 1 && key.index == 0 {
             finished.insert(id)
             return (true, false, data)
         }
@@ -75,17 +84,28 @@ struct Receiver {
             finished.insert(stale)
         }
         // Mutate in place: a copy of the assembly would copy every part on each fragment.
-        if assemblies[id] == nil { assemblies[id] = Assembly(count: count, retryEnd: now + lifetime) }
+        if assemblies[id] == nil {
+            assemblies[id] = Assembly(count: count, last: last, retryEnd: now + lifetime)
+        }
         assemblies[id]!.retryEnd = max(assemblies[id]!.retryEnd, now + lifetime)
         assemblies[id]!.parts[key.index] = Data(data)
         assemblies[id]!.size += data.count
         buffered += data.count
         guard assemblies[id]!.parts.count == count else { return (true, false, nil) }
         let complete = assemblies[id]!
-        var payload = Data(capacity: complete.size)
-        for index in 0..<count { payload.append(complete.parts[index]!) }
         remove(id)
         finished.insert(id)
+        var fragments: [Data]?
+        if let last {
+            let length = complete.parts.values.reduce(0) { max($0, $1.count) }
+            fragments = Repair.decode(complete.parts, count: count, length: length)
+            if let rebuilt = fragments?[count - 1] { fragments![count - 1] = rebuilt.prefix(last) }
+        } else {
+            fragments = (0..<count).map { complete.parts[$0]! }
+        }
+        guard let fragments else { return (true, false, nil) }
+        var payload = Data(capacity: complete.size)
+        for fragment in fragments { payload.append(fragment) }
         return (true, false, payload)
     }
 }

@@ -112,7 +112,7 @@ final class VideoSession {
     nonisolated(nonsending) func sendFrame(
         _ pixels: CVPixelBuffer, presentationTime: CMTime,
         duration: CMTime, retryFor retryBudget: Duration = .milliseconds(80),
-        sendWithin firstSendLimit: Duration? = nil, maximumQP: Int? = nil
+        sendWithin firstSendLimit: Duration? = nil, maximumQP: Int? = nil, expectedLoss: Double = 0
     ) async throws -> Int {
         guard !closed else { throw Failure.closed }
         guard let encoder else { throw Failure.encoderUnavailable }
@@ -174,8 +174,11 @@ final class VideoSession {
             onEvent(.sentKeyFrame(frame: id, bytes: packet.count))
         } else {
             do {
-                message = try send(packet, .retrying(for: retryBudget, sendWithin: firstSendLimit)) {
-                    [weak self] outcome in
+                // Key frames above are retried until they arrive, and need no repair fragments.
+                let redundancy = SessionTiming.frameRedundancy(bytes: packet.count, loss: expectedLoss)
+                message = try send(
+                    packet, .retrying(for: retryBudget, sendWithin: firstSendLimit, redundancy: redundancy)
+                ) { [weak self] outcome in
                     if outcome == .expired { self?.loseFrame(id) }
                 }
             } catch {

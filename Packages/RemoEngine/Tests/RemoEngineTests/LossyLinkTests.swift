@@ -149,11 +149,12 @@ struct LinkQuality: CustomStringConvertible, Sendable {
 }
 
 /// The whole path, with the real encoder and decoder: a session keeps a moving picture going
-/// through loss, repairs it without key frames, and never freezes for long.
+/// through loss, repairs it without key frames, and never freezes for long. The last link is
+/// too slow for a retransmission to arrive in time, so only repair fragments can carry it.
 @Test(.serialized, arguments: [
     LinkQuality(loss: 0, delay: .milliseconds(40)),
     LinkQuality(loss: 0.03, delay: .milliseconds(10)),
-    LinkQuality(loss: 0.10, delay: .milliseconds(40)),
+    LinkQuality(loss: 0.10, delay: .milliseconds(75)),
 ]) @MainActor
 func movingPictureSurvivesALossyLink(link: LinkQuality) async throws {
     var port: UInt16?
@@ -204,10 +205,10 @@ func movingPictureSurvivesALossyLink(link: LinkQuality) async throws {
         format: "LOSSY %@: %.1f fps, longest gap %.0f ms, gaps over 100 ms %d (%.1f%% of the time), requests %d, key frames %d",
         "\(link)", rate, longest / .milliseconds(1), gaps.filter { $0 > .milliseconds(100) }.count,
         100 * frozen / span, requests.value, keyFrames.value))
-    // Retransmission repairs light loss unseen. Heavy loss costs frames, but not the session
-    // and not a string of key frames.
-    #expect(rate > (link.loss < 0.05 ? 24 : 8))
-    #expect(longest < (link.loss < 0.05 ? .milliseconds(400) : .milliseconds(2000)))
+    // Repair fragments and retransmission hide light loss. Heavy loss on a slow link still
+    // costs a frame now and then, but not the session and not a string of key frames.
+    #expect(rate > (link.loss < 0.05 ? 24 : 18))
+    #expect(longest < (link.loss < 0.05 ? .milliseconds(400) : .milliseconds(1000)))
     #expect(keyFrames.value <= 2)
 
     server.stop()

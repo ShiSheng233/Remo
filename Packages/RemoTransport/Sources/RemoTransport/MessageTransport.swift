@@ -20,15 +20,21 @@ public final class MessageTransport {
         /// Cancels the unfinished message last admitted with the same key, for state where only
         /// the newest value matters.
         public var replacing: Int?
+        /// Repair fragments to send after the message's own, as a share of their number and
+        /// rounded to the nearest whole fragment. The peer rebuilds the message from any of
+        /// its fragments, as many as it had before repair, so that much loss costs no round
+        /// trip. A message of a single datagram gets a second one from a half upward.
+        public var redundancy: Double
 
         public init(
             retryBudget: TimeInterval = 0, firstSendDeadline: TimeInterval? = nil,
-            priority: Priority = .normal, replacing key: Int? = nil
+            priority: Priority = .normal, replacing key: Int? = nil, redundancy: Double = 0
         ) {
             self.retryBudget = retryBudget
             self.firstSendDeadline = firstSendDeadline
             self.priority = priority
             replacing = key
+            self.redundancy = redundancy
         }
 
         public static func untilDelivered(priority: Priority = .normal, replacing key: Int? = nil) -> Self {
@@ -43,9 +49,10 @@ public final class MessageTransport {
 
     /// How a message ended. None is reported once the transport has closed.
     public enum Outcome: Equatable, Sendable {
-        /// The peer acknowledged every fragment.
+        /// The peer acknowledged every fragment, or enough of them to rebuild the message.
         case delivered
-        /// Its first-send deadline passed, or a fragment was lost with no retry budget left.
+        /// Its first-send deadline passed, or too many fragments were lost with no retry
+        /// budget left.
         case expired
         /// Cancelled or replaced. Fragments already sent can still complete at the peer.
         case cancelled
@@ -81,6 +88,10 @@ public final class MessageTransport {
         public let minimumRoundTripTime: TimeInterval?
         /// The share of data datagrams lost over about the last second.
         public let lossRatio: Double
+        /// The part of `lossRatio` that sending less would not remove: loss that stayed when
+        /// the rate was reduced, or too little to be worth testing. Redundancy sized by this
+        /// does not answer congestion with more traffic.
+        public let linkLossRatio: Double
         /// Includes retransmissions. Standalone ACK datagrams use no packet number.
         public let acceptedDataPackets: UInt32
         public let blocked: Bool
@@ -100,7 +111,9 @@ public final class MessageTransport {
 
     private final class Message {
         let data: Data
+        /// Data fragments. Repair fragments are numbered after them.
         let count: Int
+        let repair: Int
         let capacity: Int
         /// Retransmissions stop here. Infinite for a message that must arrive.
         let deadline: TimeInterval
@@ -110,11 +123,14 @@ public final class MessageTransport {
         var firstDeadline: TimeInterval?
         var cursor = 0
         var retries: Set<Int> = []
+        /// Lost fragments that repair fragments still in play may make up for.
+        var spare: Set<Int> = []
         /// Consecutive timeouts per fragment, for retransmission backoff.
         var timeouts: [Int: Int] = [:]
         /// Fragments neither acknowledged nor given up on.
         var remaining: Int
-        var abandoned = false
+        var confirmed = 0
+        private var parity: [Data]?
 
         init(
             _ data: Data, mtu: Int, now: TimeInterval, delivery: Delivery,
@@ -124,20 +140,62 @@ public final class MessageTransport {
             key = delivery.replacing
             self.onOutcome = onOutcome
             self.data = data
-            capacity =
-                data.count <= mtu - Wire.singleHeader
-                ? mtu - Wire.singleHeader : mtu - Wire.fragmentHeader
+            let protected = mtu - Wire.repairableHeader
+            let fragments = (data.count + protected - 1) / protected
+            var repair = 0
+            if delivery.redundancy > 0, fragments <= Repair.maxData {
+                repair = Int(min(Double(Repair.maxRepair), (Double(fragments) * delivery.redundancy).rounded()))
+            }
+            self.repair = repair
+            if repair > 0 {
+                capacity = protected
+            } else {
+                capacity =
+                    data.count <= mtu - Wire.singleHeader
+                    ? mtu - Wire.singleHeader : mtu - Wire.fragmentHeader
+            }
             count = (data.count + capacity - 1) / capacity
-            remaining = count
+            remaining = count + repair
             deadline = now + delivery.retryBudget
             firstDeadline = delivery.firstSendDeadline
         }
 
-        func size(_ index: Int) -> Int { min(capacity, data.count - index * capacity) }
-        var header: Int { count == 1 ? Wire.singleHeader : Wire.fragmentHeader }
+        var total: Int { count + repair }
+        /// Repair fragments are as long as the longest data fragment.
+        private var repairSize: Int { min(capacity, data.count) }
+        func size(_ index: Int) -> Int {
+            index < count ? min(capacity, data.count - index * capacity) : repairSize
+        }
+        var header: Int {
+            repair > 0 ? Wire.repairableHeader : count == 1 ? Wire.singleHeader : Wire.fragmentHeader
+        }
         var queuedBytes: Int {
-            let fresh = max(0, data.count - cursor * capacity) + (count - cursor) * header
+            let fresh =
+                max(0, data.count - cursor * capacity) + (total - max(cursor, count)) * repairSize
+                + (total - cursor) * header
             return retries.reduce(fresh) { $0 + size($1) + header }
+        }
+
+        /// Queues lost fragments for retransmission, as few as the message still needs: the
+        /// peer can do without any fragment that enough of the others arrive in place of.
+        func reinforce() {
+            while confirmed + remaining - spare.count < count, let index = spare.min() {
+                spare.remove(index)
+                retries.insert(index)
+            }
+        }
+
+        func payload(_ index: Int) -> Data {
+            func fragment(_ index: Int) -> Data {
+                let start = data.startIndex + index * capacity
+                return data[start..<(start + size(index))]
+            }
+            guard index >= count else { return fragment(index) }
+            // Made when the first one is sent: an acknowledgement often gets there first.
+            if parity == nil {
+                parity = Repair.encode((0..<count).map(fragment), repair: repair, length: repairSize)
+            }
+            return parity![index - count]
         }
     }
 
@@ -250,6 +308,13 @@ public final class MessageTransport {
         return packets >= 20 && losses >= 3 ? min(1, Double(losses) / Double(packets)) : 0
     }
 
+    /// How many datagrams a message of `bytes` takes when it is sent with repair fragments,
+    /// not counting those: what a share given as `Delivery.redundancy` is a share of.
+    public static func repairableFragments(in bytes: Int, datagramLimit: Int = 1200) -> Int {
+        let capacity = datagramLimit - Wire.repairableHeader
+        return max(1, (bytes + capacity - 1) / capacity)
+    }
+
     /// Return false for sendDatagram only if the datagram was not accepted.
     /// After that, signal writable to resume. Other request return values are ignored.
     /// Data and outcome callbacks run synchronously, and may send or cancel. Messages arrive in
@@ -283,7 +348,7 @@ public final class MessageTransport {
         for msg in messages.values { queued[msg.priority, default: 0] += msg.queuedBytes }
         return Statistics(
             bitsPerSecond: rate, roundTripTime: rtt, minimumRoundTripTime: minimumRTT,
-            lossRatio: lossRatio, acceptedDataPackets: lastPacket, blocked: blocked, probing: probeAt != nil,
+            lossRatio: lossRatio, linkLossRatio: min(lossRatio, toleratedLoss), acceptedDataPackets: lastPacket, blocked: blocked, probing: probeAt != nil,
             estimatedQueueDelay: queueDelay, queuedBytes: queued,
             expiredBeforeFirstSend: expiredBeforeFirstSend)
     }
@@ -437,22 +502,30 @@ public final class MessageTransport {
             guard number <= lastPacket else { return }
             acknowledge(number, bits, now)
         case .data(let number, let key, let count, let lifetime, let payload):
-            let (accepted, duplicate, complete) = receiver.accept(
-                key, count: count, lifetime: lifetime, data: payload, now: now)
-            guard accepted else { return }
-            let gap = UInt64(number) != UInt64(largest) + 1
-            if number > largest {
-                bitmap = (bitmap << (number - largest)) | 1
-                largest = number
-            } else {
-                bitmap |= UInt64(1) << (largest - number)
-            }
-            ackCount += 1
-            let urgent = duplicate || gap || ackCount >= 8
-            ackDue = min(ackDue ?? .infinity, urgent ? now : now + 0.005)
-            if let complete { dataHandler(complete) }
+            accept(number, receiver.accept(key, count: count, lifetime: lifetime, data: payload, now: now), now)
+        case .repairable(let number, let key, let count, let last, let lifetime, let payload):
+            accept(
+                number,
+                receiver.accept(key, count: count, last: last, lifetime: lifetime, data: payload, now: now),
+                now)
         case nil: break
         }
+    }
+
+    private func accept(_ number: UInt32, _ result: (Bool, Bool, Data?), _ now: TimeInterval) {
+        let (accepted, duplicate, complete) = result
+        guard accepted else { return }
+        let gap = UInt64(number) != UInt64(largest) + 1
+        if number > largest {
+            bitmap = (bitmap << (number - largest)) | 1
+            largest = number
+        } else {
+            bitmap |= UInt64(1) << (largest - number)
+        }
+        ackCount += 1
+        let urgent = duplicate || gap || ackCount >= 8
+        ackDue = min(ackDue ?? .infinity, urgent ? now : now + 0.005)
+        if let complete { dataHandler(complete) }
     }
 
     private func acknowledge(_ largest: UInt32, _ bits: UInt64, _ now: TimeInterval) {
@@ -501,9 +574,16 @@ public final class MessageTransport {
             for key in confirmed {
                 guard let msg = messages[key.id] else { continue }
                 msg.retries.remove(key.index)
+                msg.spare.remove(key.index)
                 msg.timeouts[key.index] = nil
                 msg.remaining -= 1
-                if msg.remaining == 0 { finish(key.id, msg.abandoned ? .expired : .delivered) }
+                msg.confirmed += 1
+                // With repair fragments, the peer has the message once it has this many.
+                if msg.confirmed >= msg.count {
+                    finish(key.id, .delivered)
+                } else if msg.remaining == 0 {
+                    finish(key.id, .expired)
+                }
             }
             attempts = attempts.filter { !confirmed.contains($0.value.key) }
         }
@@ -531,20 +611,23 @@ public final class MessageTransport {
         // acknowledgement can still confirm the fragment.
         if viable(msg, now) {
             if timeout { msg.timeouts[key.index] = min(5, msg.timeouts[key.index, default: 0] + 1) }
-            msg.retries.insert(key.index)
+            msg.spare.insert(key.index)
+            msg.reinforce()
         } else {
+            for index in msg.spare { abandon(.init(id: key.id, index: index), msg) }
             abandon(key, msg)
         }
     }
 
-    /// Gives up on one fragment. The message can no longer complete, but its other fragments
-    /// still run their course: a loss verdict can be wrong, and the fragment may have arrived.
+    /// Gives up on one fragment. Unless repair fragments make up for it the message can no
+    /// longer complete, but its other fragments still run their course: a loss verdict can be
+    /// wrong, and the fragment may have arrived.
     private func abandon(_ key: Wire.Fragment, _ msg: Message) {
         attempts = attempts.filter { $0.value.key != key }
         msg.retries.remove(key.index)
+        msg.spare.remove(key.index)
         msg.timeouts[key.index] = nil
         msg.remaining -= 1
-        msg.abandoned = true
         if msg.remaining == 0 { finish(key.id, .expired) }
     }
 
@@ -556,7 +639,7 @@ public final class MessageTransport {
                 finish(id, .expired)
             } else if now >= msg.deadline {
                 // Fragments still in flight are settled by their acknowledgement or timeout.
-                for index in msg.retries { abandon(.init(id: id, index: index), msg) }
+                for index in msg.retries.union(msg.spare) { abandon(.init(id: id, index: index), msg) }
             }
         }
         for (number, attempt) in attempts {
@@ -738,7 +821,7 @@ public final class MessageTransport {
                 if viable(msg, now) { return key }
                 abandon(key, msg)
             }
-            if msg.cursor < msg.count { return .init(id: id, index: msg.cursor) }
+            if msg.cursor < msg.total { return .init(id: id, index: msg.cursor) }
         }
         return nil
     }
@@ -748,10 +831,14 @@ public final class MessageTransport {
             close(.sequenceExhausted)
             return
         }
-        let start = msg.data.startIndex + key.index * msg.capacity
-        let bytes = Wire.data(
-            lastPacket + 1, key, msg.count, lifetime: msg.deadline - clock(),
-            msg.data[start..<(start + msg.size(key.index))])
+        let lifetime = msg.deadline - clock()
+        let payload = msg.payload(key.index)
+        let bytes =
+            msg.repair > 0
+            ? Wire.repairable(
+                lastPacket + 1, key, count: msg.count, last: msg.size(msg.count - 1), lifetime: lifetime,
+                payload)
+            : Wire.data(lastPacket + 1, key, msg.count, lifetime: lifetime, payload)
         guard ioHandler(.sendDatagram(bytes)) else {
             blocked = true
             return
@@ -759,6 +846,7 @@ public final class MessageTransport {
         lastPacket += 1
         if msg.retries.remove(key.index) == nil {
             msg.cursor += 1
+            // Repair fragments are extra: the first-send deadline is met without them.
             if msg.cursor == msg.count { msg.firstDeadline = nil }
         }
         let sent = clock()

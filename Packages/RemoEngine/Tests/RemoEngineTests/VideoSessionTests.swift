@@ -509,3 +509,55 @@ func delayedBootstrapAndLostFrames(scenario: LossScenario) async throws {
     #expect(errors[2] < errors[1] && errors[3] < errors[2] && errors[4] < errors[3])
     #expect(Double(errors[4]) < 0.6 * Double(errors[0]))
 }
+
+@Test @MainActor func predictedFramesCarryRepairFragmentsOnALossyLink() async throws {
+    let encoder = try VideoEncoder(
+        width: 640, height: 360, framesPerSecond: 30, bitRate: 2_000_000,
+        enableLongTermReferences: true)
+    var sent: [(frame: VideoFrameMessage, bytes: Int, loss: Double, delivery: MessageTransport.Delivery)] = []
+    var loss = 0.0
+    let session = VideoSession(
+        encoder: encoder,
+        send: { data, delivery, onOutcome in
+            sent.append((try VideoFrameMessage(data), data.count, loss, delivery))
+            onOutcome?(.delivered)
+            return nil
+        },
+        onFrame: { _, _, _ in }, onFailure: { Issue.record("Unexpected failure: \($0)") })
+    defer { session.close() }
+    let pixels = try makePixels(640, 360)
+    var seed: UInt32 = 1
+    for index in 0..<12 {
+        // New detail in every frame, so that predicted frames take several datagrams.
+        try #require(CVPixelBufferLockBaseAddress(pixels, []) == kCVReturnSuccess)
+        let base = CVPixelBufferGetBaseAddressOfPlane(pixels, 0)!.assumingMemoryBound(to: UInt8.self)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0)
+        for y in 0..<360 {
+            for x in 0..<640 {
+                if x.isMultiple(of: 4) { seed = seed &* 1_664_525 &+ 1_013_904_223 }
+                base[y * stride + x] = 48 + UInt8(seed >> 25)
+            }
+        }
+        memset(
+            CVPixelBufferGetBaseAddressOfPlane(pixels, 1)!, 128,
+            CVPixelBufferGetBytesPerRowOfPlane(pixels, 1) * 180)
+        CVPixelBufferUnlockBaseAddress(pixels, [])
+        loss = index < 6 ? 0.1 : 0
+        do {
+            _ = try await session.sendFrame(
+                pixels, presentationTime: CMTime(value: Int64(index), timescale: 30),
+                duration: CMTime(value: 1, timescale: 30), expectedLoss: loss)
+        } catch VideoCodecError.frameDropped {}
+    }
+    let key = try #require(sent.first)
+    // The key frame is retried until it arrives instead.
+    #expect(key.frame.kind == .idr && key.delivery.retryBudget == .infinity && key.delivery.redundancy == 0)
+    let lossy = sent.dropFirst().filter { $0.loss > 0 }
+    let clean = sent.filter { $0.loss == 0 }
+    try #require(!lossy.isEmpty && !clean.isEmpty)
+    #expect(lossy.contains { $0.delivery.redundancy > 0 })
+    for frame in lossy {
+        #expect(frame.delivery.redundancy == SessionTiming.frameRedundancy(bytes: frame.bytes, loss: 0.1))
+    }
+    #expect(clean.allSatisfy { $0.delivery.redundancy == 0 })
+}
