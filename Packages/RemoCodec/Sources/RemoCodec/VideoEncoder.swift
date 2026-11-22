@@ -36,14 +36,16 @@ public final class VideoEncoder {
         }
     }
 
-    /// Motion quantizer floor scales with the target bit rate so higher-bandwidth links (such as
-    /// 5 Mbps) spend their budget on crisp motion instead of being clamped to a low-rate floor.
+    /// Motion quantizer floor scales smoothly with the target bit rate so moderate desktop motion
+    /// on 2.5–5 Mbps links spends available headroom on sharper detail rather than stalling rate
+    /// probing behind an artificial QP ceiling.
     static func motionMinimumQP(for bitRate: Int) -> Int {
         switch bitRate {
-        case ..<1_000_000: 34
-        case ..<2_000_000: 31
-        case ..<3_500_000: 27
-        default: 24
+        case ..<800_000: 34
+        case ..<1_500_000: 30
+        case ..<2_200_000: 26
+        case ..<3_000_000: 22
+        default: 18
         }
     }
 

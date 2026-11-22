@@ -184,3 +184,18 @@ func deepBufferDoesNotHoldAStandingQueue(capacity: Double) {
     #expect(link.demand > 0.6 * link.capacity && link.demand < 1.15 * link.capacity)
     #expect(Double(link.dropped) / Double(link.sent) < 0.02)
 }
+
+@Test func budgetClimbsToFiveMegabitThroughBriefQuietDips() {
+    let link = Bottleneck()
+    link.capacity = 10_000_000
+    link.maximumVideo = 5_000_000
+    // Climb for 3 s, dip to low-motion traffic for 1 s, then resume moderate motion.
+    link.advance(seconds: 3)
+    let savedMax = link.maximumVideo
+    link.maximumVideo = 900_000
+    link.advance(seconds: 1)
+    link.maximumVideo = savedMax
+    link.advance(seconds: 10)
+    #expect(link.budget > 4_800_000)
+    #expect(link.dropped == 0)
+}

@@ -297,8 +297,10 @@ final class ServerConnection {
             if eventDriven {
                 let deadline = nextMaintenanceDeadline(from: Instant.now, nextControl: nextControl)
                 let timer = Task {
-                    try? await Task.sleep(until: deadline, clock: .suspending)
-                    wakeSink.yield(())
+                    do {
+                        try await Task.sleep(until: deadline, clock: .suspending)
+                        wakeSink.yield(())
+                    } catch {}
                 }
                 _ = await wakeIterator.next()
                 timer.cancel()
@@ -378,10 +380,12 @@ final class ServerConnection {
         let target = min(
             maximum,
             max(128_000, Int((budget * 0.88 - (sendsAudio ? Self.audioBitRate : 0)) / (1 + redundancy))))
-        if now.hasElapsed(.milliseconds(500), since: lastRateUpdate)
-            && (abs(target - targetBitRate) > targetBitRate / 8
-                || (target == maximum && target != targetBitRate))
-        {
+        let shouldUpdateRate =
+            target < targetBitRate * 9 / 10
+            || (now.hasElapsed(.milliseconds(300), since: lastRateUpdate)
+                && (abs(target - targetBitRate) > targetBitRate / 20
+                    || (target == maximum && target != targetBitRate)))
+        if shouldUpdateRate {
             try encoder?.setBitRate(target)
             refreshBitRate = min(refreshBitRate, target)
             targetBitRate = target

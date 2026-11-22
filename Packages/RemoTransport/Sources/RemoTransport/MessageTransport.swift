@@ -201,6 +201,8 @@ public final class MessageTransport {
 
     private struct Attempt {
         let key: Wire.Fragment
+        let sent: TimeInterval
+        let bytes: Int
         var expires: TimeInterval?
     }
 
@@ -219,6 +221,7 @@ public final class MessageTransport {
     private var expiredBeforeFirstSend: [Priority: UInt64] = [:]
     private var lastPacket: UInt32 = 0
     private var attempts: [UInt32: Attempt] = [:]
+    private var inFlightBytes = 0
     private var highConfirmed: [UInt32] = []
     private var largest: UInt32 = 0
     private var bitmap: UInt64 = 0
@@ -257,12 +260,15 @@ public final class MessageTransport {
         let bytes: Int
     }
     private var deliveryRecords = Array<DeliveryRecord?>(repeating: nil, count: 8192)
-    private var deliverySampleAt: TimeInterval
-    private var acknowledgedBytes = 0
     private var deliveryRate = 0.0
     // The budget may run ahead of what was delivered, but only by one step: an application that
     // spends most of its budget then asks the link for a quarter more than it has shown.
     private var probeCeiling: Double { deliveryRate * 1.5 }
+    /// Cap unacknowledged bytes in flight to ~2× BDP + 50 ms so a sudden link stall cannot pour
+    /// unbounded packets into a bottleneck buffer before rate control reacts.
+    private var maxInFlightBytes: Int {
+        max(4 * datagramLimit, Int(rate * max(0.15, (rtt ?? 0.1) * 2.0 + 0.05) / 8))
+    }
     private var windowBytes = 0
     private var windowAcknowledged = 0
     private var windowPackets = 0
@@ -346,7 +352,6 @@ public final class MessageTransport {
         creditAt = clock()
         lastDataSend = creditAt
         sampleAt = creditAt
-        deliverySampleAt = creditAt
         floorRotatedAt = creditAt
     }
 
@@ -427,6 +432,7 @@ public final class MessageTransport {
         replaceable.removeAll()
         outcomes.removeAll()
         attempts.removeAll()
+        inFlightBytes = 0
         events.removeAll()
         if armed != nil {
             armed = nil
@@ -555,7 +561,6 @@ public final class MessageTransport {
                 newDelivery = true
                 let elapsed = max(0, now - record.sent)
                 if elapsed <= 2 {
-                    acknowledgedBytes += record.bytes
                     windowAcknowledged += record.bytes
                     confirmations += 1
                     // Sample RTT only when `largest` itself is newly acknowledged (RFC 9002), so
@@ -595,7 +600,10 @@ public final class MessageTransport {
                     finish(key.id, .expired)
                 }
             }
-            attempts = attempts.filter { !confirmed.contains($0.value.key) }
+            for (number, attempt) in attempts where confirmed.contains(attempt.key) {
+                if attempt.expires != nil { inFlightBytes = max(0, inFlightBytes - attempt.bytes) }
+                attempts.removeValue(forKey: number)
+            }
         }
         if highConfirmed.count == 3 {
             for (number, attempt) in attempts
@@ -611,7 +619,10 @@ public final class MessageTransport {
 
     private func lose(_ number: UInt32, _ attempt: Attempt, _ now: TimeInterval, timeout: Bool) {
         suspectedLosses.insert(number)
-        attempts[number]?.expires = nil
+        if attempts[number]?.expires != nil {
+            inFlightBytes = max(0, inFlightBytes - attempt.bytes)
+            attempts[number]?.expires = nil
+        }
         let key = attempt.key
         guard let msg = messages[key.id] else {
             attempts.removeValue(forKey: number)
@@ -633,7 +644,10 @@ public final class MessageTransport {
     /// longer complete, but its other fragments still run their course: a loss verdict can be
     /// wrong, and the fragment may have arrived.
     private func abandon(_ key: Wire.Fragment, _ msg: Message) {
-        attempts = attempts.filter { $0.value.key != key }
+        for (number, attempt) in attempts where attempt.key == key {
+            if attempt.expires != nil { inFlightBytes = max(0, inFlightBytes - attempt.bytes) }
+            attempts.removeValue(forKey: number)
+        }
         msg.retries.remove(key.index)
         msg.spare.remove(key.index)
         msg.timeouts[key.index] = nil
@@ -672,20 +686,6 @@ public final class MessageTransport {
             probeReducedRate = true
             reduceRate()
         }
-        // Use wall-clock delivery windows, including idle time between ACK bursts.
-        let deliveryInterval = now - deliverySampleAt
-        if deliveryInterval >= 1 {
-            let measured = Double(acknowledgedBytes) * 8 / deliveryInterval
-            if deliveryInterval > 2 {
-                deliveryRate = 0
-            } else if deliveryRate == 0 {
-                deliveryRate = measured
-            } else {
-                deliveryRate = (deliveryRate + measured) / 2
-            }
-            deliverySampleAt = now
-            acknowledgedBytes = 0
-        }
         if now >= floorRotatedAt + 5 {
             previousFloorRTT = floorRTT
             floorRTT = nil
@@ -697,6 +697,11 @@ public final class MessageTransport {
                 interval: interval, sent: windowBytes, acknowledged: windowAcknowledged,
                 packets: windowPackets, losses: agingLosses.count))
             if history.count > 4 { history.removeFirst() }
+            if interval > 1.5 {
+                deliveryRate = 0
+            } else {
+                updateDeliveryRate()
+            }
             adjustRate(now, interval: interval)
             confirmations = 0
             windowBytes = 0
@@ -707,6 +712,39 @@ public final class MessageTransport {
             suspectedLosses.removeAll(keepingCapacity: true)
             sampleAt = now
         }
+    }
+
+    /// Tracks the rolling 1-second delivered rate every 0.25 s, rising immediately when more
+    /// traffic is confirmed and decaying gently (~1.1 s half-life) across brief quiet dips.
+    /// Requires at least 0.5 s of history so a single short burst does not establish a rate.
+    private func updateDeliveryRate() {
+        let duration = history.reduce(0.0) { $0 + $1.interval }
+        guard history.count >= 2, duration >= 0.45 else { return }
+        let bytes = history.reduce(0) { $0 + $1.acknowledged }
+        let measured = Double(bytes) * 8 / duration
+        if deliveryRate == 0 {
+            deliveryRate = measured
+        } else if measured >= deliveryRate {
+            // Rise smoothly every 0.25 s (~0.6 s half-life) so rate climbs promptly without
+            // overshooting shallow buffers on a sudden demand jump.
+            deliveryRate = deliveryRate * 0.75 + measured * 0.25
+        } else {
+            // Decay gently (~1.4 s half-life) so brief 1-second quiet spells do not stall probing.
+            deliveryRate = deliveryRate * 0.88 + measured * 0.12
+        }
+    }
+
+    /// Re-anchors `deliveryRate` to what the link actually carried right before backoff so stale
+    /// pre-congestion peaks cannot prematurely reopen `probeCeiling`.
+    private func resetDeliveryRateAfterBackoff() {
+        let recent = history.suffix(2)
+        let duration = recent.reduce(0.0) { $0 + $1.interval }
+        guard duration > 0 else {
+            deliveryRate = 0
+            return
+        }
+        let bytes = recent.reduce(0) { $0 + $1.acknowledged }
+        deliveryRate = min(deliveryRate, Double(bytes) * 8 / duration)
     }
 
     /// One step of rate control, on a quarter second of evidence.
@@ -768,14 +806,19 @@ public final class MessageTransport {
                 return
             }
             // A standing queue means the link is saturated, so what it delivered of what was
-            // sent is what it can carry. Settle a little under that, and go lower still for
-            // as long as it takes the queue to empty.
+            // sent (excluding packets still within one RTT of transmission) is what it can carry.
             let recent = history.suffix(2)
             let sent = recent.reduce(0) { $0 + $1.sent }
             let acknowledged = recent.reduce(0) { $0 + $1.acknowledged }
-            let carried = sent > 0 ? max(0.25, min(1, Double(acknowledged) / Double(sent))) : 1
+            let rttWindow = rtt ?? 0.05
+            let youngInFlight = attempts.values.reduce(0) { sum, attempt in
+                attempt.expires != nil && now - attempt.sent <= rttWindow ? sum + attempt.bytes : sum
+            }
+            let eligibleSent = max(acknowledged, sent - youngInFlight)
+            let carried = eligibleSent > 0 ? max(0.25, min(1, Double(acknowledged) / Double(eligibleSent))) : 1
             let sustainable = max(Self.minimumRate, rate * 0.9 * carried)
             startup = false
+            resetDeliveryRateAfterBackoff()
             recoveryCeiling = sustainable
             capacityMark = (sustainable, now)
             rate = max(Self.minimumRate, sustainable * max(0.5, 1 - queueDelay))
@@ -802,7 +845,7 @@ public final class MessageTransport {
                 // Probe upward only while the budget is being used, and gently near a rate
                 // that recently proved too much.
                 let nearMark = capacityMark.map { now - $0.at < 20 && rate >= $0.rate * 0.98 } ?? false
-                rate = min(100_000_000, probeCeiling, rate * (nearMark ? 1.002 : startup ? 1.08 : 1.03))
+                rate = min(100_000_000, probeCeiling, rate * (nearMark ? 1.002 : startup ? 1.05 : 1.02))
             }
             if rate >= recoveryCeiling { recoveryCeiling = 0 }
         } else if probeAt != nil {
@@ -811,6 +854,7 @@ public final class MessageTransport {
     }
 
     private func reduceRate() {
+        resetDeliveryRateAfterBackoff()
         recoveryCeiling = max(recoveryCeiling, min(rate, deliveryRate))
         healthyFeedbackTime = 0
         startup = false
@@ -818,7 +862,11 @@ public final class MessageTransport {
     }
 
     private func candidate(_ now: TimeInterval) -> Wire.Fragment? {
-        if let probeAt, now < probeAt { return nil }
+        if let probeAt {
+            if now < probeAt { return nil }
+        } else if inFlightBytes >= maxInFlightBytes {
+            return nil
+        }
         guard let oldest = messages.keys.min() else { return nil }
         let ordered = messages.sorted {
             if $0.value.priority == $1.value.priority { return $0.key < $1.key }
@@ -864,7 +912,8 @@ public final class MessageTransport {
         let timeout = min(0.5, rto * Double(1 << msg.timeouts[key.index, default: 0]))
         deliveryRecords[Int(lastPacket) % deliveryRecords.count] = DeliveryRecord(
             number: lastPacket, sent: sent, bytes: bytes.count)
-        attempts[lastPacket] = Attempt(key: key, expires: sent + timeout)
+        attempts[lastPacket] = Attempt(key: key, sent: sent, bytes: bytes.count, expires: sent + timeout)
+        inFlightBytes += bytes.count
         if progressAt == nil { progressAt = sent }
         if probeAt != nil {
             probeAt = sent + probeInterval

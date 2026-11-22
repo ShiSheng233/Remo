@@ -383,9 +383,10 @@ func recoveryAfterLostReference(acknowledge: Bool) async throws {
 
 @Test func bitrateAdaptiveQuantizerFloorsRelaxAtHigherBitRates() {
     #expect(VideoEncoder.motionMinimumQP(for: 500_000) == 34)
-    #expect(VideoEncoder.motionMinimumQP(for: 1_500_000) == 31)
-    #expect(VideoEncoder.motionMinimumQP(for: 2_500_000) == 27)
-    #expect(VideoEncoder.motionMinimumQP(for: 5_000_000) == 24)
+    #expect(VideoEncoder.motionMinimumQP(for: 1_200_000) == 30)
+    #expect(VideoEncoder.motionMinimumQP(for: 2_000_000) == 26)
+    #expect(VideoEncoder.motionMinimumQP(for: 2_500_000) == 22)
+    #expect(VideoEncoder.motionMinimumQP(for: 5_000_000) == 18)
     #expect(VideoEncoder.keyFrameMinimumQP(for: 2_000_000) == 34)
     #expect(VideoEncoder.keyFrameMinimumQP(for: 5_000_000) == 30)
 }
