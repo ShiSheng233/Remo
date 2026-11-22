@@ -87,7 +87,15 @@ public final class RemoteScreenServer {
     private let context: ServerConnection.Context
     private var listener: NWListener?
     private var listenerEvents: AsyncStream<NWListener.State>.Continuation?
-    private var connections: [ObjectIdentifier: (ServerConnection, Task<Void, Never>)] = [:]
+    private var connections: [ObjectIdentifier: (ServerConnection, Task<Void, Never>)] = [:] {
+        didSet { updateActivity() }
+    }
+    /// Held while any client is connected. Streaming is latency-critical: once the app is in the
+    /// background, App Nap and timer coalescing stretch the transport's pacing timer from about
+    /// 1 ms to 7–14 ms, which caps the send rate far below the budget (measured: 2.0 instead of
+    /// 4.9 Mbps, latency p50 143 instead of 28 ms). Idle system sleep waits too; the display may
+    /// still sleep.
+    private var activity: (any NSObjectProtocol)?
     private var stopped = false
 
     /// Validates the configuration and resolves the source, prompting for any permissions.
@@ -196,6 +204,16 @@ public final class RemoteScreenServer {
             connection.stop("server stopped", failed: false)
         }
         context.pointer?.stop()
+    }
+
+    private func updateActivity() {
+        if connections.isEmpty {
+            if let activity { ProcessInfo.processInfo.endActivity(activity) }
+            activity = nil
+        } else if activity == nil {
+            activity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .latencyCritical], reason: "Streaming to a Remo client")
+        }
     }
 
     private func accept(_ connection: NWConnection) {
