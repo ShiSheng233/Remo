@@ -284,6 +284,61 @@ public final class MessageTransport {
         var acknowledgedBytes = 0
         var lost = 0
         var interval: TimeInterval = 0.25
+        /// When the window's first and last datagrams went out: the span the application was
+        /// actually sending in.
+        var firstSent: TimeInterval?
+        var lastSent: TimeInterval = 0
+        private var activeSpan: TimeInterval {
+            guard let firstSent else { return interval }
+            return min(interval, max(0.05, lastSent - firstSent))
+        }
+        /// Sent in bursts with quiet in between, as an application with little to say sends:
+        /// then the window's averages describe the application, not the link.
+        var bursty: Bool { activeSpan < interval * 0.7 }
+        /// What got through, and what was sent, while the window was sending. Of a bursty
+        /// window these are what the link did; of a busy one they are the window's averages.
+        var carriedRate: Double { bursty ? Double(acknowledgedBytes) * 8 / activeSpan : deliveredRate }
+        var offeredRate: Double { bursty ? Double(bytes) * 8 / activeSpan : sentRate }
+        /// Send times and sizes of the datagrams acknowledged so far, and the send time of the
+        /// earliest one lost.
+        var acknowledgedSends: [(sent: TimeInterval, bytes: Int)] = []
+        var firstLostSent: TimeInterval?
+        var lastLostSent: TimeInterval?
+        /// Send times and sizes of the datagrams counted lost.
+        var lostSends: [(sent: TimeInterval, bytes: Int)] = []
+        /// Of what was sent between the first and the last loss, the share lost. A policer that
+        /// is being overrun drops a large share; random loss or reordering, a small one.
+        var dropShareUnderLoss: Double {
+            guard let first = firstLostSent, let last = lastLostSent else { return 0 }
+            let lost = lostSends.filter { $0.sent >= first && $0.sent <= last }
+            // A handful of losses close together happens by chance on a lossy link, and a link
+            // that loses in bursts drops a run at a time. An overrun limit drops all along,
+            // between datagrams it lets through.
+            guard lost.count >= 6 else { return 0 }
+            let got = acknowledgedSends.filter { $0.sent >= first && $0.sent <= last }
+            let lostTimes = lost.map(\.sent).sorted()
+            var runs = 1
+            for (a, b) in zip(lostTimes, lostTimes.dropFirst()) where got.contains(where: { $0.sent > a && $0.sent < b }) {
+                runs += 1
+            }
+            guard runs >= 3 else { return 0 }
+            let lostBytes = lost.reduce(0) { $0 + $1.bytes }
+            let gotBytes = got.reduce(0) { $0 + $1.bytes }
+            return Double(lostBytes) / Double(lostBytes + gotBytes)
+        }
+        /// `rateUnderLoss` when the loss looks like an overrun limit rather than chance.
+        var policedRate: Double? { dropShareUnderLoss >= 0.25 ? rateUnderLoss : nil }
+        /// What got through of what was sent between the first and the last loss. A link that
+        /// lets a burst through before it starts to drop (a policer with an allowance) has spent
+        /// the allowance by then and is dropping all along: this is the rate it holds to, where
+        /// the window's averages include whatever the allowance let through first and the quiet
+        /// after. Nil when too little was sent meanwhile to tell.
+        var rateUnderLoss: Double? {
+            guard let first = firstLostSent, let last = lastLostSent, last - first >= 0.04 else { return nil }
+            let during = acknowledgedSends.filter { $0.sent >= first && $0.sent <= last }
+            guard during.count >= 6 else { return nil }
+            return Double(during.reduce(0) { $0 + $1.bytes }) * 8 / (last - first)
+        }
         var lossRatio: Double {
             lost >= 3 && acknowledged + lost >= 20 ? Double(lost) / Double(acknowledged + lost) : 0
         }
@@ -464,8 +519,25 @@ public final class MessageTransport {
         var sent: Double
         /// The first window sent entirely at the reduced rate.
         var start: Int
+        /// Whether `delivered` is the rate an overrun limit held to (see `Sending.policedRate`).
+        var underLoss = false
+        /// Whether `delivered` was read from a window with little in it or sent in bursts: it
+        /// may be far below what the link carries, so it sizes neither a deep cut nor a wall.
+        var thin = false
     }
     private var lossTrial: LossTrial?
+    /// What a link that polices its rate held to while it dropped, measured from the first loss
+    /// on (BBRv1's long-term bandwidth for policers). Its allowance lets short bursts through
+    /// at any rate, so they say nothing beyond it: the budget stays at or under it. A session
+    /// that keeps pressing against it tries a little more now and then, as the link may have
+    /// changed; loss there measures it afresh.
+    private var policedCap: (rate: Double, at: TimeInterval)?
+    /// How long the cap holds before a session that keeps sending at it may try more; doubled
+    /// each time trying more ended in loss again.
+    private var policedCapHold = MessageTransport.firstPolicedCapHold
+    private static let firstPolicedCapHold = 20.0
+    private static let maximumPolicedCapHold = 160.0
+    private static let policedCapStep = 1.15
     private var toleratedLoss = 0.02
     /// Loss is not accepted as the link's own beyond this: a wrong verdict then costs little.
     private static let maximumToleratedLoss = 0.15
@@ -741,6 +813,7 @@ public final class MessageTransport {
                 if sendings[record.window] != nil {
                     sendings[record.window]!.acknowledged += 1
                     sendings[record.window]!.acknowledgedBytes += record.bytes
+                    sendings[record.window]!.acknowledgedSends.append((record.sent, record.bytes))
                     if record.lost { sendings[record.window]!.lost -= 1 }
                 }
                 let elapsed = max(0, now - record.sent)
@@ -922,6 +995,11 @@ public final class MessageTransport {
                 guard let record = deliveryRecords[slot], record.number == number, !record.lost else { continue }
                 deliveryRecords[slot]?.lost = true
                 sendings[record.window]?.lost += 1
+                let earliest = min(sendings[record.window]?.firstLostSent ?? record.sent, record.sent)
+                let latestLost = max(sendings[record.window]?.lastLostSent ?? record.sent, record.sent)
+                sendings[record.window]?.firstLostSent = earliest
+                sendings[record.window]?.lastLostSent = latestLost
+                sendings[record.window]?.lostSends.append((record.sent, record.bytes))
             }
             sendings[windowIndex, default: Sending()].interval = interval
             history.append(Window(
@@ -934,6 +1012,7 @@ public final class MessageTransport {
                 updateDeliveryRate()
             }
             adjustRate(now, interval: interval)
+            holdToPolicedCap(now)
             confirmations = 0
             windowBytes = 0
             windowAcknowledged = 0
@@ -949,6 +1028,28 @@ public final class MessageTransport {
             sendings[windowIndex] = Sending()
             sendings[windowIndex - 32] = nil
         }
+    }
+
+    private func learnPolicedCap(_ measured: Double, _ now: TimeInterval) {
+        // Found again soon after trying more: the link has not changed, wait longer next time.
+        if let known = policedCap, now - known.at < policedCapHold + 10 {
+            policedCapHold = min(Self.maximumPolicedCapHold, policedCapHold * 2)
+        }
+        policedCap = (max(Self.minimumRate, measured), now)
+    }
+
+    private func holdToPolicedCap(_ now: TimeInterval) {
+        guard var cap = policedCap else { return }
+        // Only a session that has kept sending at the cap for the last two seconds has a use
+        // for more, and only it can show whether the link gives more.
+        let recent = (windowIndex - 7...windowIndex).compactMap { sendings[$0] }
+        let sent = recent.reduce(0.0) { $0 + Double($1.bytes) * 8 }
+        let span = recent.reduce(0.0) { $0 + $1.interval }
+        if span >= 1.5, sent / span >= cap.rate * 0.9, now - cap.at >= policedCapHold {
+            cap = (cap.rate * Self.policedCapStep, now)
+            policedCap = cap
+        }
+        rate = min(rate, cap.rate)
     }
 
     /// Tracks the rolling 1-second delivered rate every 0.25 s, rising immediately when more
@@ -1022,15 +1123,17 @@ public final class MessageTransport {
         let latest = windowIndex - settling + 1
         let onset = sendings[latest] ?? Sending()
         if var trial = lossTrial {
-            if latest < trial.start, onset.exceeds(toleratedLoss), onset.deliveredRate < trial.delivered * 0.9 {
+            if latest < trial.start, onset.exceeds(toleratedLoss), onset.carriedRate < trial.delivered * 0.9 {
                 // Sent before the reduction, and less of it got through than the reduction was
                 // sized for: the loss had only begun. Reduce once more, to what this shows.
-                trial.delivered = onset.deliveredRate
-                trial.sent = onset.sentRate
+                trial.delivered = onset.policedRate ?? onset.carriedRate
+                trial.underLoss = onset.policedRate != nil
+                trial.thin = onset.policedRate == nil && (onset.bursty || onset.acknowledged + onset.lost < 40)
+                trial.sent = onset.offeredRate
                 trial.reference = max(trial.reference, onset.lossRatio)
                 trial.start = windowIndex + 1
                 lossEpoch = windowIndex + 1
-                rate = max(Self.minimumRate, min(rate, trial.delivered * 0.9))
+                rate = max(Self.minimumRate, trial.thin ? rate * 0.5 : 0, min(rate, trial.delivered * 0.9))
                 lossTrial = trial
             } else if latest < trial.start {
                 trial.reference = max(trial.reference, onset.lossRatio)
@@ -1055,7 +1158,14 @@ public final class MessageTransport {
                     // held to a margin over what it did send.
                     let share = trial.sent > 0 ? min(1, trial.delivered / trial.sent) : 1
                     rate = max(rate, min(trial.rate * share * Self.fill, trial.delivered * Self.headroom))
-                    mark(rate, now, policed: now - queueSeenAt > 3)
+                    let policed = now - queueSeenAt > 3
+                    if policed, trial.underLoss { learnPolicedCap(trial.delivered, now) }
+                    if trial.thin {
+                        // Not a measurement of the link: no wall to keep to, steps stay as they were.
+                        lossEpoch = windowIndex + 1
+                    } else {
+                        mark(rate, now, policed: policed)
+                    }
                     if after > toleratedLoss {
                         // What is left is not for want of capacity.
                         toleratedLoss = min(Self.maximumToleratedLoss, after * 1.3 + 0.01)
@@ -1131,8 +1241,11 @@ public final class MessageTransport {
             startup = false
             resetDeliveryRateAfterBackoff()
             recoveryCeiling = sustainable
-            mark(sustainable, now, policed: false)
-            rate = max(Self.minimumRate, sustainable * max(0.5, 1 - queueDelay))
+            // An application spending little of its budget says little about the link by what
+            // arrived: then the cut goes at most halfway and leaves no wall behind.
+            let appLimited = spending < 0.5
+            mark(sustainable, now, policed: false, measured: !appLimited)
+            rate = max(Self.minimumRate, appLimited ? rate * 0.5 : 0, sustainable * max(0.5, 1 - queueDelay))
             cutQueueDelay = queueDelay
             holdUntil = now + max(0.5, 2 * (rtt ?? 0))
             lossTrial = nil
@@ -1143,7 +1256,11 @@ public final class MessageTransport {
                 // through, without a trial, and let what was sent meanwhile clear before
                 // reading loss again.
                 let share = onset.sentRate > 0 ? min(1, onset.deliveredRate / onset.sentRate) : 1
-                rate = max(Self.minimumRate, min(rate * share * Self.fill, wall?.rate ?? rate))
+                let thin = onset.policedRate == nil && (onset.bursty || onset.acknowledged + onset.lost < 40)
+                rate = max(Self.minimumRate, thin ? rate * 0.5 : 0, min(rate * share * Self.fill, wall?.rate ?? rate))
+                // Sized by what got through once an overrun limit began to drop. Whether it is one is
+                // left to a loss trial to settle, as a step can meet loss of any kind.
+                if let held = onset.policedRate { rate = max(Self.minimumRate, min(rate, held * Self.fill)) }
                 mark(rate, now, policed: now - queueSeenAt > 3, measured: false)
                 holdUntil = now + Double(settling + 4) * 0.25
                 return
@@ -1151,19 +1268,41 @@ public final class MessageTransport {
             // If the link is full, what got through is what it carries, and sending less than
             // that ends the loss. The reduction is taken from what was delivered, not from the
             // budget: an application that spends less than its budget would not feel a cut in it.
-            let sample = onset.exceeds(toleratedLoss) ? onset : sendings[windowIndex - settling] ?? onset
+            // The window that shows the loss: the newest settled one if it does, else the one that
+            // lost most of the last second's, not a quiet one the longer count happened to end on.
+            let settledIndex = windowIndex - settling
+            var sample = onset.exceeds(toleratedLoss) ? onset : sendings[settledIndex] ?? onset
+            // Unless that one was all but quiet and an overrun limit shows in another: a cut
+            // sized by a quiet window lands far below what the link carries.
+            if sample.policedRate == nil,
+                let overrun = (settledIndex - 3...settledIndex).compactMap({ sendings[$0] })
+                    .filter({ $0.policedRate != nil }).max(by: { $0.lost < $1.lost })
+            {
+                sample = overrun
+            }
             // Of a burst a queue took in, all is delivered in the end, but no faster than
             // the link carries: what arrived lately bounds what counts as delivered.
             let lately = history.suffix(2)
             let span = lately.reduce(0.0) { $0 + $1.interval }
             let arriving = span > 0 ? Double(lately.reduce(0) { $0 + $1.acknowledged }) * 8 / span : .infinity
-            let delivered = max(Self.minimumRate, min(sample.deliveredRate, max(arriving, sample.deliveredRate * 0.5)))
+            // An application that sends in bursts with quiet between would be read as a slow link
+            // from the window's average: what got through while it was sending is what counts.
+            let delivered =
+                sample.policedRate.map { max(Self.minimumRate, $0) }
+                ?? (sample.bursty
+                    ? max(Self.minimumRate, sample.carriedRate)
+                    : max(Self.minimumRate, min(sample.deliveredRate, max(arriving, sample.deliveredRate * 0.5))))
+            // A window with little in it, or sent in bursts (an application that had just stopped
+            // sending), can read far below what the link carries. A cut on its strength goes at
+            // most halfway; if the loss goes on, the next one goes further.
+            let thin = sample.policedRate == nil && (sample.bursty || sample.acknowledged + sample.lost < 40)
             lossTrial = LossTrial(
                 rate: rate, reference: max(loss, sample.lossRatio), delivered: delivered,
-                sent: max(delivered, sample.sentRate), start: windowIndex + 1)
+                sent: max(delivered, sample.offeredRate), start: windowIndex + 1,
+                underLoss: sample.policedRate != nil, thin: thin)
             startup = false
             lossEpoch = windowIndex + 1
-            rate = max(Self.minimumRate, min(rate, delivered * 0.9))
+            rate = max(Self.minimumRate, thin ? rate * 0.5 : 0, min(rate, delivered * 0.9))
         } else if confirmations > 0, loss <= toleratedLoss, !onset.exceeds(toleratedLoss),
             (queueDelay ?? 0) <= tolerance / 2,
             probeAt == nil, lossTrial == nil, now >= holdUntil
@@ -1348,6 +1487,8 @@ public final class MessageTransport {
             number: lastPacket, sent: sent, bytes: bytes.count, window: windowIndex)
         sendings[windowIndex, default: Sending()].packets += 1
         sendings[windowIndex, default: Sending()].bytes += bytes.count
+        if sendings[windowIndex]?.firstSent == nil { sendings[windowIndex]?.firstSent = sent }
+        sendings[windowIndex]?.lastSent = sent
         attempts[lastPacket] = Attempt(key: key, sent: sent, bytes: bytes.count, expires: sent + timeout)
         inFlightBytes += bytes.count
         if progressAt == nil { progressAt = sent }
