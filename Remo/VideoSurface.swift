@@ -29,8 +29,16 @@ final class VideoSurface: UIView {
 
     /// The remote cursor, which the video no longer shows.
     var cursor: RemoteCursor? {
-        didSet { if cursor != oldValue { layoutCursor() } }
+        didSet {
+            guard cursor != oldValue else { return }
+            layoutCursor()
+            if let cursor, !cursorLayer.isHidden, cursor.position != oldValue?.position {
+                onCursorMoved?(cursorLayer.frame)
+            }
+        }
     }
+    /// Hears the cursor's frame, in this view's bounds, each time it moves.
+    var onCursorMoved: ((CGRect) -> Void)?
 
     /// Magnification applied by the zooming scroll view this view sits in; 1 shows the whole
     /// remote screen.

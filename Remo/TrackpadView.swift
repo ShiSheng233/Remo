@@ -273,6 +273,29 @@ private final class TouchSurface: UIScrollView {
         contentOffset = CGPoint(x: -contentInset.left, y: -contentInset.top)
     }
 
+    /// Scrolls as little as it takes to show `rect` of `view` whole, so a zoomed-in view
+    /// follows the cursor to its edges. A zoom or pan the user is making is left alone.
+    func reveal(_ rect: CGRect, in view: UIView) {
+        guard !isZooming, !isZoomBouncing, !isDragging, !bounds.isEmpty else { return }
+        let target = view.convert(rect, to: self)
+        let visible = bounds
+        func shift(_ low: CGFloat, _ high: CGFloat, within start: CGFloat, _ end: CGFloat) -> CGFloat {
+            if low < start { return low - start }
+            if high > end { return high - end }
+            return 0
+        }
+        let minimum = CGPoint(x: -contentInset.left, y: -contentInset.top)
+        let maximum = CGPoint(
+            x: max(minimum.x, contentSize.width + contentInset.right - bounds.width),
+            y: max(minimum.y, contentSize.height + contentInset.bottom - bounds.height))
+        let offset = CGPoint(
+            x: min(maximum.x, max(minimum.x,
+                contentOffset.x + shift(target.minX, target.maxX, within: visible.minX, visible.maxX))),
+            y: min(maximum.y, max(minimum.y,
+                contentOffset.y + shift(target.minY, target.maxY, within: visible.minY, visible.maxY))))
+        if offset != contentOffset { contentOffset = offset }
+    }
+
     /// Keeps the picture centered on any axis where it is smaller than the view.
     ///
     /// This uses content insets, updated from `scrollViewDidZoom`, because the scroll view
@@ -351,6 +374,10 @@ private struct TrackpadRegion: UIViewRepresentable {
         uiView.excludedRects = excludedRects
         uiView.zoomContent = surface
         uiView.videoSize = videoSize
+        surface.onCursorMoved = { [weak uiView, weak surface] frame in
+            guard let uiView, let surface else { return }
+            uiView.reveal(frame, in: surface)
+        }
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate, UIScrollViewDelegate {
