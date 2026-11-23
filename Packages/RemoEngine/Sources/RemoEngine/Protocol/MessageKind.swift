@@ -24,6 +24,10 @@ enum MessageKind: UInt8, CaseIterable {
     case pointerInput = 10
     /// `AudioMessage`.
     case audio = 11
+    /// `CursorMessage.shape`.
+    case cursorShape = 12
+    /// `CursorMessage.state`.
+    case cursorState = 13
 
     /// `VideoFrameMessage`.
     case videoFrame = 0x40

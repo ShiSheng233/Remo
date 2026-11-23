@@ -210,6 +210,10 @@ enum Command {
                     let frames =
                         screen ? "displayEnqueued=\(displayEnqueued)" : "verified=\(verifier.verified)"
                     log("[\(endpoint)] \(statistics)  \(frames)")
+                case .cursor(let cursor):
+                    #if os(macOS)
+                        window?.show(cursor)
+                    #endif
                 default: break
                 }
             })

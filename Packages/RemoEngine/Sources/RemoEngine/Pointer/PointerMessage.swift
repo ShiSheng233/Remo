@@ -15,12 +15,13 @@ enum PointerMessage: Equatable {
     /// Whole lines; positive values move the content down, following the finger.
     case scroll(lines: Int32)
 
-    /// Button changes must arrive. A late move or scroll is only noise, and a newer position
-    /// makes an unsent older one pointless.
+    /// Button changes must arrive. The newest move must arrive too, since the client already
+    /// shows the cursor there, but it makes an older one pointless. A late scroll is only noise.
     var delivery: MessageTransport.Delivery {
         switch self {
         case .ready, .button: .essential
-        case .move: .retrying(sendWithin: SessionTiming.pointerDeadline, replacing: .pointerMove)
+        case .move:
+            .untilDelivered(priority: .high, replacing: ReplaceableMessage.pointerMove.rawValue)
         case .scroll: .retrying(sendWithin: SessionTiming.pointerDeadline)
         }
     }

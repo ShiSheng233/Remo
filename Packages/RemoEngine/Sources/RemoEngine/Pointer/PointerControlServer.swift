@@ -21,7 +21,7 @@ final class PointerControlServer {
     }
 
     private let initialState: () -> PointerMessage?
-    private let emit: (Event) -> Void
+    private let emit: @MainActor (Event) -> Void
     private var owner: UUID?
     private var position = CGPoint.zero
     private var leftDown = false
@@ -31,7 +31,7 @@ final class PointerControlServer {
     /// Button changes that arrived before the one they follow, keyed by that one's sequence.
     private var pendingButtons: [UInt64: PointerMessage] = [:]
 
-    init(initialState: @escaping () -> PointerMessage?, emit: @escaping (Event) -> Void) {
+    init(initialState: @escaping () -> PointerMessage?, emit: @escaping @MainActor (Event) -> Void) {
         self.initialState = initialState
         self.emit = emit
     }
@@ -129,49 +129,46 @@ final class PointerControlServer {
     import CoreGraphics
 
     extension PointerControlServer {
-        convenience init(displayID: CGDirectDisplayID) {
-            let source = CGEventSource(stateID: .hidSystemState)
+        /// `onPost` hears the position of every pointer event posted to the display.
+        convenience init(
+            displayID: CGDirectDisplayID, onPost: @escaping @MainActor (CGPoint) -> Void = { _ in }
+        ) {
+            nonisolated(unsafe) let source = CGEventSource(stateID: .hidSystemState)
             self.init(initialState: {
-                let bounds = CGDisplayBounds(displayID)
-                guard !bounds.isEmpty,
-                    let width = UInt32(exactly: bounds.width), width > 0,
-                    let height = UInt32(exactly: bounds.height), height > 0,
+                guard let geometry = DisplayGeometry(displayID: displayID),
+                    let width = UInt32(exactly: geometry.bounds.width), width > 0,
+                    let height = UInt32(exactly: geometry.bounds.height), height > 0,
                     let location = CGEvent(source: nil)?.location
                 else { return nil }
-                let position = CGPoint(
-                    x: min(1, max(0, (location.x - bounds.minX) / max(1, bounds.width - 1))),
-                    y: min(1, max(0, (location.y - bounds.minY) / max(1, bounds.height - 1))))
-                return .ready(position: position, width: width, height: height)
+                return .ready(position: geometry.normalize(location), width: width, height: height)
             }, emit: { event in
-                let bounds = CGDisplayBounds(displayID)
-                guard !bounds.isEmpty else { return }
-                func post(_ type: CGEventType, _ button: CGMouseButton, at position: CGPoint) {
-                    let location = CGPoint(
-                        x: bounds.minX + position.x * max(0, bounds.width - 1),
-                        y: bounds.minY + position.y * max(0, bounds.height - 1))
+                guard let geometry = DisplayGeometry(displayID: displayID) else { return }
+                let post: @MainActor (CGEventType, CGMouseButton, CGPoint) -> Void = {
+                    type, button, position in
                     let event = CGEvent(
-                        mouseEventSource: source, mouseType: type, mouseCursorPosition: location,
-                        mouseButton: button)
+                        mouseEventSource: source, mouseType: type,
+                        mouseCursorPosition: geometry.location(of: position), mouseButton: button)
                     if type != .mouseMoved && type != .leftMouseDragged {
                         event?.setIntegerValueField(.mouseEventClickState, value: 1)
                     }
                     event?.post(tap: .cghidEventTap)
+                    onPost(position)
                 }
                 switch event {
                 case let .move(position, dragging):
-                    post(dragging ? .leftMouseDragged : .mouseMoved, .left, at: position)
+                    post(dragging ? .leftMouseDragged : .mouseMoved, .left, position)
                 case let .button(action, position):
                     switch action {
                     case .leftClick:
-                        post(.leftMouseDown, .left, at: position)
-                        post(.leftMouseUp, .left, at: position)
+                        post(.leftMouseDown, .left, position)
+                        post(.leftMouseUp, .left, position)
                     case .rightClick:
-                        post(.rightMouseDown, .right, at: position)
-                        post(.rightMouseUp, .right, at: position)
+                        post(.rightMouseDown, .right, position)
+                        post(.rightMouseUp, .right, position)
                     case .leftDown:
-                        post(.leftMouseDown, .left, at: position)
+                        post(.leftMouseDown, .left, position)
                     case .leftUp:
-                        post(.leftMouseUp, .left, at: position)
+                        post(.leftMouseUp, .left, position)
                     }
                 case let .scroll(lines):
                     CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 1,

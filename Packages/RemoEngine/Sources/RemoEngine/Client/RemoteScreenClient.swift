@@ -61,14 +61,19 @@ public final class RemoteScreenClient {
 
     public enum Event {
         case state(State)
-        /// The server granted pointer control. Sizes are in remote display pixels.
+        /// The server granted pointer control. Sizes are in remote display points.
         case pointerAvailable(displaySize: CGSize)
+        /// The cursor to draw over the picture changed: the server's, or where this client's
+        /// pointer input put it.
+        case cursor(RemoteCursor)
         case statistics(ClientStatistics)
     }
 
     public private(set) var state = State.idle
-    /// The remote display's size in pixels while this client controls its pointer.
+    /// The remote display's size in points while this client controls its pointer.
     public var pointerDisplaySize: CGSize? { pointer.displaySize }
+    /// The cursor to draw over the picture, once the server has described it.
+    public private(set) var cursor: RemoteCursor?
 
     private let configuration: Configuration
     private let onFrame: (VideoFrame) throws -> Void
@@ -81,6 +86,11 @@ public final class RemoteScreenClient {
     private var playback: AudioPlayback?
     private var audioDisabled = false
     private var pointer = PointerControlClient()
+    private var cursorTracker = CursorTracker()
+    /// Whether this client has moved the pointer since it last took the server's position.
+    private var pointerMovedLocally = false
+    private var lastMoveSent: Instant?
+    private var moveFlush: Task<Void, Never>?
     private var lastSeen = Instant.now
     private var lastFrame = Instant.now
     private var counters = Counters()
@@ -131,18 +141,77 @@ public final class RemoteScreenClient {
 
     // MARK: Pointer
 
-    /// Moves the remote pointer by a distance in remote display pixels.
+    /// Moves the remote pointer by a distance in remote display points. The cursor follows at
+    /// once; the server hears of it at most 30 times a second, or 60 while dragging.
     public func movePointer(by delta: CGVector) {
-        sendPointer { $0.move(by: delta) }
+        guard isRunning, state == .streaming, pointer.move(by: delta) else { return }
+        pointerMovedLocally = true
+        publishCursor()
+        scheduleMove()
     }
 
     public func pressPointer(_ button: PointerButton) {
+        // The button lands where the cursor is drawn; send the move first so hover is right.
+        flushMove()
         sendPointer { $0.press(button) }
     }
 
     /// Whole lines; positive values move the content down, following the finger.
     public func scroll(lines: Int) {
         sendPointer { $0.scroll(lines: lines) }
+    }
+
+    private func scheduleMove() {
+        guard moveFlush == nil else { return }
+        let interval =
+            pointer.dragging ? SessionTiming.dragInterval : SessionTiming.pointerMoveInterval
+        guard let last = lastMoveSent, !Instant.now.hasElapsed(interval, since: last) else {
+            flushMove()
+            return
+        }
+        moveFlush = Task { [weak self] in
+            try? await Task.sleep(until: last + interval, clock: .suspending)
+            guard !Task.isCancelled, let self else { return }
+            moveFlush = nil
+            flushMove()
+        }
+    }
+
+    private func flushMove() {
+        moveFlush?.cancel()
+        moveFlush = nil
+        guard pointer.moved else { return }
+        lastMoveSent = .now
+        sendPointer { $0.takeMove() }
+    }
+
+    private func publishCursor() {
+        let controlling = pointer.displaySize != nil
+        guard
+            let next = cursorTracker.cursor(
+                at: controlling ? pointer.position : nil,
+                forceVisible: controlling && pointerMovedLocally),
+            next != cursor
+        else { return }
+        cursor = next
+        onEvent(.cursor(next))
+    }
+
+    private func receiveCursor(_ data: Data) {
+        guard let message = try? CursorMessage(decoding: data) else { return }
+        lastSeen = .now
+        switch message {
+        case .shape(let shape):
+            guard cursorTracker.receive(shape) else { return }
+        case .state(let sequence, let state):
+            if let position = cursorTracker.receive(sequence: sequence, state),
+                pointer.displaySize != nil
+            {
+                pointer.adopt(position)
+                pointerMovedLocally = false
+            }
+        }
+        publishCursor()
     }
 
     private func sendPointer(_ make: (inout PointerControlClient) -> PointerMessage?) {
@@ -178,10 +247,16 @@ public final class RemoteScreenClient {
     private func session(_ link: Link) async {
         audioDisabled = false
         pointer = PointerControlClient()
+        cursorTracker = CursorTracker()
+        cursor = nil
+        pointerMovedLocally = false
+        lastMoveSent = nil
         counters = Counters()
         setState(.connecting)
         trace.write(nil, "client opening")
         await stream(link)
+        moveFlush?.cancel()
+        moveFlush = nil
         trace.write(nil, "client stop failure=\(failure.map { "\($0)" } ?? "none")")
         playback?.stop()
         playback = nil
@@ -360,7 +435,10 @@ public final class RemoteScreenClient {
             if pointer.receiveReady(data), let size = pointer.displaySize {
                 lastSeen = .now
                 onEvent(.pointerAvailable(displaySize: size))
+                publishCursor()
             }
+        case .cursorShape, .cursorState:
+            receiveCursor(data)
         default: break
         }
     }

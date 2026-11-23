@@ -20,8 +20,12 @@ enum SessionTiming {
     static let videoStall = Duration.seconds(2)
     /// A pointer request repeats until the server answers or the session ends.
     static let pointerHelloRetry = Duration.milliseconds(1200)
-    /// A pointer move or scroll is worthless once this old.
+    /// A scroll is worthless once this old.
     static let pointerDeadline = Duration.milliseconds(50)
+    /// The client draws the cursor where the finger puts it and tells the server at most this
+    /// often, or at `dragInterval` while a button is held.
+    static let pointerMoveInterval = Duration.seconds(1) / 30
+    static let dragInterval = Duration.seconds(1) / 60
     /// Audio that can't be sent this soon would arrive too late to play.
     static let audioDeadline = Duration.milliseconds(100)
     /// How long a server waits for a new connection to become ready.

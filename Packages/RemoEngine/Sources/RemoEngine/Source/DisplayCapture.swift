@@ -70,7 +70,8 @@
                 config.minimumFrameInterval = CMTime(value: 1, timescale: framesPerSecond)
                 config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                 config.queueDepth = 4
-                config.showsCursor = true
+                // Clients draw the cursor themselves from `CursorMessage`s.
+                config.showsCursor = false
                 if capturesAudio {
                     config.capturesAudio = true
                     config.sampleRate = 48_000

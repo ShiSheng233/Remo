@@ -7,12 +7,18 @@ import Foundation
 
 /// The controlling peer's half of the pointer protocol, which `PointerControlServer` orders.
 ///
-/// Messages arrive in no particular order, so every move and button change carries the
-/// sequence of the button change it follows.
+/// The pointer moves here first, where the client draws it; its position goes to the server
+/// when the client chooses to send it. Messages arrive in no particular order, so every move
+/// and button change carries the sequence of the button change it follows.
 struct PointerControlClient {
-    /// The remote display's size in pixels, once the server has granted control.
+    /// The remote display's size in points, once the server has granted control.
     private(set) var displaySize: CGSize?
-    private var position = CGPoint.zero
+    /// Normalized to the remote display, with the origin at its upper left.
+    private(set) var position = CGPoint.zero
+    /// Whether the left button is held.
+    private(set) var dragging = false
+    /// Whether the position has moved since it was last sent.
+    private(set) var moved = false
     private var sequence: UInt64 = 0
     private var buttonSequence: UInt64 = 0
 
@@ -26,23 +32,46 @@ struct PointerControlClient {
         return true
     }
 
-    /// Moves by a distance in remote display pixels, stopping at the display's edges.
-    mutating func move(by delta: CGVector) -> PointerMessage? {
+    /// Moves by a distance in remote display points, stopping at the display's edges.
+    /// Returns whether the position changed.
+    mutating func move(by delta: CGVector) -> Bool {
         guard let displaySize, delta != .zero, delta.dx.isFinite, delta.dy.isFinite else {
-            return nil
+            return false
         }
-        position = CGPoint(
+        let next = CGPoint(
             x: min(1, max(0, position.x + delta.dx / displaySize.width)),
             y: min(1, max(0, position.y + delta.dy / displaySize.height)))
+        guard next != position else { return false }
+        position = next
+        moved = true
+        return true
+    }
+
+    /// Something other than this client moved the remote pointer; carry on from there.
+    mutating func adopt(_ position: CGPoint) {
+        self.position = position
+        moved = false
+    }
+
+    /// The move to send, if the position changed since the last one.
+    mutating func takeMove() -> PointerMessage? {
+        guard displaySize != nil, moved else { return nil }
+        moved = false
         sequence += 1
         return .move(sequence: sequence, afterButton: buttonSequence, position: position)
     }
 
+    /// A button change carries the position, so it also stands for any unsent move.
     mutating func press(_ button: PointerButton) -> PointerMessage? {
         guard displaySize != nil else { return nil }
         let previous = buttonSequence
         sequence += 1
         buttonSequence = sequence
+        switch button {
+        case .leftDown: dragging = true
+        case .leftUp: dragging = false
+        case .leftClick, .rightClick: break
+        }
         return .button(sequence: sequence, afterButton: previous, action: button, position: position)
     }
 

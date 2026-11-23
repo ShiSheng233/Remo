@@ -87,6 +87,8 @@ final class StreamPlayer {
             log?.write("streaming")
         case .state(.idle): break
         case .statistics(let statistics): log?.write(statistics.description)
+        case .cursor(let cursor):
+            surface?.cursor = cursor
         case .pointerAvailable(let size):
             mouseDisplaySize = size
             log?.write("pointer control granted for a \(Int(size.width))x\(Int(size.height)) display")
@@ -98,7 +100,8 @@ final class StreamPlayer {
         else { return }
         switch gesture {
         case let .move(delta):
-            // Finger travel follows the picture, so a zoomed view moves the pointer less.
+            // Finger travel follows the picture, so a zoomed view moves the pointer less. The
+            // client moves the cursor drawn on the surface at once.
             let bounds = surface.bounds
             let scale =
                 min(bounds.width / displaySize.width, bounds.height / displaySize.height)

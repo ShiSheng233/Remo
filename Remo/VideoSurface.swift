@@ -23,6 +23,14 @@ final class VideoSurface: UIView {
     private var redrawPending = false
     /// Extra drawable resolution while zoomed in, never beyond the remote picture’s own pixels.
     private var detail: CGFloat = 1
+    /// Draws the remote cursor over the picture. Being a sublayer, it zooms with the picture,
+    /// and it moves without redrawing the video.
+    private let cursorLayer = CALayer()
+
+    /// The remote cursor, which the video no longer shows.
+    var cursor: RemoteCursor? {
+        didSet { if cursor != oldValue { layoutCursor() } }
+    }
 
     /// Magnification applied by the zooming scroll view this view sits in; 1 shows the whole
     /// remote screen.
@@ -40,6 +48,9 @@ final class VideoSurface: UIView {
         display.colorspace = colorSpace
         isAccessibilityElement = true
         accessibilityLabel = String(localized: "Remote video")
+        cursorLayer.isHidden = true
+        cursorLayer.zPosition = 1
+        display.addSublayer(cursorLayer)
     }
 
     @available(*, unavailable)
@@ -58,6 +69,27 @@ final class VideoSurface: UIView {
         display.drawableSize = CGSize(
             width: (bounds.width * scale).rounded(), height: (bounds.height * scale).rounded())
         setNeedsRedraw()
+        layoutCursor()
+    }
+
+    /// Places the cursor on the picture as `render` fits it into the view.
+    private func layoutCursor() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard let cursor, cursor.visible, let image = cursor.image,
+            let extent = lastImage?.extent, extent.width > 0, extent.height > 0, !bounds.isEmpty
+        else {
+            cursorLayer.isHidden = true
+            return
+        }
+        let scale = min(bounds.width / extent.width, bounds.height / extent.height)
+        let picture = CGRect(
+            x: bounds.midX - extent.width * scale / 2, y: bounds.midY - extent.height * scale / 2,
+            width: extent.width * scale, height: extent.height * scale)
+        cursorLayer.contents = image
+        cursorLayer.frame = cursor.frame(in: picture)
+        cursorLayer.isHidden = false
     }
 
     /// Re-renders sharper once a zoom settles. While zooming, the layer is simply scaled, which
@@ -86,8 +118,10 @@ final class VideoSurface: UIView {
 
     func present(_ frame: VideoFrame) throws -> Bool {
         let image = CIImage(cvPixelBuffer: frame.pixels)
+        let resized = lastImage?.extent != image.extent
         lastImage = image
         redrawPending = false
+        if resized { layoutCursor() }
         return try render(image)
     }
 

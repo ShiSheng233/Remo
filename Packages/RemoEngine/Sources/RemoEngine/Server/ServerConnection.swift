@@ -20,6 +20,7 @@ final class ServerConnection {
         let maximumVideoBitRate: Int
         let startSource: StartSource
         let pointer: PointerControlServer?
+        let cursor: CursorMonitor?
         let diagnostics: Diagnostics
         let onEvent: @MainActor (RemoteScreenServer.Event) -> Void
 
@@ -44,6 +45,12 @@ final class ServerConnection {
     private var lastSeen = Instant.now
     private var lastNewAck: Instant?
     private var previousAcceptedDataPackets: UInt32 = 0
+
+    // Cursor
+    private var cursorSubscription: UUID?
+    private var cursorSequence: UInt64 = 0
+    /// Shapes this client has been sent, so each goes once.
+    private var sentCursorShapes: Set<UInt64> = []
 
     // Source
     private var source: (any ScreenFrameSource)?
@@ -142,6 +149,8 @@ final class ServerConnection {
                 stop("send failed: \(error)", failed: true)
             }
         }
+        if let cursorSubscription { context.cursor?.unsubscribe(cursorSubscription) }
+        cursorSubscription = nil
         audioSendTask?.cancel()
         frameForwardTask?.cancel()
         frameForwardTask = nil
@@ -219,6 +228,11 @@ final class ServerConnection {
             guard bytes.count == 1 else { return }
             if !active { context.onEvent(.streamingStarted(peer: peer)) }
             active = true
+            if cursorSubscription == nil, let cursor = context.cursor {
+                cursorSubscription = cursor.subscribe { [weak self] state, shape in
+                    self?.sendCursor(state, shape: shape)
+                }
+            }
             streamWake?.yield(())
             trace.write(peer, "hello accepted")
         case .heartbeat:
@@ -244,6 +258,26 @@ final class ServerConnection {
         default: return
         }
         lastSeen = .now
+    }
+
+    private func sendCursor(_ state: CursorState, shape: CursorShape?) {
+        guard !stopping, active, let session else { return }
+        do {
+            if let shape, !sentCursorShapes.contains(shape.id) {
+                // A client keeps more shapes than this, so it still has every one sent since.
+                if sentCursorShapes.count >= 128 { sentCursorShapes.removeAll() }
+                let message = CursorMessage.shape(shape)
+                try session.send(message.encoded, delivery: message.delivery)
+                sentCursorShapes.insert(shape.id)
+            }
+            cursorSequence += 1
+            let message = CursorMessage.state(sequence: cursorSequence, state)
+            try session.send(message.encoded, delivery: message.delivery)
+        } catch NetworkMessageSession.SendError.backpressure {
+            // The monitor publishes the cursor again shortly.
+        } catch {
+            stop("send failed: \(error)", failed: true)
+        }
     }
 
     private func stream(_ session: NetworkMessageSession) async throws {

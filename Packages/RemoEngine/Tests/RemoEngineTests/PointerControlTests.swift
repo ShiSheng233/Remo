@@ -32,7 +32,8 @@ import Testing
     #expect(throws: WireFormatError.self) { try PointerMessage(decoding: selfReferential.encoded) }
     // Button changes must arrive; a move only matters while it is fresh.
     #expect(messages[2].delivery.retryBudget == .infinity)
-    #expect(messages[1].delivery.retryBudget == 0 && messages[1].delivery.firstSendDeadline != nil)
+    // The newest move must arrive too: the client already draws the cursor there.
+    #expect(messages[1].delivery.retryBudget == .infinity && messages[1].delivery.priority == .high)
     #expect(messages[1].delivery.replacing != nil && messages[3].delivery.replacing == nil)
 }
 
@@ -126,8 +127,8 @@ import Testing
 
 @Test @MainActor func pointerClientOrdersInputForTheServer() throws {
     var client = PointerControlClient()
-    let early = [client.move(by: CGVector(dx: 10, dy: 10)), client.press(.leftClick)]
-    #expect(early == [nil, nil])
+    let early = (client.move(by: CGVector(dx: 10, dy: 10)), client.press(.leftClick))
+    #expect(!early.0 && early.1 == nil)
 
     let start = CGPoint(x: 0.5, y: 0.5)
     var events: [PointerControlServer.Event] = []
@@ -144,16 +145,31 @@ import Testing
         let message = try #require(message)
         server.receive(message.encoded, from: id)
     }
-    try send(client.move(by: CGVector(dx: 100, dy: -50)))
+    // Moves add up locally and go out as one.
+    let steps = [client.move(by: CGVector(dx: 62.5, dy: -25)), client.move(by: CGVector(dx: 62.5, dy: -25))]
+    #expect(steps == [true, true])
+    try send(client.takeMove())
+    let repeated = client.takeMove()
+    #expect(repeated == nil)
     try send(client.press(.leftDown))
+    #expect(client.dragging)
     // Moves past the edge stop there.
-    try send(client.move(by: CGVector(dx: 10_000, dy: 10_000)))
+    let edge = [client.move(by: CGVector(dx: 10_000, dy: 10_000)), client.move(by: CGVector(dx: 1, dy: 1))]
+    #expect(edge == [true, false])
+    try send(client.takeMove())
     try send(client.press(.leftUp))
+    #expect(!client.dragging)
     try send(client.scroll(lines: 1_000))
-    let ignored = [client.scroll(lines: 0), client.move(by: .zero)]
-    #expect(ignored == [nil, nil])
+    let still = client.move(by: .zero)
+    #expect(client.scroll(lines: 0) == nil && !still)
+    // Taking the server's position replaces an unsent move.
+    _ = client.move(by: CGVector(dx: -10, dy: 0))
+    client.adopt(CGPoint(x: 0.25, y: 0.75))
+    let replaced = client.takeMove()
+    #expect(replaced == nil)
+    #expect(client.position == CGPoint(x: 0.25, y: 0.75))
 
-    let moved = CGPoint(x: 0.6, y: 0.4)
+    let moved = CGPoint(x: 0.625, y: 0.4)
     let corner = CGPoint(x: 1, y: 1)
     #expect(events == [
         .move(moved, dragging: false), .button(.leftDown, moved),

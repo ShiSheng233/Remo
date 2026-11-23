@@ -22,6 +22,7 @@ extension Duration {
 /// State where a newer message makes an unfinished older one worthless.
 enum ReplaceableMessage: Int {
     case heartbeat, control, pointerHello, pointerMove, videoAcknowledgement, videoRecoveryRequest
+    case cursorState
 }
 
 extension MessageTransport.Delivery {

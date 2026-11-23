@@ -99,13 +99,30 @@ public final class RemoteScreenServer {
     private var stopped = false
 
     /// Validates the configuration and resolves the source, prompting for any permissions.
-    public init(
+    public convenience init(
         configuration: Configuration, onEvent: @escaping @MainActor (Event) -> Void = { _ in }
+    ) async throws {
+        try await self.init(configuration: configuration, cursor: nil, onEvent: onEvent)
+    }
+
+    /// `cursor` stands in for the system cursor, which only a main display source has.
+    init(
+        configuration: Configuration, cursor: (@MainActor () -> CursorSample?)?,
+        onEvent: @escaping @MainActor (Event) -> Void = { _ in }
     ) async throws {
         guard (1...240).contains(configuration.framesPerSecond) else {
             throw SetupError.invalidFrameRate
         }
         guard configuration.maximumVideoBitRate > 0 else { throw SetupError.invalidBitRate }
+        // Polled at the frame rate, which is plenty for the eye, up to the 60 Hz of most displays.
+        let cursorInterval = Duration.seconds(1) / Int(min(60, configuration.framesPerSecond))
+        var cursorMonitor = cursor.map { CursorMonitor(interval: cursorInterval, sample: $0) }
+        #if os(macOS)
+            if cursorMonitor == nil, case .mainDisplay = configuration.source {
+                let system = SystemCursor(displayID: CGMainDisplayID())
+                cursorMonitor = CursorMonitor(interval: cursorInterval, sample: system.sample)
+            }
+        #endif
         var pointer: PointerControlServer?
         if configuration.allowsPointerControl {
             #if os(macOS)
@@ -115,7 +132,9 @@ public final class RemoteScreenServer {
                 guard CGPreflightPostEventAccess() else {
                     throw SetupError.accessibilityAccessRequired
                 }
-                pointer = PointerControlServer(displayID: CGMainDisplayID())
+                pointer = PointerControlServer(displayID: CGMainDisplayID()) { [cursorMonitor] in
+                    cursorMonitor?.notePosted($0)
+                }
             #else
                 throw SetupError.pointerControlUnavailable
             #endif
@@ -156,7 +175,8 @@ public final class RemoteScreenServer {
         context = ServerConnection.Context(
             framesPerSecond: configuration.framesPerSecond,
             maximumVideoBitRate: configuration.maximumVideoBitRate,
-            startSource: startSource, pointer: pointer, diagnostics: configuration.diagnostics,
+            startSource: startSource, pointer: pointer, cursor: cursorMonitor,
+            diagnostics: configuration.diagnostics,
             onEvent: onEvent)
     }
 

@@ -2,11 +2,54 @@
     import AppKit
     import AVFoundation
     import CoreMedia
+    import RemoEngine
 
     @MainActor
     private final class VideoView: NSView {
         let display = AVSampleBufferDisplayLayer()
-        override func makeBackingLayer() -> CALayer { display }
+        private let cursorLayer = CALayer()
+        var videoSize: CGSize? {
+            didSet { if videoSize != oldValue { layoutCursor() } }
+        }
+        var cursor: RemoteCursor? {
+            didSet { if cursor != oldValue { layoutCursor() } }
+        }
+
+        override func makeBackingLayer() -> CALayer {
+            cursorLayer.isHidden = true
+            cursorLayer.zPosition = 1
+            display.addSublayer(cursorLayer)
+            return display
+        }
+
+        override func setFrameSize(_ newSize: NSSize) {
+            super.setFrameSize(newSize)
+            layoutCursor()
+        }
+
+        /// Places the cursor on the picture as `resizeAspect` fits it into the view.
+        private func layoutCursor() {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            defer { CATransaction.commit() }
+            guard let cursor, cursor.visible, let image = cursor.image, let videoSize,
+                videoSize.width > 0, videoSize.height > 0, !bounds.isEmpty
+            else {
+                cursorLayer.isHidden = true
+                return
+            }
+            let scale = min(bounds.width / videoSize.width, bounds.height / videoSize.height)
+            let picture = CGRect(
+                x: bounds.midX - videoSize.width * scale / 2,
+                y: bounds.midY - videoSize.height * scale / 2,
+                width: videoSize.width * scale, height: videoSize.height * scale)
+            // The cursor is measured from the top; this layer's origin is at the bottom.
+            var frame = cursor.frame(in: picture)
+            frame.origin.y = bounds.height - frame.maxY
+            cursorLayer.contents = image
+            cursorLayer.frame = frame
+            cursorLayer.isHidden = false
+        }
     }
 
     @MainActor
@@ -36,7 +79,13 @@
             NSApplication.shared.activate(ignoringOtherApps: true)
         }
 
+        func show(_ cursor: RemoteCursor) {
+            view.cursor = cursor
+        }
+
         func present(_ pixels: CVPixelBuffer, duration: CMTime) throws -> Bool {
+            view.videoSize = CGSize(
+                width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels))
             let layer = view.display
             if layer.status == .failed || layer.requiresFlushToResumeDecoding { layer.flush() }
             guard layer.isReadyForMoreMediaData else { return false }
