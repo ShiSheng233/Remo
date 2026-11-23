@@ -204,6 +204,8 @@ public final class MessageTransport {
         let sent: TimeInterval
         let bytes: Int
         var expires: TimeInterval?
+        /// An acknowledgement showed this transmission missing, rather than none arriving in time.
+        var lossSeen = false
     }
 
     public let datagramLimit: Int
@@ -258,6 +260,10 @@ public final class MessageTransport {
         let number: UInt32
         let sent: TimeInterval
         let bytes: Int
+        /// The observation window it was sent in.
+        let window: Int
+        /// Counted as lost there. An acknowledgement can still take that back.
+        var lost = false
     }
     private var deliveryRecords = Array<DeliveryRecord?>(repeating: nil, count: 8192)
     private var deliveryRate = 0.0
@@ -269,6 +275,56 @@ public final class MessageTransport {
     private var maxInFlightBytes: Int {
         max(4 * datagramLimit, Int(rate * max(0.15, (rtt ?? 0.1) * 2.0 + 0.05) / 8))
     }
+    /// What became of the datagrams sent in one observation window. Loss and delivery are
+    /// read against what was sent at the time, so a change of rate does not distort them.
+    private struct Sending {
+        var packets = 0
+        var bytes = 0
+        var acknowledged = 0
+        var acknowledgedBytes = 0
+        var lost = 0
+        var interval: TimeInterval = 0.25
+        var lossRatio: Double {
+            lost >= 3 && acknowledged + lost >= 20 ? Double(lost) / Double(acknowledged + lost) : 0
+        }
+        var deliveredRate: Double { Double(acknowledgedBytes) * 8 / interval }
+        var sentRate: Double { Double(bytes) * 8 / interval }
+        /// Whether this one window lost more than `tolerated` beyond what chance explains:
+        /// a quarter second of a link that loses a steady share now and then loses twice it.
+        func exceeds(_ tolerated: Double) -> Bool {
+            Self.exceeds(tolerated, acknowledged: acknowledged, lost: lost)
+        }
+
+        static func exceeds(_ tolerated: Double, acknowledged: Int, lost: Int) -> Bool {
+            let count = Double(acknowledged + lost)
+            let expected = count * tolerated
+            return lost >= 3 && count >= 20 && Double(lost) > expected + 2 * (expected * (1 - tolerated)).squareRoot()
+        }
+    }
+
+    /// Whether more is being lost than `tolerated`, beyond what chance explains: a lot in the
+    /// newest window that can tell, or less over a second, or a little over four.
+    private func lossExceeds(_ tolerated: Double, onset: Sending) -> Bool {
+        if onset.exceeds(tolerated) { return true }
+        let settled = windowIndex - settling
+        for span in [4, 16] {
+            // What was lost before the budget last came down says nothing about it now.
+            let (acknowledged, lost) = outcome(from: max(settled - span + 1, lossEpoch), through: settled)
+            if Sending.exceeds(tolerated, acknowledged: acknowledged, lost: lost) { return true }
+        }
+        return false
+    }
+    /// A budget is worth no more than this over what was delivered when the link was full:
+    /// an application that spends little of it would send the rest in bursts the link has
+    /// just shown it cannot take.
+    private static let headroom = 1.5
+    private var sendings: [Int: Sending] = [0: Sending()]
+    private var windowIndex = 0
+    /// The first window sent at the budget as it was last reduced.
+    private var lossEpoch = 0
+    /// How many windows back a datagram's loss is certain to have been counted: one for a
+    /// suspicion to age, one for it to arise, and the round trip.
+    private var settling: Int { 2 + Int((rtt ?? 0.1) / 0.25) }
     private var windowBytes = 0
     private var windowAcknowledged = 0
     private var windowPackets = 0
@@ -282,6 +338,10 @@ public final class MessageTransport {
     // Recovery acts on a timeout immediately. Rate control waits one full observation
     // window so a later bitmap can clear that exact transmission, even after payload eviction.
     private var suspectedLosses: Set<UInt32> = []
+    /// Fragments past their retry budget whose only sign of loss is a missing acknowledgement,
+    /// with when to give up on them. Acknowledgements get lost too, and every later one repeats
+    /// the last 64 packet numbers, so one can still confirm the fragment.
+    private var unconfirmed: [Wire.Fragment: TimeInterval] = [:]
     private var agingLosses: Set<UInt32> = []
     private var confirmations = 0
 
@@ -308,16 +368,127 @@ public final class MessageTransport {
     private var holdUntil: TimeInterval = 0
     private var cutQueueDelay: TimeInterval?
     private var futileCuts = 0
-    /// A rate the link is known to struggle beyond, approached slowly while the memory is fresh.
+    /// The budget the link was found to carry the last time it was full. While the memory is
+    /// fresh the budget is raised beyond it only by testing: a step up, counted once the
+    /// application has sent that much more and those datagrams are accounted for, and taken
+    /// back to what got through if the link pushes back. Steps start small, so a failed one
+    /// costs little, and grow while they pass, so spare capacity is found in a few.
     private var capacityMark: (rate: Double, at: TimeInterval)?
+    private struct Probe {
+        /// The budget before the step.
+        let base: Double
+        /// The window at whose end the step has been tested, and the one at whose end it is
+        /// given up as never tried.
+        let verify: Int
+        let expires: Int
+        /// What has to be sent for the step to count as tried: half the way from what was
+        /// sent before it toward what the step allows. Nil for an application that was not
+        /// spending its budget: sending more then proves nothing, only bursts that the
+        /// budget alone held back and that went through do.
+        let exercised: Double?
+    }
+    private var probe: Probe?
+    /// When the latest step passed. It stays in doubt for a while: a link that polices its
+    /// rate lets a burst through before it starts to drop, so trouble can come seconds late.
+    private var passed: TimeInterval?
+    /// Whether the latest step was a bold one, taken on the strength of `proven`.
+    private var steppedBoldly = false
+    /// A budget the link keeps turning out to be full at, and how many times in a row. The
+    /// more often, the longer the wait before testing beyond it again: nothing has changed
+    /// up there. A different capacity starts the count afresh.
+    ///
+    /// How the link said so matters. One that queues shows a step too far as a little delay,
+    /// at once, and at no cost: it can be tested often. One that polices its rate drops
+    /// datagrams instead, and only after letting a burst through: there a step too far costs
+    /// loss and shows late, so tests are rarer and each has to hold before the next.
+    private var wall: (rate: Double, hits: Int, policed: Bool)?
+    private var steadyWall: Bool { wall?.policed == true }
+    /// When a queue was last seen building. Loss with no queue anywhere near it is policing.
+    private var queueSeenAt: TimeInterval = -.infinity
+    private var probeStep = MessageTransport.firstProbeStep
+    private var probeWait = MessageTransport.firstProbeWait
+    private var nextProbe: TimeInterval = 0
+    /// The highest budget that was used without trouble lately. Below it, steps are bold
+    /// from the start: a link that dipped usually comes back.
+    private var proven: (rate: Double, at: TimeInterval)?
+    /// A budget on its way to being proven: used since `at` with nothing pushing back.
+    private var proving: (rate: Double, at: TimeInterval)?
+    private static let firstProbeStep = 0.05
+    private static let maximumProbeStep = 0.25
+    private static let firstProbeWait = 1.0
+    private static let maximumProbeWait = 16.0
+    private static let maximumProbeWaitQueued = 4.0
+    /// How far past a wall the budget has to get before steps grow again.
+    private static let clearOfWall = 1.15
+    private static let markLifetime = 60.0
+    private static let doubt = 4.0
+    /// After congestion the budget returns to where the application sends this share of
+    /// what got through.
+    private static let fill = 0.95
+
+    /// Whether a step up is being tested or has passed too recently to be trusted.
+    private func stepInDoubt(_ now: TimeInterval) -> Bool {
+        probe != nil || (passed.map { now - $0 < Self.doubt } ?? false)
+    }
+
+    /// The link was full and carries `capacity`: a measurement, or for a step that failed
+    /// only a first reading, which does not move a wall already found.
+    private func mark(_ capacity: Double, _ now: TimeInterval, policed: Bool, measured: Bool = true) {
+        if let known = wall, !measured || abs(capacity - known.rate) <= known.rate * 0.2 {
+            wall = (measured ? (known.rate + capacity) / 2 : known.rate, known.hits + 1, policed)
+            probeWait = min(policed ? Self.maximumProbeWait : Self.maximumProbeWaitQueued, probeWait * 2)
+        } else {
+            wall = (capacity, 1, policed)
+            probeWait = Self.firstProbeWait
+        }
+        // A bold step that failed: the link has not come back to what it was.
+        if steppedBoldly, stepInDoubt(now) { proven = nil }
+        probeStep = Self.firstProbeStep
+        capacityMark = (capacity, now)
+        lossEpoch = windowIndex + 1
+        nextProbe = now + probeWait
+        probe = nil
+        passed = nil
+        proving = nil
+    }
+
     // Loss alone doesn't say whether the link is full. A reduction that makes it go away does.
-    private var lossTrial: (rate: Double, loss: Double, until: TimeInterval)?
+    private struct LossTrial {
+        /// The budget to return to if the loss turns out to be the link's own.
+        let rate: Double
+        /// The loss the reduction has to remove.
+        var reference: Double
+        /// What got through while the loss was seen: the link's capacity, if it was full.
+        var delivered: Double
+        /// What was sent then.
+        var sent: Double
+        /// The first window sent entirely at the reduced rate.
+        var start: Int
+    }
+    private var lossTrial: LossTrial?
     private var toleratedLoss = 0.02
+    /// Loss is not accepted as the link's own beyond this: a wrong verdict then costs little.
+    private static let maximumToleratedLoss = 0.15
+    /// Consecutive verdicts that the loss was the link's own, and when the next test is due.
+    private var linkVerdicts = 0
+    private var nextLossTrial: TimeInterval = 0
     private var toleratedLossAt: TimeInterval = 0
+    /// The share lost of the datagrams sent over about a second, as far back as their fate is known.
     private var lossRatio: Double {
-        let packets = history.reduce(0) { $0 + $1.packets }
-        let losses = history.reduce(0) { $0 + $1.losses }
-        return packets >= 20 && losses >= 3 ? min(1, Double(losses) / Double(packets)) : 0
+        let (acknowledged, lost) = outcome(from: windowIndex - settling - 3, through: windowIndex - settling)
+        return acknowledged + lost >= 20 && lost >= 3 ? Double(lost) / Double(acknowledged + lost) : 0
+    }
+
+    private func outcome(from first: Int, through last: Int) -> (acknowledged: Int, lost: Int) {
+        var acknowledged = 0
+        var lost = 0
+        guard last >= max(0, first) else { return (0, 0) }
+        for index in max(0, first)...last {
+            guard let sending = sendings[index] else { continue }
+            acknowledged += sending.acknowledged
+            lost += sending.lost
+        }
+        return (acknowledged, lost)
     }
 
     /// Fits inside IPv6's 1280-byte minimum MTU even after inner IPv4/UDP + WireGuard encapsulation
@@ -439,6 +610,7 @@ public final class MessageTransport {
         replaceable.removeAll()
         outcomes.removeAll()
         attempts.removeAll()
+        unconfirmed.removeAll()
         inFlightBytes = 0
         events.removeAll()
         if armed != nil {
@@ -566,6 +738,11 @@ public final class MessageTransport {
             if let record = deliveryRecords[slot], record.number == number {
                 deliveryRecords[slot] = nil
                 newDelivery = true
+                if sendings[record.window] != nil {
+                    sendings[record.window]!.acknowledged += 1
+                    sendings[record.window]!.acknowledgedBytes += record.bytes
+                    if record.lost { sendings[record.window]!.lost -= 1 }
+                }
                 let elapsed = max(0, now - record.sent)
                 if elapsed <= 2 {
                     windowAcknowledged += record.bytes
@@ -613,6 +790,23 @@ public final class MessageTransport {
                 if attempt.expires != nil { inFlightBytes = max(0, inFlightBytes - attempt.bytes) }
                 attempts.removeValue(forKey: number)
             }
+            for key in confirmed { unconfirmed[key] = nil }
+        }
+        if !unconfirmed.isEmpty, highConfirmed.count == 3 {
+            // A fragment waiting for its acknowledgement is lost once one that covers its packet
+            // number shows it missing, behind three later packets that did arrive.
+            var missing: Set<Wire.Fragment> = []
+            for (number, attempt) in attempts
+            where unconfirmed[attempt.key] != nil && number < highConfirmed[2] && number < largest
+                && largest - number < 64 && bits & (UInt64(1) << (largest - number)) == 0
+            {
+                attempts[number]?.lossSeen = true
+                missing.insert(attempt.key)
+            }
+            for key in missing {
+                guard let msg = messages[key.id] else { continue }
+                if !attempts.values.contains(where: { $0.key == key && !$0.lossSeen }) { abandon(key, msg) }
+            }
         }
         if highConfirmed.count == 3 {
             for (number, attempt) in attempts
@@ -628,6 +822,7 @@ public final class MessageTransport {
 
     private func lose(_ number: UInt32, _ attempt: Attempt, _ now: TimeInterval, timeout: Bool) {
         suspectedLosses.insert(number)
+        if !timeout { attempts[number]?.lossSeen = true }
         if attempts[number]?.expires != nil {
             inFlightBytes = max(0, inFlightBytes - attempt.bytes)
             attempts[number]?.expires = nil
@@ -653,6 +848,18 @@ public final class MessageTransport {
     /// longer complete, but its other fragments still run their course: a loss verdict can be
     /// wrong, and the fragment may have arrived.
     private func abandon(_ key: Wire.Fragment, _ msg: Message) {
+        if unconfirmed[key] == nil {
+            let sent = attempts.values.filter { $0.key == key }
+            if !sent.isEmpty, !sent.contains(where: \.lossSeen) {
+                // Sent, and nothing says it went missing: wait a little for an acknowledgement
+                // before telling the application it was lost. It is not sent again meanwhile.
+                unconfirmed[key] = clock() + max(0.1, 2 * (rtt ?? 0.05))
+                msg.retries.remove(key.index)
+                msg.spare.remove(key.index)
+                return
+            }
+        }
+        unconfirmed[key] = nil
         for (number, attempt) in attempts where attempt.key == key {
             if attempt.expires != nil { inFlightBytes = max(0, inFlightBytes - attempt.bytes) }
             attempts.removeValue(forKey: number)
@@ -673,6 +880,13 @@ public final class MessageTransport {
             } else if now >= msg.deadline {
                 // Fragments still in flight are settled by their acknowledgement or timeout.
                 for index in msg.retries.union(msg.spare) { abandon(.init(id: id, index: index), msg) }
+            }
+        }
+        for (key, deadline) in unconfirmed where deadline <= now {
+            if let msg = messages[key.id] {
+                abandon(key, msg)
+            } else {
+                unconfirmed[key] = nil
             }
         }
         for (number, attempt) in attempts {
@@ -702,6 +916,14 @@ public final class MessageTransport {
         }
         if now >= sampleAt + 0.25 {
             let interval = now - sampleAt
+            // A suspicion that survived a window without an acknowledgement is a loss.
+            for number in agingLosses {
+                let slot = Int(number) % deliveryRecords.count
+                guard let record = deliveryRecords[slot], record.number == number, !record.lost else { continue }
+                deliveryRecords[slot]?.lost = true
+                sendings[record.window]?.lost += 1
+            }
+            sendings[windowIndex, default: Sending()].interval = interval
             history.append(Window(
                 interval: interval, sent: windowBytes, acknowledged: windowAcknowledged,
                 packets: windowPackets, losses: agingLosses.count))
@@ -723,6 +945,9 @@ public final class MessageTransport {
             agingLosses = suspectedLosses
             suspectedLosses.removeAll(keepingCapacity: true)
             sampleAt = now
+            windowIndex += 1
+            sendings[windowIndex] = Sending()
+            sendings[windowIndex - 32] = nil
         }
     }
 
@@ -780,18 +1005,77 @@ public final class MessageTransport {
             futileCuts = 0
         }
         // The first sign of a queue ends the quick climb, before it has to be undone.
-        if (queueDelay ?? 0) > tolerance / 2 { startup = false }
+        if (queueDelay ?? 0) > tolerance / 2 {
+            startup = false
+            queueSeenAt = now
+        }
+        if let tested = probe, let queueDelay, queueDelay > tolerance / 2, queueDelay <= tolerance, now >= holdUntil {
+            // A queue is forming under the step: far enough. Back to before it, while that
+            // costs nothing yet.
+            rate = min(rate, tested.base)
+            mark(rate, now, policed: false, measured: false)
+            return
+        }
         let loss = lossRatio
-        if let trial = lossTrial, now >= trial.until {
-            lossTrial = nil
-            if loss > trial.loss * 0.6 {
-                // Sending less changed nothing, so this loss is the link's own. Put the rate
-                // back and stop reading loss at this level as a sign of congestion.
-                toleratedLoss = max(toleratedLoss, loss * 1.3 + 0.01)
-                toleratedLossAt = now
-                rate = max(rate, trial.rate)
-            } else {
-                capacityMark = (rate, now)
+        // The newest window whose deliveries are all in. Its losses are not: what it shows
+        // lost so far is the least it lost.
+        let latest = windowIndex - settling + 1
+        let onset = sendings[latest] ?? Sending()
+        if var trial = lossTrial {
+            if latest < trial.start, onset.exceeds(toleratedLoss), onset.deliveredRate < trial.delivered * 0.9 {
+                // Sent before the reduction, and less of it got through than the reduction was
+                // sized for: the loss had only begun. Reduce once more, to what this shows.
+                trial.delivered = onset.deliveredRate
+                trial.sent = onset.sentRate
+                trial.reference = max(trial.reference, onset.lossRatio)
+                trial.start = windowIndex + 1
+                lossEpoch = windowIndex + 1
+                rate = max(Self.minimumRate, min(rate, trial.delivered * 0.9))
+                lossTrial = trial
+            } else if latest < trial.start {
+                trial.reference = max(trial.reference, onset.lossRatio)
+                lossTrial = trial
+            }
+            let settled = windowIndex - settling
+            if settled >= trial.start + 2 {
+                lossTrial = nil
+                let (acknowledged, lost) = outcome(from: trial.start, through: settled)
+                let after = acknowledged + lost > 0 ? Double(lost) / Double(acknowledged + lost) : 0
+                if acknowledged + lost < 30 {
+                    // Too little was sent to tell. Nothing is learned either way.
+                    rate = max(rate, trial.rate)
+                } else if after > trial.reference * 0.4, after <= trial.reference * 0.7 {
+                    // Less, but not gone: this could be chance either way. Nothing is learned.
+                    rate = max(rate, trial.rate)
+                } else if after <= trial.reference * 0.4 {
+                    // Sending less ended the loss: the link was full, and what got through
+                    // then is what it carries. Return to that.
+                    // The budget that makes the application send just under that: by how much
+                    // it overshot, it comes down. One that spends little of its budget is
+                    // held to a margin over what it did send.
+                    let share = trial.sent > 0 ? min(1, trial.delivered / trial.sent) : 1
+                    rate = max(rate, min(trial.rate * share * Self.fill, trial.delivered * Self.headroom))
+                    mark(rate, now, policed: now - queueSeenAt > 3)
+                    if after > toleratedLoss {
+                        // What is left is not for want of capacity.
+                        toleratedLoss = min(Self.maximumToleratedLoss, after * 1.3 + 0.01)
+                        toleratedLossAt = now
+                    }
+                    linkVerdicts = 0
+                    nextLossTrial = now
+                } else {
+                    // Sending less changed nothing, so this loss is the link's own. Put the
+                    // rate back and stop reading loss at this level as a sign of congestion.
+                    toleratedLoss = min(Self.maximumToleratedLoss, max(toleratedLoss, after * 1.3 + 0.01))
+                    toleratedLossAt = now
+                    rate = max(rate, trial.rate)
+                    // Loss beyond what is accepted keeps asking the question. Ask it less often.
+                    linkVerdicts += 1
+                    nextLossTrial = now + min(30, Double(1 << min(linkVerdicts, 5)))
+                }
+                // What was lost before the reduction is still in the last second's count.
+                holdUntil = max(holdUntil, now + 0.5)
+                return
             }
         }
         if toleratedLoss > 0.02, now >= toleratedLossAt + 30 {
@@ -815,6 +1099,11 @@ public final class MessageTransport {
                 floorRotatedAt = now
                 futileCuts = 0
                 cutQueueDelay = nil
+                // With the floor moved, a queue that is still there no longer shows. Nothing
+                // is raised on the strength of it having gone: steps up wait until the floor
+                // has had time to come back down, and there is no way back to a ceiling.
+                nextProbe = max(nextProbe, now + 5)
+                recoveryCeiling = 0
                 return
             }
             // A standing queue means the link is saturated, so what it delivered of what was
@@ -828,24 +1117,55 @@ public final class MessageTransport {
             }
             let eligibleSent = max(acknowledged, sent - youngInFlight)
             let carried = eligibleSent > 0 ? max(0.25, min(1, Double(acknowledged) / Double(eligibleSent))) : 1
-            let sustainable = max(Self.minimumRate, rate * 0.9 * carried)
+            // The budget also comes down to where the application sends just under what the
+            // link was seen to deliver: by the share of the budget it has been spending, or,
+            // for one that spends little of it and would not be slowed by a share off, to a
+            // margin over what arrived. On a long queue most of what was sent is still on its
+            // way and `carried` says little; this then is what holds.
+            let duration = recent.reduce(0.0) { $0 + $1.interval }
+            let delivered = duration > 0 ? Double(acknowledged) * 8 / duration : rate
+            let spending = duration > 0 ? min(1, Double(sent) * 8 / duration / rate) : 1
+            let sustainable = max(
+                Self.minimumRate,
+                min(rate * 0.9 * carried, delivered * min(Self.headroom, Self.fill / max(spending, 0.01))))
             startup = false
             resetDeliveryRateAfterBackoff()
             recoveryCeiling = sustainable
-            capacityMark = (sustainable, now)
+            mark(sustainable, now, policed: false)
             rate = max(Self.minimumRate, sustainable * max(0.5, 1 - queueDelay))
             cutQueueDelay = queueDelay
             holdUntil = now + max(0.5, 2 * (rtt ?? 0))
             lossTrial = nil
-        } else if loss > toleratedLoss, lossTrial == nil, now >= holdUntil {
+        } else if lossExceeds(toleratedLoss, onset: onset), lossTrial == nil, now >= max(holdUntil, nextLossTrial) {
             healthyFeedbackTime = 0
-            // If the link is full, sending this much less ends the loss.
-            let until = now + 1.5 + 2 * (rtt ?? 0)
-            lossTrial = (rate, loss, until)
+            if stepInDoubt(now) {
+                // The step up met loss: this is as far as the link goes. Back to what got
+                // through, without a trial, and let what was sent meanwhile clear before
+                // reading loss again.
+                let share = onset.sentRate > 0 ? min(1, onset.deliveredRate / onset.sentRate) : 1
+                rate = max(Self.minimumRate, min(rate * share * Self.fill, wall?.rate ?? rate))
+                mark(rate, now, policed: now - queueSeenAt > 3, measured: false)
+                holdUntil = now + Double(settling + 4) * 0.25
+                return
+            }
+            // If the link is full, what got through is what it carries, and sending less than
+            // that ends the loss. The reduction is taken from what was delivered, not from the
+            // budget: an application that spends less than its budget would not feel a cut in it.
+            let sample = onset.exceeds(toleratedLoss) ? onset : sendings[windowIndex - settling] ?? onset
+            // Of a burst a queue took in, all is delivered in the end, but no faster than
+            // the link carries: what arrived lately bounds what counts as delivered.
+            let lately = history.suffix(2)
+            let span = lately.reduce(0.0) { $0 + $1.interval }
+            let arriving = span > 0 ? Double(lately.reduce(0) { $0 + $1.acknowledged }) * 8 / span : .infinity
+            let delivered = max(Self.minimumRate, min(sample.deliveredRate, max(arriving, sample.deliveredRate * 0.5)))
+            lossTrial = LossTrial(
+                rate: rate, reference: max(loss, sample.lossRatio), delivered: delivered,
+                sent: max(delivered, sample.sentRate), start: windowIndex + 1)
             startup = false
-            rate = max(Self.minimumRate, rate * (1 - loss) * 0.95)
-            holdUntil = until
-        } else if confirmations > 0, loss <= toleratedLoss, (queueDelay ?? 0) <= tolerance / 2,
+            lossEpoch = windowIndex + 1
+            rate = max(Self.minimumRate, min(rate, delivered * 0.9))
+        } else if confirmations > 0, loss <= toleratedLoss, !onset.exceeds(toleratedLoss),
+            (queueDelay ?? 0) <= tolerance / 2,
             probeAt == nil, lossTrial == nil, now >= holdUntil
         {
             healthyFeedbackTime += min(interval, 0.5)
@@ -853,10 +1173,19 @@ public final class MessageTransport {
             // we are not draining after a congestion backoff, measure the active burst delivery rate
             // so short high-bitrate desktop bursts (like opening a Dock grid) prove link capacity
             // without waiting for a full quiet-free second to lift the 1 s average.
-            let nearMark = capacityMark.map { now - $0.at < 20 && rate >= $0.rate * 0.98 } ?? false
+            if let known = capacityMark, now - known.at >= Self.markLifetime, !stepInDoubt(now) { capacityMark = nil }
+            if let at = passed, now - at >= Self.doubt {
+                // The step has held.
+                passed = nil
+                if let known = wall, rate > known.rate * Self.clearOfWall {
+                    // Well past where the link kept being full: it has more to give now.
+                    wall = nil
+                    probeWait = Self.firstProbeWait
+                }
+            }
             var pacerLimited = false
             var burstRate = 0.0
-            if history.count >= 2, recoveryCeiling == 0, !nearMark, windowBacklogged,
+            if history.count >= 2, recoveryCeiling == 0, windowBacklogged,
                 confirmations >= 8, windowAcknowledged >= 8 * datagramLimit,
                 let firstSend = windowFirstConfirmedSend, let lastAck = windowLastConfirmedAt
             {
@@ -867,21 +1196,81 @@ public final class MessageTransport {
                     deliveryRate = max(deliveryRate, min(rate, burstRate))
                 }
             }
+            let sentLately = ((sendings[latest - 1]?.sentRate ?? onset.sentRate) + onset.sentRate) / 2
+            if let tested = probe, windowIndex >= tested.expires,
+                !(pacerLimited || tested.exercised.map { sentLately >= $0 } ?? false)
+            {
+                // Never tried: the application had no use for it. Nothing is known about it,
+                // so it is not kept.
+                rate = min(rate, tested.base)
+                probe = nil
+                nextProbe = now + probeWait
+            }
+            if let tested = probe, windowIndex >= tested.verify,
+                pacerLimited || tested.exercised.map({ sentLately >= $0 }) ?? false
+            {
+                // The step was used and nothing pushed back: more was sent, or bursts were held
+                // back by the budget alone and went through. The next can be larger. Against
+                // a wall it first has to hold: what passes at once there often fails late.
+                probe = nil
+                passed = now
+                if let known = wall, rate <= known.rate * Self.clearOfWall {
+                    // Still near where the link was last full: keep to small steps, which cost
+                    // next to nothing when they fail, until clear of it.
+                    probeStep = Self.firstProbeStep
+                } else {
+                    probeStep = min(Self.maximumProbeStep, probeStep * 2.5)
+                    if wall?.policed == false { wall = nil }
+                }
+                nextProbe = steadyWall ? now + Self.doubt : now
+                capacityMark = (rate, now)
+            }
+            let used = queued || utilized || pacerLimited
+            // A budget counts as proven once it has been used for two seconds without trouble:
+            // sooner, trouble may simply not have shown yet.
+            if used, proving.map({ rate > $0.rate }) ?? true { proving = (rate, now) }
+            if let held = proving, now - held.at >= 2, proven.map({ held.rate > $0.rate || now - $0.at > 120 }) ?? true {
+                proven = (held.rate, now)
+            }
             if min(recoveryCeiling, probeCeiling) > rate && healthyFeedbackTime >= 0.5 {
                 // The queue has emptied: return to what the link was just shown to carry.
                 rate = min(recoveryCeiling, probeCeiling, rate * 1.15)
                 healthyFeedbackTime = 0
-            } else if (queued || utilized || pacerLimited) && (pacerLimited || probeCeiling > rate) {
-                // Probe upward when the budget is used. Ramp aggressively when the pacer itself
-                // is bottlenecking clean bursts (especially on low-RTT LAN paths during startup),
-                // and gently near a recently confirmed capacity mark.
+            } else if used, probe == nil, let known = capacityMark, rate < known.rate * 0.98 {
+                // Below what the link is known to carry: go back there.
+                rate = min(known.rate, rate * 1.25)
+            } else if used, capacityMark != nil {
+                if probe == nil, now >= nextProbe {
+                    // Test a higher rate: boldly where this much was carried not long ago and
+                    // the link has not just shown otherwise.
+                    // Steps are sized for a short round trip. On a long one their effect shows
+                    // later and lasts longer, so they are smaller.
+                    let reach = min(1, 0.12 / max(rtt ?? 0.05, 0.03))
+                    var step = probeStep * reach
+                    steppedBoldly = false
+                    if !steadyWall, probeStep > Self.firstProbeStep, let known = proven, now - known.at <= 120,
+                        rate * (1 + Self.maximumProbeStep) <= known.rate
+                    {
+                        step = Self.maximumProbeStep * reach
+                        steppedBoldly = true
+                    }
+                    // What was sent over the last second, against which the step has to show.
+                    let before = (windowIndex - 3...windowIndex).compactMap { sendings[$0]?.sentRate }
+                    let sentBefore = before.reduce(0, +) / Double(max(1, before.count))
+                    probe = Probe(
+                        base: rate, verify: windowIndex + 1 + settling, expires: windowIndex + 13 + settling,
+                        exercised: sentBefore >= rate * 0.6 ? sentBefore * (1 + 0.5 * step) : nil)
+                    rate = min(100_000_000, rate * (1 + step))
+                }
+            } else if used && (pacerLimited || probeCeiling > rate) {
+                // (Reached only without a capacity mark.)
+                // The link has not pushed back yet, or not for a while. Probe upward when the
+                // budget is used, aggressively when the pacer itself is bottlenecking clean
+                // bursts (especially on low-RTT LAN paths during startup).
                 let lowRTT = (minimumRTT ?? .infinity) < 0.02
                 let step: Double
                 let ceiling: Double
-                if nearMark {
-                    step = 1.002
-                    ceiling = probeCeiling
-                } else if pacerLimited {
+                if pacerLimited {
                     step = startup ? (lowRTT ? 2.0 : 1.50) : (lowRTT ? 1.40 : 1.20)
                     ceiling = max(probeCeiling, min(rate, burstRate) * step)
                 } else {
@@ -890,7 +1279,9 @@ public final class MessageTransport {
                 }
                 rate = min(100_000_000, ceiling, rate * step)
             }
-            if rate >= recoveryCeiling { recoveryCeiling = 0 }
+            // An application that sends little since never earns the way back. The ceiling
+            // then only stands in the way of what its bursts can show.
+            if rate >= recoveryCeiling || (probeCeiling <= rate && healthyFeedbackTime >= 1) { recoveryCeiling = 0 }
         } else if probeAt != nil {
             healthyFeedbackTime = 0
         }
@@ -954,7 +1345,9 @@ public final class MessageTransport {
         lastDataSend = sent
         let timeout = min(0.5, rto * Double(1 << msg.timeouts[key.index, default: 0]))
         deliveryRecords[Int(lastPacket) % deliveryRecords.count] = DeliveryRecord(
-            number: lastPacket, sent: sent, bytes: bytes.count)
+            number: lastPacket, sent: sent, bytes: bytes.count, window: windowIndex)
+        sendings[windowIndex, default: Sending()].packets += 1
+        sendings[windowIndex, default: Sending()].bytes += bytes.count
         attempts[lastPacket] = Attempt(key: key, sent: sent, bytes: bytes.count, expires: sent + timeout)
         inFlightBytes += bytes.count
         if progressAt == nil { progressAt = sent }
@@ -975,6 +1368,7 @@ public final class MessageTransport {
             if msg.deadline > now { wake = min(wake, msg.deadline) }
         }
         for attempt in attempts.values { wake = min(wake, attempt.expires ?? .infinity) }
+        for deadline in unconfirmed.values { wake = min(wake, deadline) }
         if let probeAt {
             if !blocked && probeAt > now { wake = min(wake, probeAt) }
         } else if let start = progressAt {
