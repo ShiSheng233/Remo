@@ -24,6 +24,8 @@ struct TrackpadView: View {
     let surface: VideoSurface
     /// Pixel size of the remote picture, which the zoomed view is sized from.
     var videoSize: CGSize?
+    /// Height obscured at the bottom (e.g. the on-screen keyboard).
+    var bottomInset: CGFloat = 0
 
     @State private var wheelFrame = CGRect.zero
 
@@ -31,9 +33,13 @@ struct TrackpadView: View {
         // The trackpad’s UIKit view would otherwise take real touches meant for the wheel.
         TrackpadRegion(
             onInput: onInput, excludedRects: excludedRects + (showsWheel ? [wheelFrame] : []),
-            surface: surface, videoSize: videoSize)
+            surface: surface, videoSize: videoSize, bottomInset: bottomInset)
             .overlay(alignment: .trailing) {
-                if showsWheel { wheel }
+                if showsWheel {
+                    wheel
+                        .padding(.bottom, bottomInset)
+                        .animation(.spring(duration: 0.36, bounce: 0.06), value: bottomInset)
+                }
             }
     }
 
@@ -215,6 +221,13 @@ private final class TouchSurface: UIScrollView {
     var videoSize: CGSize? {
         didSet { if videoSize != oldValue { resetZoom() } }
     }
+    /// Height obscured along the bottom edge, such as an active on-screen keyboard.
+    var bottomInset: CGFloat = 0 {
+        didSet {
+            guard abs(bottomInset - oldValue) > 0.5 else { return }
+            updateBottomInset()
+        }
+    }
     /// The picture at its fitted size; zooming scales it.
     var zoomContent: UIView? {
         didSet {
@@ -278,7 +291,9 @@ private final class TouchSurface: UIScrollView {
     func reveal(_ rect: CGRect, in view: UIView) {
         guard !isZooming, !isZoomBouncing, !isDragging, !bounds.isEmpty else { return }
         let target = view.convert(rect, to: self)
-        let visible = bounds
+        let visible = CGRect(
+            x: bounds.minX, y: bounds.minY,
+            width: bounds.width, height: max(0, bounds.height - bottomInset))
         func shift(_ low: CGFloat, _ high: CGFloat, within start: CGFloat, _ end: CGFloat) -> CGFloat {
             if low < start { return low - start }
             if high > end { return high - end }
@@ -305,8 +320,23 @@ private final class TouchSurface: UIScrollView {
     func centerContent() {
         let size = contentSize
         let x = max(0, (bounds.width - size.width) / 2)
-        let y = max(0, (bounds.height - size.height) / 2)
-        contentInset = UIEdgeInsets(top: y, left: x, bottom: y, right: x)
+        let visibleHeight = max(0, bounds.height - bottomInset)
+        let y = max(0, (visibleHeight - size.height) / 2)
+        contentInset = UIEdgeInsets(top: y, left: x, bottom: y + bottomInset, right: x)
+    }
+
+    private func updateBottomInset() {
+        UIView.animate(.spring) {
+            self.centerContent()
+            let minimumY = -self.contentInset.top
+            let maximumY = max(minimumY, self.contentSize.height + self.contentInset.bottom - self.bounds.height)
+            let clampedY = min(maximumY, max(minimumY, self.contentOffset.y))
+            if self.contentSize.height <= max(0, self.bounds.height - self.bottomInset) {
+                self.contentOffset.y = minimumY
+            } else if clampedY != self.contentOffset.y {
+                self.contentOffset.y = clampedY
+            }
+        }
     }
 
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
@@ -346,6 +376,7 @@ private struct TrackpadRegion: UIViewRepresentable {
     let excludedRects: [CGRect]
     let surface: VideoSurface
     let videoSize: CGSize?
+    let bottomInset: CGFloat
 
     func makeCoordinator() -> Coordinator { Coordinator(onInput: onInput) }
 
@@ -374,6 +405,7 @@ private struct TrackpadRegion: UIViewRepresentable {
         uiView.excludedRects = excludedRects
         uiView.zoomContent = surface
         uiView.videoSize = videoSize
+        uiView.bottomInset = bottomInset
         surface.onCursorMoved = { [weak uiView, weak surface] frame in
             guard let uiView, let surface else { return }
             uiView.reveal(frame, in: surface)
