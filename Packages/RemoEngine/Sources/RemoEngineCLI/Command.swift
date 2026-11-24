@@ -13,11 +13,13 @@ enum Command {
     static let usage = """
         Usage:
           remo-engine server [port] [--screen] [--control] [--wire-stats] [--trace-heartbeats]
-          remo-engine client <host> [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--audio] [--wire-stats] [--trace-heartbeats]
+          remo-engine client <host> [port] [--resolution WIDTHxHEIGHT] [--virtual-display WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--audio] [--wire-stats] [--trace-heartbeats]
 
         Default UDP port: \(RemoProtocol.defaultPort)
         --resolution sets the test pattern size or caps screen capture at WIDTHxHEIGHT pixels (client).
         Dimensions must be even (2...8192). Defaults: 640x360 test pattern, screen longest edge 1920.
+        --virtual-display creates a @2x HiDPI virtual display on the server with logical size WIDTHxHEIGHT pt (client).
+        Logical dimensions must be 800...3600 × 600...3600 pt (e.g. 890x626 creates 1780x1252 px).
         --fps sets the target frame rate (1...240, default 60, client). Screen capture runs VFR up to this rate.
         --max-video-bitrate sets the video bitrate ceiling in bits per second (default 5000000, client).
         --screen streams the main display on the server and opens a video window on the client (macOS).
@@ -66,9 +68,10 @@ enum Command {
         let screen = present.contains("--screen")
         let audio = present.contains("--audio")
         var resolution: StreamParameters.Size?
+        var virtualDisplay: StreamParameters.VirtualDisplay?
         var fps: Int32 = StreamParameters.defaultFramesPerSecond
         var bitRate = StreamParameters.defaultMaximumVideoBitRate
-        for option in ["--resolution", "--fps", "--max-video-bitrate"] {
+        for option in ["--resolution", "--virtual-display", "--fps", "--max-video-bitrate"] {
             guard let index = args.firstIndex(of: option) else { continue }
             guard args.first == "client" else { fail("\(option) is a client option.") }
             guard index + 1 < args.count else { fail("Missing value for \(option).") }
@@ -82,6 +85,13 @@ enum Command {
                     fail("Expected --max-video-bitrate in bits per second (1...2147483647).")
                 }
                 bitRate = Int(value)
+            case "--virtual-display":
+                let parts = value.lowercased().split(
+                    separator: "x", omittingEmptySubsequences: false)
+                guard parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) else {
+                    fail("Expected --virtual-display WIDTHxHEIGHT (logical points).")
+                }
+                virtualDisplay = StreamParameters.VirtualDisplay(logicalWidth: w, logicalHeight: h)
             default:
                 let parts = value.lowercased().split(
                     separator: "x", omittingEmptySubsequences: false)
@@ -119,8 +129,8 @@ enum Command {
                 port: port)
         } else {
             let stream = StreamParameters(
-                maximumSize: resolution, framesPerSecond: fps, maximumVideoBitRate: bitRate,
-                streamsAudio: audio)
+                maximumSize: resolution, virtualDisplay: virtualDisplay,
+                framesPerSecond: fps, maximumVideoBitRate: bitRate, streamsAudio: audio)
             if let problem = stream.validationProblem { fail(problem) }
             let endpoint = NWEndpoint.hostPort(
                 host: NWEndpoint.Host(args[1]), port: NWEndpoint.Port(rawValue: port)!)
@@ -139,8 +149,9 @@ enum Command {
                 case .listening(let port): log("Listening on UDP port \(port)")
                 case .clientConnected: break
                 case let .streamingStarted(peer, session):
+                    let display = session.isVirtualDisplay ? "virtual display, " : ""
                     log(
-                        "[\(peer)] streaming started (\(session.width) × \(session.height), up to \(session.framesPerSecond) fps, max \(session.maximumVideoBitRate) bps, audio \(session.streamsAudio ? "on" : "off"))"
+                        "[\(peer)] streaming started (\(display)\(session.width) × \(session.height), up to \(session.framesPerSecond) fps, max \(session.maximumVideoBitRate) bps, audio \(session.streamsAudio ? "on" : "off"))"
                     )
                 case .clientDisconnected(let peer, let reason, _): log("[\(peer)] \(reason)")
                 case .statistics(let peer, let statistics):
@@ -167,7 +178,12 @@ enum Command {
     static func testPattern() -> RemoteScreenServer.Source {
         log("Test pattern source")
         return .custom { parameters in
-            let size = parameters.maximumSize ?? StreamParameters.Size(width: 640, height: 360)
+            let size =
+                parameters.maximumSize
+                ?? parameters.virtualDisplay.map {
+                    StreamParameters.Size(width: $0.pixelWidth, height: $0.pixelHeight)
+                }
+                ?? StreamParameters.Size(width: 640, height: 360)
             return try TestPatternSource(
                 width: size.width, height: size.height, framesPerSecond: parameters.framesPerSecond)
         }

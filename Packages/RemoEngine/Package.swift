@@ -8,9 +8,19 @@ let package = Package(
         .library(name: "RemoEngine", targets: ["RemoEngine"]),
         .executable(name: "remo-engine", targets: ["RemoEngineCLI"]),
     ],
-    dependencies: [.package(path: "../RemoCodec"), .package(path: "../RemoTransport")],
+    dependencies: [
+        .package(path: "../RemoCodec"),
+        .package(path: "../RemoShims"),
+        .package(path: "../RemoTransport"),
+    ],
     targets: [
-        .target(name: "RemoEngine", dependencies: ["RemoCodec", "RemoTransport"]),
+        .target(
+            name: "RemoEngine",
+            dependencies: [
+                "RemoCodec",
+                "RemoTransport",
+                .product(name: "CVirtualDisplay", package: "RemoShims", condition: .when(platforms: [.macOS])),
+            ]),
         .executableTarget(name: "RemoEngineCLI", dependencies: ["RemoEngine"]),
         .testTarget(name: "RemoEngineCLITests", dependencies: ["RemoEngineCLI"]),
         .testTarget(

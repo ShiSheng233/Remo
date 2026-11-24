@@ -212,6 +212,49 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     try await listening.value
 }
 
+@Test @MainActor func clientNegotiatesVirtualDisplayParametersInHandshake() async throws {
+    let requested = StreamParameters(
+        virtualDisplay: .init(logicalWidth: 890, logicalHeight: 626),
+        framesPerSecond: 60,
+        maximumVideoBitRate: 6_000_000,
+        streamsAudio: false)
+    var receivedParameters: StreamParameters?
+    var port: UInt16?
+    let server = try await RemoteScreenServer(
+        configuration: .init(
+            source: .custom { parameters in
+                receivedParameters = parameters
+                let vd = try #require(parameters.virtualDisplay)
+                return SteppingSource(width: vd.pixelWidth, height: vd.pixelHeight)
+            })
+    ) { event in
+        if case .listening(let value) = event { port = value }
+    }
+    let listening = Task { try await server.listen(on: 0) }
+    defer { server.stop() }
+    while port == nil { try await Task.sleep(for: .milliseconds(10)) }
+
+    var decodedSize: (Int, Int)?
+    var client: RemoteScreenClient!
+    client = RemoteScreenClient(
+        configuration: .init(requestsRemoteControl: false, stream: requested),
+        onFrame: { frame in
+            decodedSize = (
+                CVPixelBufferGetWidth(frame.pixels), CVPixelBufferGetHeight(frame.pixels)
+            )
+            client.disconnect()
+        })
+    let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .init(rawValue: port!)!)
+    let failure = await client.run(.udp(endpoint))
+
+    #expect(failure == nil)
+    #expect(receivedParameters == requested)
+    #expect(decodedSize?.0 == 1780 && decodedSize?.1 == 1252)
+
+    server.stop()
+    try await listening.value
+}
+
 @Test @MainActor func serverRejectsInvalidConfigurations() async {
     await #expect(throws: RemoteScreenServer.SetupError.self) {
         _ = try await RemoteScreenServer(
@@ -224,6 +267,9 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: 7711)
     for stream in [
         StreamParameters(maximumSize: .init(width: 321, height: 240)),
+        StreamParameters(virtualDisplay: .init(logicalWidth: 799, logicalHeight: 600)),
+        StreamParameters(virtualDisplay: .init(logicalWidth: 800, logicalHeight: 599)),
+        StreamParameters(virtualDisplay: .init(logicalWidth: 3601, logicalHeight: 1000)),
         StreamParameters(framesPerSecond: 0),
         StreamParameters(framesPerSecond: 241),
         StreamParameters(maximumVideoBitRate: 0),

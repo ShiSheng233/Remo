@@ -2,6 +2,7 @@
 //  Created by Cyandev on 11/21/26.
 //
 
+import RemoEngine
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -31,6 +32,7 @@ struct ServerDetailView: View {
     @State private var customBitRateText: String
     @State private var saveFailed = false
     @State private var isWide = false
+    @State private var screenLogicalSize = DeviceScreen.logicalSize
 
     /// Detail width from which Connect sits beside the name instead of spanning the page.
     private static let wideLayoutWidth: CGFloat = 520
@@ -101,6 +103,9 @@ struct ServerDetailView: View {
             editRequest = nil
             beginEditing()
         }
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { _ in
+            screenLogicalSize = DeviceScreen.logicalSize
+        }
     }
 
     // A plain stack rather than Form rows, which clip and inset the heading off the left edge.
@@ -143,8 +148,16 @@ struct ServerDetailView: View {
                     Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 26))
 
                 VStack(spacing: 0) {
-                    LabeledContent("Resolution", value: server.stream.resolutionSummary)
-                        .frame(minHeight: 52)
+                    if server.stream.usesVirtualDisplay {
+                        let vd = RemoteServer.StreamSettings.virtualDisplay(
+                            for: screenLogicalSize)
+                        LabeledContent(
+                            "Display", value: "Virtual (\(vd.pixelWidth) × \(vd.pixelHeight))")
+                            .frame(minHeight: 52)
+                    } else {
+                        LabeledContent("Resolution", value: server.stream.resolutionSummary)
+                            .frame(minHeight: 52)
+                    }
                     Divider()
                     LabeledContent("Frame Rate", value: "\(server.stream.framesPerSecond) fps")
                         .frame(minHeight: 52)
@@ -269,26 +282,35 @@ struct ServerDetailView: View {
         }
 
         Section {
-            Picker("Resolution", selection: $draft.stream.resolution) {
-                ForEach(RemoteServer.StreamSettings.Resolution.allCases) { preset in
-                    Text(preset.title).tag(preset)
-                }
-            }
-            if draft.stream.resolution == .custom {
-                LabeledContent("Width") {
-                    HStack(spacing: 6) {
-                        TextField("Width", text: customWidthBinding, prompt: Text("1920"))
-                            .keyboardType(.numberPad)
-                            .multilineTextAlignment(.trailing)
-                        Text("px").foregroundStyle(.secondary)
+            Toggle("Virtual display", isOn: $draft.stream.usesVirtualDisplay)
+            if draft.stream.usesVirtualDisplay {
+                let vd = RemoteServer.StreamSettings.virtualDisplay(for: screenLogicalSize)
+                LabeledContent(
+                    "Display size",
+                    value: "\(vd.pixelWidth) × \(vd.pixelHeight) (\(vd.logicalWidth) × \(vd.logicalHeight) @2x)"
+                )
+            } else {
+                Picker("Resolution", selection: $draft.stream.resolution) {
+                    ForEach(RemoteServer.StreamSettings.Resolution.allCases) { preset in
+                        Text(preset.title).tag(preset)
                     }
                 }
-                LabeledContent("Height") {
-                    HStack(spacing: 6) {
-                        TextField("Height", text: customHeightBinding, prompt: Text("1080"))
-                            .keyboardType(.numberPad)
-                            .multilineTextAlignment(.trailing)
-                        Text("px").foregroundStyle(.secondary)
+                if draft.stream.resolution == .custom {
+                    LabeledContent("Width") {
+                        HStack(spacing: 6) {
+                            TextField("Width", text: customWidthBinding, prompt: Text("1920"))
+                                .keyboardType(.numberPad)
+                                .multilineTextAlignment(.trailing)
+                            Text("px").foregroundStyle(.secondary)
+                        }
+                    }
+                    LabeledContent("Height") {
+                        HStack(spacing: 6) {
+                            TextField("Height", text: customHeightBinding, prompt: Text("1080"))
+                                .keyboardType(.numberPad)
+                                .multilineTextAlignment(.trailing)
+                            Text("px").foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -334,6 +356,10 @@ struct ServerDetailView: View {
             if let problem = draft.stream.validationProblem {
                 Text(problem)
                     .foregroundStyle(.red)
+            } else if draft.stream.usesVirtualDisplay {
+                Text(
+                    "Creates a 2× HiDPI virtual display on the Mac matching this device’s logical screen size and streams it at full resolution. Capture runs at a variable frame rate up to the limit."
+                )
             } else {
                 Text(
                     "The display is scaled to fit the selected resolution while keeping its aspect ratio. Capture runs at a variable frame rate up to the limit."

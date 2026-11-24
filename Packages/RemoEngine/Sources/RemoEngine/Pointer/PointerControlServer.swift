@@ -28,6 +28,18 @@ final class PointerControlServer {
 
     private let initialState: () -> InitialState?
     private let emit: @MainActor (Event) -> Void
+    #if os(macOS)
+        private final class DisplayTarget {
+            var displayID: CGDirectDisplayID
+            var onPost: @MainActor (CGPoint) -> Void
+
+            init(displayID: CGDirectDisplayID, onPost: @escaping @MainActor (CGPoint) -> Void) {
+                self.displayID = displayID
+                self.onPost = onPost
+            }
+        }
+        private var displayTarget: DisplayTarget?
+    #endif
     private var owner: UUID?
     private var position = CGPoint.zero
     private var leftDown = false
@@ -121,6 +133,9 @@ final class PointerControlServer {
         if leftDown { emit(.button(.leftUp, position)) }
         leftDown = false
         owner = nil
+        #if os(macOS)
+            displayTarget?.onPost = { _ in }
+        #endif
         latestPosition = 0
         latestButton = 0
         pendingMove = nil
@@ -140,15 +155,20 @@ final class PointerControlServer {
             onPost: @escaping @MainActor (CGPoint) -> Void = { _ in }
         ) {
             nonisolated(unsafe) let source = CGEventSource(stateID: .hidSystemState)
+            let target = DisplayTarget(displayID: displayID, onPost: onPost)
             self.init(initialState: {
-                guard let geometry = DisplayGeometry(displayID: displayID),
+                guard let geometry = DisplayGeometry(displayID: target.displayID),
                     let width = UInt32(exactly: geometry.bounds.width), width > 0,
                     let height = UInt32(exactly: geometry.bounds.height), height > 0,
                     let location = CGEvent(source: nil)?.location
                 else { return nil }
-                return InitialState(position: geometry.normalize(location), width: width, height: height)
+                let position =
+                    geometry.bounds.contains(location)
+                    ? geometry.normalize(location)
+                    : CGPoint(x: 0.5, y: 0.5)
+                return InitialState(position: position, width: width, height: height)
             }, emit: { event in
-                guard let geometry = DisplayGeometry(displayID: displayID) else { return }
+                guard let geometry = DisplayGeometry(displayID: target.displayID) else { return }
                 let remoteFlags = modifierFlags()
                 let post: @MainActor (CGEventType, CGMouseButton, CGPoint) -> Void = {
                     type, button, position in
@@ -162,7 +182,7 @@ final class PointerControlServer {
                         event?.setIntegerValueField(.mouseEventClickState, value: 1)
                     }
                     event?.post(tap: .cghidEventTap)
-                    onPost(position)
+                    target.onPost(position)
                 }
                 switch event {
                 case let .move(position, dragging):
@@ -190,6 +210,19 @@ final class PointerControlServer {
                     scrollEvent?.post(tap: .cghidEventTap)
                 }
             })
+            self.displayTarget = target
+        }
+
+        /// Grants control targeting a specific display (main display or a per-client virtual
+        /// display) without affecting an already-active controlling peer.
+        func begin(
+            for peer: UUID, displayID: CGDirectDisplayID,
+            onPost: @escaping @MainActor (CGPoint) -> Void
+        ) -> InitialState? {
+            guard owner == nil else { return nil }
+            displayTarget?.displayID = displayID
+            displayTarget?.onPost = onPost
+            return begin(for: peer)
         }
     }
 #endif

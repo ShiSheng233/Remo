@@ -59,8 +59,12 @@ final class StreamPlayer {
         self.client = client
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         let sizeText = stream.maximumSize.map { "\($0.width)x\($0.height)" } ?? "default"
+        let virtualText =
+            stream.virtualDisplay.map {
+                " virtualDisplay=\($0.logicalWidth)x\($0.logicalHeight)@2x(\($0.pixelWidth)x\($0.pixelHeight))"
+            } ?? ""
         log?.write(
-            "Remo \(version) connecting to \(endpoint)\(wireGuard == nil ? "" : " through WireGuard") (size=\(sizeText) fps=\(stream.framesPerSecond) maxBps=\(stream.maximumVideoBitRate) audio=\(stream.streamsAudio))"
+            "Remo \(version) connecting to \(endpoint)\(wireGuard == nil ? "" : " through WireGuard") (size=\(sizeText)\(virtualText) fps=\(stream.framesPerSecond) maxBps=\(stream.maximumVideoBitRate) audio=\(stream.streamsAudio))"
         )
         task = Task {
             let failure = await client.run(

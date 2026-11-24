@@ -51,16 +51,18 @@ public final class RemoteScreenServer {
         public let framesPerSecond: Int32
         public let maximumVideoBitRate: Int
         public let streamsAudio: Bool
+        public let isVirtualDisplay: Bool
 
         public init(
             width: Int, height: Int, framesPerSecond: Int32, maximumVideoBitRate: Int,
-            streamsAudio: Bool
+            streamsAudio: Bool, isVirtualDisplay: Bool = false
         ) {
             self.width = width
             self.height = height
             self.framesPerSecond = framesPerSecond
             self.maximumVideoBitRate = maximumVideoBitRate
             self.streamsAudio = streamsAudio
+            self.isVirtualDisplay = isVirtualDisplay
         }
     }
 
@@ -177,6 +179,25 @@ public final class RemoteScreenServer {
                 }
                 let traceDirectory = configuration.diagnostics.audioTraceDirectory
                 startSource = { parameters in
+                    if let spec = parameters.virtualDisplay {
+                        let virtualDisplay = try await VirtualDisplay.create(specification: spec)
+                        do {
+                            let capture = try await DisplayCapture.Configuration.display(
+                                displayID: virtualDisplay.displayID,
+                                maximumWidth: parameters.maximumSize?.width,
+                                maximumHeight: parameters.maximumSize?.height,
+                                framesPerSecond: parameters.framesPerSecond,
+                                retryAttempts: 20,
+                                retryDelay: .milliseconds(250))
+                            return try await capture.start(
+                                capturesAudio: parameters.streamsAudio,
+                                audioTraceDirectory: traceDirectory,
+                                virtualDisplay: virtualDisplay)
+                        } catch {
+                            virtualDisplay.destroy()
+                            throw error
+                        }
+                    }
                     let maxWidth = parameters.maximumSize?.width ?? StreamParameters.defaultScreenEdge
                     let maxHeight = parameters.maximumSize?.height ?? StreamParameters.defaultScreenEdge
                     let capture = try await DisplayCapture.Configuration.mainDisplay(
@@ -241,6 +262,14 @@ public final class RemoteScreenServer {
         }
         context.pointer?.stop()
         context.keyboard?.stop()
+    }
+
+    /// Synchronously tears down any active virtual displays. Call from `applicationWillTerminate`
+    /// so macOS removes virtual displays cleanly before the process exits.
+    public static func destroyVirtualDisplays() {
+        #if os(macOS)
+            VirtualDisplay.destroyAll()
+        #endif
     }
 
     private func updateActivity() {

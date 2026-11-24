@@ -9,6 +9,10 @@ import Network
 import RemoCodec
 import RemoTransport
 
+#if os(macOS)
+    import CoreGraphics
+#endif
+
 /// One client of a `RemoteScreenServer`, from connection setup until it leaves or times out.
 @MainActor
 final class ServerConnection {
@@ -44,6 +48,8 @@ final class ServerConnection {
     private var previousAcceptedDataPackets: UInt32 = 0
 
     // Cursor & keyboard state
+    private var requestsControl = false
+    private var activeCursorMonitor: CursorMonitor?
     private var cursorSubscription: UUID?
     private var cursorSequence: UInt64 = 0
     /// Shapes this client has been sent, so each goes once.
@@ -52,6 +58,7 @@ final class ServerConnection {
 
     // Source
     private var streamParameters = StreamParameters()
+    private var sourceStartTask: Task<Void, Error>?
     private var source: (any ScreenFrameSource)?
     private var frameForwardTask: Task<Void, Never>?
     private var streamWake: AsyncStream<Void>.Continuation?
@@ -145,8 +152,11 @@ final class ServerConnection {
                 stop("send failed: \(error)", failed: true)
             }
         }
-        if let cursorSubscription { context.cursor?.unsubscribe(cursorSubscription) }
+        sourceStartTask?.cancel()
+        sourceStartTask = nil
+        if let cursorSubscription { activeCursorMonitor?.unsubscribe(cursorSubscription) }
         cursorSubscription = nil
+        activeCursorMonitor = nil
         audioSendTask?.cancel()
         frameForwardTask?.cancel()
         frameForwardTask = nil
@@ -170,6 +180,7 @@ final class ServerConnection {
         context.pointer?.end(for: controlPeer)
         context.keyboard?.end(for: controlPeer)
         setup?.cancel()
+        sourceStartTask?.cancel()
         streamWake?.yield(())
         let idle = Instant.now - lastSeen
         trace.write(
@@ -227,32 +238,19 @@ final class ServerConnection {
             }
             if !active {
                 active = true
+                self.requestsControl = requestsControl
                 streamParameters = stream
                 targetBitRate = stream.maximumVideoBitRate
                 encoderFrameRate = stream.framesPerSecond
                 refreshBitRate = stream.maximumVideoBitRate
-                if cursorSubscription == nil, let cursor = context.cursor {
-                    cursorSubscription = cursor.subscribe { [weak self] state, shape in
-                        self?.sendCursor(state, shape: shape)
-                    }
-                }
-                let grant = requestsControl ? beginControl() : nil
-                if let session {
-                    let ready = SessionHandshake.ready(control: grant)
-                    do {
-                        try session.send(ready.encoded, delivery: ready.delivery)
-                    } catch {
-                        if grant != nil {
-                            context.pointer?.end(for: controlPeer)
-                            context.keyboard?.end(for: controlPeer)
-                        }
-                    }
-                }
                 streamWake?.yield(())
                 let sizeText = stream.maximumSize.map { "\($0.width)x\($0.height)" } ?? "default"
+                let virtualText =
+                    stream.virtualDisplay.map { " virtualDisplay=\($0.logicalWidth)x\($0.logicalHeight)" }
+                    ?? ""
                 trace.write(
                     peer,
-                    "hello accepted control=\(grant != nil) size=\(sizeText) fps=\(stream.framesPerSecond) maxBps=\(stream.maximumVideoBitRate) audio=\(stream.streamsAudio)"
+                    "hello accepted requestsControl=\(requestsControl) size=\(sizeText)\(virtualText) fps=\(stream.framesPerSecond) maxBps=\(stream.maximumVideoBitRate) audio=\(stream.streamsAudio)"
                 )
             }
         case .heartbeat:
@@ -273,10 +271,25 @@ final class ServerConnection {
         lastSeen = .now
     }
 
-    private func beginControl() -> SessionHandshake.ControlGrant? {
-        guard let pointer = context.pointer, let keyboard = context.keyboard,
-            let pointerState = pointer.begin(for: controlPeer)
-        else { return nil }
+    private func beginControl(
+        source: any ScreenFrameSource, cursorMonitor: CursorMonitor?
+    ) -> SessionHandshake.ControlGrant? {
+        guard let pointer = context.pointer, let keyboard = context.keyboard else { return nil }
+        let pointerState: PointerControlServer.InitialState?
+        #if os(macOS)
+            if let displaySource = source as? any DisplayScreenFrameSource {
+                pointerState = pointer.begin(
+                    for: controlPeer, displayID: displaySource.displayID,
+                    onPost: { [weak cursorMonitor] in
+                        cursorMonitor?.notePosted($0)
+                    })
+            } else {
+                pointerState = pointer.begin(for: controlPeer)
+            }
+        #else
+            pointerState = pointer.begin(for: controlPeer)
+        #endif
+        guard let pointerState else { return nil }
         guard
             let capsLock = keyboard.begin(
                 for: controlPeer,
@@ -292,6 +305,18 @@ final class ServerConnection {
             displayWidth: pointerState.width,
             displayHeight: pointerState.height,
             capsLock: capsLock)
+    }
+
+    private func cursorMonitor(for source: any ScreenFrameSource) -> CursorMonitor? {
+        #if os(macOS)
+            if let displaySource = source as? any DisplayScreenFrameSource,
+                displaySource.isVirtualDisplay
+            {
+                let system = SystemCursor(displayID: displaySource.displayID)
+                return CursorMonitor(interval: .seconds(1) / 60, sample: system.sample)
+            }
+        #endif
+        return context.cursor
     }
 
     private func sendKeyboardState(capsLock: Bool) {
@@ -355,13 +380,44 @@ final class ServerConnection {
                 }
                 if source == nil {
                     // Start the source once the client sends its stream parameters.
-                    let source = try await context.startSource(streamParameters)
-                    self.source = source
+                    let startTask = Task { @MainActor [self] in
+                        self.source = try await context.startSource(streamParameters)
+                    }
+                    sourceStartTask = startTask
+                    try await startTask.value
+                    sourceStartTask = nil
                     if stopping { break }
+                    guard let source = self.source else { throw VideoSession.Failure.closed }
                     try prepareVideo(source)
                     if streamParameters.streamsAudio, let capture = source as? any AudioSource {
                         startAudio(capture, session: session)
                     }
+                    let cursor = cursorMonitor(for: source)
+                    activeCursorMonitor = cursor
+                    if cursorSubscription == nil, let cursor {
+                        cursorSubscription = cursor.subscribe { [weak self] state, shape in
+                            self?.sendCursor(state, shape: shape)
+                        }
+                    }
+                    let grant =
+                        requestsControl ? beginControl(source: source, cursorMonitor: cursor) : nil
+                    let ready = SessionHandshake.ready(control: grant)
+                    do {
+                        try session.send(ready.encoded, delivery: ready.delivery)
+                    } catch {
+                        if grant != nil {
+                            context.pointer?.end(for: controlPeer)
+                            context.keyboard?.end(for: controlPeer)
+                        }
+                        throw error
+                    }
+                    trace.write(peer, "session ready control=\(grant != nil)")
+                    let isVirtualDisplay: Bool
+                    #if os(macOS)
+                        isVirtualDisplay = (source as? any DisplayScreenFrameSource)?.isVirtualDisplay ?? false
+                    #else
+                        isVirtualDisplay = false
+                    #endif
                     context.onEvent(
                         .streamingStarted(
                             peer: peer,
@@ -369,7 +425,8 @@ final class ServerConnection {
                                 width: source.width, height: source.height,
                                 framesPerSecond: streamParameters.framesPerSecond,
                                 maximumVideoBitRate: streamParameters.maximumVideoBitRate,
-                                streamsAudio: sendsAudio)))
+                                streamsAudio: sendsAudio,
+                                isVirtualDisplay: isVirtualDisplay)))
                     if let notifying = source as? any NotifyingScreenFrameSource {
                         eventDriven = true
                         let arrivals = notifying.frameArrivals

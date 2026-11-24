@@ -150,8 +150,10 @@ struct ClientSummaryCard: View {
                     ClientStatusLabel(status: client.status)
                     if let session = client.session {
                         Text("·").foregroundStyle(.tertiary)
-                        Text("\(session.width) × \(session.height) · \(session.framesPerSecond) fps")
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "\(session.isVirtualDisplay ? "Virtual · " : "")\(session.width) × \(session.height) · \(session.framesPerSecond) fps"
+                        )
+                        .foregroundStyle(.secondary)
                     }
                 }
                 .font(.caption)

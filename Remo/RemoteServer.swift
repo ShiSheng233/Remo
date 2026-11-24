@@ -2,6 +2,7 @@
 //  Created by Cyandev on 11/21/26.
 //
 
+import CoreGraphics
 import Foundation
 import Network
 import RemoEngine
@@ -107,6 +108,7 @@ nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
         static let frameRatePresets = [30, 60, 120]
         static let bitRatePresets = [2_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000]
 
+        var usesVirtualDisplay = false
         var resolution = Resolution.automatic
         var customWidth = 1920
         var customHeight = 1080
@@ -115,6 +117,7 @@ nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
         var streamsAudio = false
 
         init(
+            usesVirtualDisplay: Bool = false,
             resolution: Resolution = .automatic,
             customWidth: Int = 1920,
             customHeight: Int = 1080,
@@ -122,6 +125,7 @@ nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
             maximumVideoBitRate: Int = StreamParameters.defaultMaximumVideoBitRate,
             streamsAudio: Bool = false
         ) {
+            self.usesVirtualDisplay = usesVirtualDisplay
             self.resolution = resolution
             self.customWidth = customWidth
             self.customHeight = customHeight
@@ -136,6 +140,7 @@ nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
             func decode<Value: Decodable>(_ key: CodingKeys, into value: inout Value) {
                 if let decoded = try? container.decode(Value.self, forKey: key) { value = decoded }
             }
+            decode(.usesVirtualDisplay, into: &usesVirtualDisplay)
             decode(.resolution, into: &resolution)
             decode(.customWidth, into: &customWidth)
             decode(.customHeight, into: &customHeight)
@@ -161,17 +166,30 @@ nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
                 return "The frame rate must be 1...240."
             }
             return StreamParameters(
-                maximumSize: maximumSize, framesPerSecond: fps,
-                maximumVideoBitRate: maximumVideoBitRate, streamsAudio: streamsAudio
+                maximumSize: usesVirtualDisplay ? nil : maximumSize,
+                framesPerSecond: fps,
+                maximumVideoBitRate: maximumVideoBitRate,
+                streamsAudio: streamsAudio
             ).validationProblem
         }
 
-        var parameters: StreamParameters? {
+        func parameters(screenLogicalSize: CGSize) -> StreamParameters? {
             guard let fps = Int32(exactly: framesPerSecond) else { return nil }
+            let virtualDisplay =
+                usesVirtualDisplay ? Self.virtualDisplay(for: screenLogicalSize) : nil
             let parameters = StreamParameters(
-                maximumSize: maximumSize, framesPerSecond: fps,
-                maximumVideoBitRate: maximumVideoBitRate, streamsAudio: streamsAudio)
+                maximumSize: usesVirtualDisplay ? nil : maximumSize,
+                virtualDisplay: virtualDisplay,
+                framesPerSecond: fps,
+                maximumVideoBitRate: maximumVideoBitRate,
+                streamsAudio: streamsAudio)
             return parameters.isValid ? parameters : nil
+        }
+
+        static func virtualDisplay(for screenLogicalSize: CGSize) -> StreamParameters.VirtualDisplay {
+            StreamParameters.VirtualDisplay.fitting(
+                logicalWidth: Int(screenLogicalSize.width.rounded()),
+                logicalHeight: Int(screenLogicalSize.height.rounded()))
         }
 
         var resolutionSummary: String {
@@ -244,7 +262,7 @@ nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
 
     var isValid: Bool {
         (useWireGuard ? wireGuard.configuration != nil : direct.endpoint != nil)
-            && stream.parameters != nil
+            && stream.validationProblem == nil
     }
 
     /// Orders servers by name, falling back to their identifiers so equal names never reshuffle.

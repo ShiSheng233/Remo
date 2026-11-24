@@ -32,11 +32,18 @@ import RemoTransport
         framesPerSecond: 120,
         maximumVideoBitRate: 12_000_000,
         streamsAudio: true)
+    let virtualDisplayStream = StreamParameters(
+        virtualDisplay: .init(logicalWidth: 890, logicalHeight: 626),
+        framesPerSecond: 60,
+        maximumVideoBitRate: 8_000_000,
+        streamsAudio: true)
     let messages: [SessionHandshake] = [
         .hello(requestsControl: false),
         .hello(requestsControl: true),
         .hello(requestsControl: false, stream: customStream),
         .hello(requestsControl: true, stream: customStream),
+        .hello(requestsControl: false, stream: virtualDisplayStream),
+        .hello(requestsControl: true, stream: virtualDisplayStream),
         .ready(control: nil),
         .ready(control: grant),
     ]
@@ -51,7 +58,10 @@ import RemoTransport
             try SessionHandshake(decoding: message.encoded + [0])
         }
     }
-    func rawHello(flags: UInt8, w: UInt16, h: UInt16, fps: UInt16, bps: UInt32) -> Data {
+    func rawHello(
+        flags: UInt8, w: UInt16, h: UInt16, fps: UInt16, bps: UInt32,
+        virtualDisplay: (UInt16, UInt16)? = nil
+    ) -> Data {
         var data = Data()
         data.put(MessageKind.hello.rawValue)
         data.put(flags)
@@ -59,10 +69,19 @@ import RemoTransport
         data.put(h)
         data.put(fps)
         data.put(bps)
+        if let virtualDisplay {
+            data.put(virtualDisplay.0)
+            data.put(virtualDisplay.1)
+        }
         return data
     }
     for invalid in [
+        rawHello(flags: 0x08, w: 0, h: 0, fps: 60, bps: 5_000_000),
         rawHello(flags: 0x04, w: 0, h: 0, fps: 60, bps: 5_000_000),
+        rawHello(flags: 0x04, w: 0, h: 0, fps: 60, bps: 5_000_000, virtualDisplay: (799, 600)),
+        rawHello(flags: 0x04, w: 0, h: 0, fps: 60, bps: 5_000_000, virtualDisplay: (800, 599)),
+        rawHello(flags: 0x04, w: 0, h: 0, fps: 60, bps: 5_000_000, virtualDisplay: (3601, 1000)),
+        rawHello(flags: 0x04, w: 0, h: 0, fps: 60, bps: 5_000_000, virtualDisplay: (1000, 3601)),
         rawHello(flags: 0, w: 1920, h: 0, fps: 60, bps: 5_000_000),
         rawHello(flags: 0, w: 0, h: 1080, fps: 60, bps: 5_000_000),
         rawHello(flags: 0, w: 321, h: 240, fps: 60, bps: 5_000_000),
@@ -74,6 +93,36 @@ import RemoTransport
     ] {
         #expect(throws: WireFormatError.self) { try SessionHandshake(decoding: invalid) }
     }
+}
+
+@Test func virtualDisplayFittingPreservesInRangeSizesAndScalesOutOfRangeSizes() {
+    // iPhone Duo: 2670×1878 @3x → 890×626 pt → 1780×1252 px @2x
+    let duo = StreamParameters.VirtualDisplay.fitting(logicalWidth: 890, logicalHeight: 626)
+    #expect(duo == .init(logicalWidth: 890, logicalHeight: 626))
+    #expect(duo.pixelWidth == 1780 && duo.pixelHeight == 1252)
+    #expect(duo.isValid)
+
+    // iPad Pro 11": already in range
+    let ipad = StreamParameters.VirtualDisplay.fitting(logicalWidth: 1194, logicalHeight: 834)
+    #expect(ipad == .init(logicalWidth: 1194, logicalHeight: 834))
+    #expect(ipad.pixelWidth == 2388 && ipad.pixelHeight == 1668)
+
+    // Standard iPhone landscape: height below 600 pt scales up proportionally
+    let iphoneLandscape = StreamParameters.VirtualDisplay.fitting(logicalWidth: 874, logicalHeight: 402)
+    #expect(iphoneLandscape.logicalHeight == 600)
+    #expect(iphoneLandscape.logicalWidth == 1304)
+    #expect(iphoneLandscape.isValid)
+
+    // Standard iPhone portrait: width below 800 pt scales up proportionally
+    let iphonePortrait = StreamParameters.VirtualDisplay.fitting(logicalWidth: 402, logicalHeight: 874)
+    #expect(iphonePortrait.logicalWidth == 800)
+    #expect(iphonePortrait.logicalHeight == 1739)
+    #expect(iphonePortrait.isValid)
+
+    // Oversized screen scales down into 3600×3600
+    let huge = StreamParameters.VirtualDisplay.fitting(logicalWidth: 4000, logicalHeight: 2500)
+    #expect(huge == .init(logicalWidth: 3600, logicalHeight: 2250))
+    #expect(huge.isValid)
 }
 
 @Test func frameRedundancyFollowsLossAndFrameSize() {

@@ -143,7 +143,12 @@ final class ServerController {
         case .testPattern:
             append(.event, nil, "Test pattern source")
             source = .custom { parameters in
-                let size = parameters.maximumSize ?? StreamParameters.Size(width: 640, height: 360)
+                let size =
+                    parameters.maximumSize
+                    ?? parameters.virtualDisplay.map {
+                        StreamParameters.Size(width: $0.pixelWidth, height: $0.pixelHeight)
+                    }
+                    ?? StreamParameters.Size(width: 640, height: 360)
                 return try TestPatternSource(
                     width: size.width, height: size.height,
                     framesPerSecond: parameters.framesPerSecond)
@@ -208,10 +213,11 @@ final class ServerController {
             append(.event, peer, "client connected")
         case let .streamingStarted(peer, session):
             client(peer)?.startStreaming(session: session)
+            let display = session.isVirtualDisplay ? "virtual display, " : ""
             let audio = session.streamsAudio ? "audio on" : "audio off"
             append(
                 .event, peer,
-                "streaming started: \(session.width) × \(session.height), up to \(session.framesPerSecond) fps, max \(Format.megabits(Double(session.maximumVideoBitRate))), \(audio)"
+                "streaming started: \(display)\(session.width) × \(session.height), up to \(session.framesPerSecond) fps, max \(Format.megabits(Double(session.maximumVideoBitRate))), \(audio)"
             )
         case .clientDisconnected(let peer, let reason, let failed):
             client(peer)?.disconnect(reason: reason, failed: failed)

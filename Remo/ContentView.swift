@@ -4,6 +4,19 @@
 //
 
 import SwiftUI
+import UIKit
+
+enum DeviceScreen {
+    @MainActor
+    static var logicalSize: CGSize {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let active = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        if let size = active?.screen.bounds.size, size.width > 0, size.height > 0 {
+            return size
+        }
+        return CGSize(width: 1920, height: 1080)
+    }
+}
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -99,7 +112,9 @@ struct ContentView: View {
     }
 
     private func connect(_ server: RemoteServer) {
-        guard let endpoint = server.address.endpoint, let stream = server.stream.parameters else {
+        guard let endpoint = server.address.endpoint,
+            let stream = server.stream.parameters(screenLogicalSize: DeviceScreen.logicalSize)
+        else {
             return
         }
         let wireGuard = server.useWireGuard ? server.wireGuard.configuration : nil

@@ -21,7 +21,8 @@ enum SessionHandshake: Equatable {
     private enum HelloFlag {
         static let requestsControl: UInt8 = 1 << 0
         static let streamsAudio: UInt8 = 1 << 1
-        static let all: UInt8 = requestsControl | streamsAudio
+        static let virtualDisplay: UInt8 = 1 << 2
+        static let all: UInt8 = requestsControl | streamsAudio | virtualDisplay
     }
 
     case hello(requestsControl: Bool, stream: StreamParameters = StreamParameters())
@@ -37,11 +38,16 @@ enum SessionHandshake: Equatable {
             var flags: UInt8 = 0
             if requestsControl { flags |= HelloFlag.requestsControl }
             if stream.streamsAudio { flags |= HelloFlag.streamsAudio }
+            if stream.virtualDisplay != nil { flags |= HelloFlag.virtualDisplay }
             data.put(flags)
             data.put(UInt16(stream.maximumSize?.width ?? 0))
             data.put(UInt16(stream.maximumSize?.height ?? 0))
             data.put(UInt16(stream.framesPerSecond))
             data.put(UInt32(stream.maximumVideoBitRate))
+            if let virtualDisplay = stream.virtualDisplay {
+                data.put(UInt16(virtualDisplay.logicalWidth))
+                data.put(UInt16(virtualDisplay.logicalHeight))
+            }
         case .ready(let control):
             data.put(MessageKind.sessionReady.rawValue)
             if let control {
@@ -75,8 +81,18 @@ enum SessionHandshake: Equatable {
             }
             let framesPerSecond = Int32(try data.take(UInt16.self))
             let maximumVideoBitRate = Int(try data.take(UInt32.self))
+            let virtualDisplay: StreamParameters.VirtualDisplay?
+            if flags & HelloFlag.virtualDisplay != 0 {
+                let logicalWidth = Int(try data.take(UInt16.self))
+                let logicalHeight = Int(try data.take(UInt16.self))
+                virtualDisplay = StreamParameters.VirtualDisplay(
+                    logicalWidth: logicalWidth, logicalHeight: logicalHeight)
+            } else {
+                virtualDisplay = nil
+            }
             let stream = StreamParameters(
                 maximumSize: maximumSize,
+                virtualDisplay: virtualDisplay,
                 framesPerSecond: framesPerSecond,
                 maximumVideoBitRate: maximumVideoBitRate,
                 streamsAudio: flags & HelloFlag.streamsAudio != 0)

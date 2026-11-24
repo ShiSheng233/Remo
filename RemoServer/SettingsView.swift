@@ -32,7 +32,7 @@ struct SettingsView: View {
             } header: {
                 Text("Source")
             } footer: {
-                Text("Resolution, frame rate, max video bit rate, and audio streaming are requested by each client when it connects.")
+                Text("Resolution, virtual display, frame rate, max video bit rate, and audio streaming are requested by each client when it connects.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

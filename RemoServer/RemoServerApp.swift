@@ -3,10 +3,19 @@
 //  Copyright (c) 2026 Cyandev. All rights reserved.
 //
 
+import AppKit
+import RemoEngine
 import SwiftUI
+
+private final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        RemoteScreenServer.destroyVirtualDisplays()
+    }
+}
 
 @main
 struct RemoServerApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var controller = ServerController()
 
     var body: some Scene {

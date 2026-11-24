@@ -77,8 +77,9 @@ struct ClientDashboardView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 if let session = client.session {
+                    let display = session.isVirtualDisplay ? "Virtual Display · " : ""
                     Text(
-                        "\(session.width) × \(session.height) · up to \(session.framesPerSecond) fps · max \(Format.megabits(Double(session.maximumVideoBitRate)))\(session.streamsAudio ? " · Audio" : "")"
+                        "\(display)\(session.width) × \(session.height) · up to \(session.framesPerSecond) fps · max \(Format.megabits(Double(session.maximumVideoBitRate)))\(session.streamsAudio ? " · Audio" : "")"
                     )
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
