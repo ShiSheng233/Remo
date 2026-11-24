@@ -20,6 +20,9 @@ enum SessionTiming {
     static let videoStall = Duration.seconds(2)
     /// A scroll is worthless once this old.
     static let pointerDeadline = Duration.milliseconds(50)
+    /// How long the client waits for its extended-control hello before asking again in the
+    /// original format, which a server that predates the flag understands.
+    static let legacyHelloDelay = Duration.milliseconds(1200)
     /// The client draws the cursor where the finger puts it and tells the server at most this
     /// often, or at `dragInterval` while a button is held.
     static let pointerMoveInterval = Duration.seconds(1) / 30

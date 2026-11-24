@@ -124,6 +124,13 @@ final class StreamPlayer {
             client.pressPointer(action)
         case let .scroll(lines):
             client.scroll(lines: lines)
+        case let .point(position):
+            // Hardware reports where the pointer is, not how far it went.
+            client.movePointer(to: position)
+        case let .press(action, clickCount):
+            client.pressPointer(action, clickCount: clickCount)
+        case let .scrollAt(delta, unit, position):
+            client.scrollPointer(by: delta, unit: unit, at: position)
         }
     }
 

@@ -228,7 +228,7 @@ final class ServerConnection {
         }
         switch kind {
         case .hello:
-            guard case let .hello(requestsControl) = try? SessionHandshake(decoding: bytes) else {
+            guard case let .hello(requestsControl, extendedPointer) = try? SessionHandshake(decoding: bytes) else {
                 return
             }
             if !active {
@@ -239,7 +239,7 @@ final class ServerConnection {
                         self?.sendCursor(state, shape: shape)
                     }
                 }
-                let grant = requestsControl ? beginControl() : nil
+                let grant = requestsControl ? beginControl(extended: extendedPointer) : nil
                 if let session {
                     let ready = SessionHandshake.ready(control: grant)
                     do {
@@ -272,7 +272,7 @@ final class ServerConnection {
         lastSeen = .now
     }
 
-    private func beginControl() -> SessionHandshake.ControlGrant? {
+    private func beginControl(extended: Bool) -> SessionHandshake.ControlGrant? {
         guard let pointer = context.pointer, let keyboard = context.keyboard,
             let pointerState = pointer.begin(for: controlPeer)
         else { return nil }
@@ -290,7 +290,7 @@ final class ServerConnection {
             pointerPosition: pointerState.position,
             displayWidth: pointerState.width,
             displayHeight: pointerState.height,
-            capsLock: capsLock)
+            capsLock: capsLock, extendedPointer: extended)
     }
 
     private func sendKeyboardState(capsLock: Bool) {

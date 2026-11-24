@@ -27,11 +27,16 @@ import RemoTransport
         displayWidth: 1512,
         displayHeight: 982,
         capsLock: true)
+    let extendedGrant = SessionHandshake.ControlGrant(
+        pointerPosition: CGPoint(x: 0.25, y: 0.75), displayWidth: 1512, displayHeight: 982,
+        capsLock: true, extendedPointer: true)
     let messages: [SessionHandshake] = [
         .hello(requestsControl: false),
         .hello(requestsControl: true),
+        .hello(requestsControl: true, extendedPointer: true),
         .ready(control: nil),
         .ready(control: grant),
+        .ready(control: extendedGrant),
     ]
     for message in messages {
         #expect(try SessionHandshake(decoding: message.encoded) == message)
@@ -44,6 +49,11 @@ import RemoTransport
             try SessionHandshake(decoding: message.encoded + [0])
         }
     }
+    #expect(grant.extendedPointer == false)
+    #expect(SessionHandshake.hello(requestsControl: true).encoded == Data([1, 1]))
+    #expect(SessionHandshake.hello(requestsControl: true, extendedPointer: true).encoded == Data([1, 3]))
+    #expect(SessionHandshake.ready(control: grant).encoded.prefix(2) == Data([6, 1]))
+    #expect(SessionHandshake.ready(control: extendedGrant).encoded.prefix(2) == Data([6, 3]))
     let badFlags = Data([MessageKind.hello.rawValue, 2])
     #expect(throws: WireFormatError.self) { try SessionHandshake(decoding: badFlags) }
 }

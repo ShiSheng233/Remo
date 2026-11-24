@@ -96,6 +96,10 @@ public final class RemoteScreenClient {
     private var pointerMovedLocally = false
     private var lastMoveSent: Instant?
     private var moveFlush: Task<Void, Never>?
+    /// Whether the server answered the handshake, control granted or denied, and whether
+    /// the client already asked again in the original format an old server understands.
+    private var helloAnswered = false
+    private var legacyHelloSent = false
     private var lastSeen = Instant.now
     private var lastFrame = Instant.now
     private var counters = Counters()
@@ -155,15 +159,46 @@ public final class RemoteScreenClient {
         scheduleMove()
     }
 
+    /// Moves the remote pointer to an absolute position, normalized to the display with the
+    /// origin at its upper left. The same pacing and coalescing as `movePointer(by:)` apply.
+    public func movePointer(to position: CGPoint) {
+        guard isRunning, state == .streaming, pointer.move(to: position) else { return }
+        pointerMovedLocally = true
+        publishCursor()
+        scheduleMove()
+    }
+
+    /// A single click or a hold's press or release; `pressPointer(_:clickCount:)`.
     public func pressPointer(_ button: PointerButton) {
+        pressPointer(button, clickCount: 1)
+    }
+
+    /// `clickCount` and secondary holds ride the extended-pointer grant; elsewhere a count
+    /// falls back to one click and a secondary hold to a click on release.
+    public func pressPointer(_ button: PointerButton, clickCount: Int) {
         // The button lands where the cursor is drawn; send the move first so hover is right.
         flushMove()
-        sendPointer { $0.press(button) }
+        sendPointer { $0.press(button, clickCount: clickCount) }
     }
 
     /// Whole lines; positive values move the content down, following the finger.
     public func scroll(lines: Int) {
         sendPointer { $0.scroll(lines: lines) }
+    }
+
+    /// Scrolls both axes at `position`, normalized like `movePointer(to:)`, in `unit` steps
+    /// signed like `scroll(lines:)`; horizontal and pixel steps need the extended grant.
+    /// Without it the vertical scroll still lands at `position` when it differs: the move
+    /// goes first, best effort, since the old wire carries no scroll location.
+    public func scrollPointer(
+        by delta: CGVector, unit: PointerScrollUnit, at position: CGPoint
+    ) {
+        guard isRunning, state == .streaming else { return }
+        if !pointer.capabilities.contains(.vectorScroll) {
+            if position != pointer.position { movePointer(to: position) }
+            if pointer.moved { flushMove() }
+        }
+        sendPointer { $0.scroll(by: delta, unit: unit, at: position) }
     }
 
     private func scheduleMove() {
@@ -303,6 +338,8 @@ public final class RemoteScreenClient {
         cursor = nil
         pointerMovedLocally = false
         lastMoveSent = nil
+        helloAnswered = false
+        legacyHelloSent = false
         counters = Counters()
         setState(.connecting)
         trace.write(nil, "client opening")
@@ -376,7 +413,9 @@ public final class RemoteScreenClient {
                     configuration.diagnostics.info(nil, line)
                 },
                 onFailure: { [weak self] error in self?.fail(.videoFailed(error)) })
-            let hello = SessionHandshake.hello(requestsControl: configuration.requestsRemoteControl)
+            let hello = SessionHandshake.hello(
+                requestsControl: configuration.requestsRemoteControl,
+                extendedPointer: configuration.requestsRemoteControl)
             try session.send(hello.encoded, delivery: hello.delivery)
             trace.write(nil, "hello queued")
             setState(.waitingForVideo)
@@ -430,6 +469,16 @@ public final class RemoteScreenClient {
                 try video?.requestRefresh()
             }
             do {
+                if configuration.requestsRemoteControl, !helloAnswered, !legacyHelloSent,
+                    now.hasElapsed(SessionTiming.legacyHelloDelay, since: started)
+                {
+                    // The extended-pointer flag can leave an old server's hello unanswered;
+                    // ask once more in the original format, which still grants basic control.
+                    try session.send(
+                        SessionHandshake.hello(requestsControl: true).encoded,
+                        delivery: .essential)
+                    legacyHelloSent = true
+                }
                 try session.send(
                     MessageKind.heartbeat.encoded, delivery: .retrying(replacing: .heartbeat))
                 counters.heartbeats += 1
@@ -474,9 +523,13 @@ public final class RemoteScreenClient {
         case .sessionReady:
             guard case let .ready(control) = try? SessionHandshake(decoding: data) else { return }
             lastSeen = .now
+            helloAnswered = true
             guard let control else { return }
             let size = CGSize(width: Int(control.displayWidth), height: Int(control.displayHeight))
-            if pointer.begin(position: control.pointerPosition, displaySize: size) {
+            if pointer.begin(
+                position: control.pointerPosition, displaySize: size,
+                capabilities: control.extendedPointer ? .current : [])
+            {
                 keyboard.begin(capsLock: control.capsLock)
                 onEvent(.controlAvailable(displaySize: size, capsLock: control.capsLock))
                 publishCursor()
