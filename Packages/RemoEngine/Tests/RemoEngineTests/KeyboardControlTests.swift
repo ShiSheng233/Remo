@@ -196,7 +196,7 @@ import Testing
         emit: { receivedEvents.append($0) })
 
     let server = try await RemoteScreenServer(
-        configuration: .init(source: .custom { MinimalFrameSource() }, allowsRemoteControl: true),
+        configuration: .init(source: .custom { _ in MinimalFrameSource() }, allowsRemoteControl: true),
         cursor: nil,
         pointer: pointerServer,
         keyboard: keyboardServer

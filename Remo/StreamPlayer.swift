@@ -42,7 +42,8 @@ final class StreamPlayer {
     /// Starts a session; `onFinalFrame` receives a JPEG of the last frame shown once it ends.
     /// `log` receives the same diagnostics and statistics the CLI prints.
     func connect(
-        to endpoint: NWEndpoint, wireGuard: WireGuardConfiguration? = nil, log: SessionLog? = nil,
+        to endpoint: NWEndpoint, wireGuard: WireGuardConfiguration? = nil,
+        stream: StreamParameters = StreamParameters(), log: SessionLog? = nil,
         onFinalFrame: ((Data) -> Void)? = nil
     ) {
         guard task == nil else { return }
@@ -52,12 +53,15 @@ final class StreamPlayer {
         phase = .connecting
         let diagnostics = Diagnostics(handler: log.map { log in { log.write($0.description) } })
         let client = RemoteScreenClient(
-            configuration: .init(diagnostics: diagnostics),
+            configuration: .init(stream: stream, diagnostics: diagnostics),
             onFrame: { [weak self] in try self?.present($0, on: surface) },
             onEvent: { [weak self] in self?.handle($0) })
         self.client = client
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        log?.write("Remo \(version) connecting to \(endpoint)\(wireGuard == nil ? "" : " through WireGuard")")
+        let sizeText = stream.maximumSize.map { "\($0.width)x\($0.height)" } ?? "default"
+        log?.write(
+            "Remo \(version) connecting to \(endpoint)\(wireGuard == nil ? "" : " through WireGuard") (size=\(sizeText) fps=\(stream.framesPerSecond) maxBps=\(stream.maximumVideoBitRate) audio=\(stream.streamsAudio))"
+        )
         task = Task {
             let failure = await client.run(
                 wireGuard.map { .datagrams(WireGuardDatagramConnection($0, log: log)) } ?? .udp(endpoint))
@@ -211,6 +215,7 @@ final class StreamPlayer {
 
     private static func message(for failure: RemoteScreenClient.Failure, wireGuard: Bool) -> String {
         switch failure {
+        case .invalidConfiguration(let problem): problem
         case .setupTimedOut:
             wireGuard ? "The WireGuard handshake timed out." : "Couldn’t open a connection to the server."
         case .connectionFailed(let error), .sendFailed(let error): error.localizedDescription

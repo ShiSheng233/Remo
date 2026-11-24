@@ -12,20 +12,16 @@ import RemoTransport
 /// One client of a `RemoteScreenServer`, from connection setup until it leaves or times out.
 @MainActor
 final class ServerConnection {
-    typealias StartSource = @MainActor () async throws -> any ScreenFrameSource
+    typealias StartSource = @MainActor (StreamParameters) async throws -> any ScreenFrameSource
 
     /// Shared by every connection of one server.
     struct Context {
-        let framesPerSecond: Int32
-        let maximumVideoBitRate: Int
         let startSource: StartSource
         let pointer: PointerControlServer?
         let keyboard: KeyboardControlServer?
         let cursor: CursorMonitor?
         let diagnostics: Diagnostics
         let onEvent: @MainActor (RemoteScreenServer.Event) -> Void
-
-        var frameInterval: Duration { .seconds(1) / Int(framesPerSecond) }
     }
 
     /// 96 kbps Opus in 20 ms packets, with their headers.
@@ -55,16 +51,17 @@ final class ServerConnection {
     private var keyboardStateSequence: UInt64 = 0
 
     // Source
+    private var streamParameters = StreamParameters()
     private var source: (any ScreenFrameSource)?
     private var frameForwardTask: Task<Void, Never>?
     private var streamWake: AsyncStream<Void>.Continuation?
     private var encoder: VideoEncoder?
     private var previousCapturePTS = CMTime.invalid
     private var lastCaptureSend: Instant?
-    private var targetBitRate: Int
-    private var encoderFrameRate: Int32
+    private var targetBitRate = StreamParameters.defaultMaximumVideoBitRate
+    private var encoderFrameRate = StreamParameters.defaultFramesPerSecond
     private var lastRateUpdate: Instant?
-    private var refreshBitRate: Int
+    private var refreshBitRate = StreamParameters.defaultMaximumVideoBitRate
     private var lastQualityRefresh: Instant?
     private var lastImageChange = Instant.now
     private var refreshWhenStill = false
@@ -102,9 +99,6 @@ final class ServerConnection {
         self.peer = peer
         self.context = context
         trace = HeartbeatTrace(layer: "session", diagnostics: context.diagnostics)
-        targetBitRate = context.maximumVideoBitRate
-        encoderFrameRate = context.framesPerSecond
-        refreshBitRate = context.maximumVideoBitRate
     }
 
     private func log(_ message: @autoclosure () -> String) {
@@ -228,12 +222,15 @@ final class ServerConnection {
         }
         switch kind {
         case .hello:
-            guard case let .hello(requestsControl) = try? SessionHandshake(decoding: bytes) else {
+            guard case let .hello(requestsControl, stream) = try? SessionHandshake(decoding: bytes) else {
                 return
             }
             if !active {
                 active = true
-                context.onEvent(.streamingStarted(peer: peer))
+                streamParameters = stream
+                targetBitRate = stream.maximumVideoBitRate
+                encoderFrameRate = stream.framesPerSecond
+                refreshBitRate = stream.maximumVideoBitRate
                 if cursorSubscription == nil, let cursor = context.cursor {
                     cursorSubscription = cursor.subscribe { [weak self] state, shape in
                         self?.sendCursor(state, shape: shape)
@@ -252,7 +249,11 @@ final class ServerConnection {
                     }
                 }
                 streamWake?.yield(())
-                trace.write(peer, "hello accepted control=\(grant != nil)")
+                let sizeText = stream.maximumSize.map { "\($0.width)x\($0.height)" } ?? "default"
+                trace.write(
+                    peer,
+                    "hello accepted control=\(grant != nil) size=\(sizeText) fps=\(stream.framesPerSecond) maxBps=\(stream.maximumVideoBitRate) audio=\(stream.streamsAudio)"
+                )
             }
         case .heartbeat:
             guard bytes.count == 1, active else {
@@ -353,14 +354,22 @@ final class ServerConnection {
                     }
                 }
                 if source == nil {
-                    // Start the source once the client asks for video.
-                    let source = try await context.startSource()
+                    // Start the source once the client sends its stream parameters.
+                    let source = try await context.startSource(streamParameters)
                     self.source = source
                     if stopping { break }
                     try prepareVideo(source)
-                    if let capture = source as? any AudioSource {
+                    if streamParameters.streamsAudio, let capture = source as? any AudioSource {
                         startAudio(capture, session: session)
                     }
+                    context.onEvent(
+                        .streamingStarted(
+                            peer: peer,
+                            session: RemoteScreenServer.SessionInfo(
+                                width: source.width, height: source.height,
+                                framesPerSecond: streamParameters.framesPerSecond,
+                                maximumVideoBitRate: streamParameters.maximumVideoBitRate,
+                                streamsAudio: sendsAudio)))
                     if let notifying = source as? any NotifyingScreenFrameSource {
                         eventDriven = true
                         let arrivals = notifying.frameArrivals
@@ -398,10 +407,10 @@ final class ServerConnection {
     /// higher-bitrate links (e.g. 5 Mbps), stepping down to 30 fps when bitrate is tight or loss
     /// is heavy so each frame gets twice the bit budget and half the per-second loss exposure.
     private var effectiveFramesPerSecond: Int32 {
-        if context.framesPerSecond > 30 && (targetBitRate < 2_000_000 || protectedLoss >= 0.05) {
+        if streamParameters.framesPerSecond > 30 && (targetBitRate < 2_000_000 || protectedLoss >= 0.05) {
             return 30
         }
-        return context.framesPerSecond
+        return streamParameters.framesPerSecond
     }
 
     private var effectiveFrameInterval: Duration {
@@ -449,7 +458,7 @@ final class ServerConnection {
     ) async throws {
         let stats = session.statistics
         let budget = stats.bitsPerSecond
-        let maximum = context.maximumVideoBitRate
+        let maximum = streamParameters.maximumVideoBitRate
         protectedLoss = max(
             stats.linkLossRatio, protectedLoss * pow(0.5, (now - protectedLossAt) / .seconds(5)))
         protectedLossAt = now
@@ -491,7 +500,7 @@ final class ServerConnection {
         }
         // Send a still desktop again periodically so a lost frame can be recovered.
         guard changed || now.hasElapsed(stillInterval, since: lastCaptureSend) else { return }
-        if eventDriven, changed, desiredFPS < context.framesPerSecond,
+        if eventDriven, changed, desiredFPS < streamParameters.framesPerSecond,
             !now.hasElapsed(effectiveFrameInterval - .milliseconds(2), since: lastCaptureSend)
         {
             return

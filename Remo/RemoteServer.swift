@@ -67,12 +67,165 @@ nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
         }
     }
 
+    struct StreamSettings: Codable, Hashable, Sendable {
+        enum Resolution: String, Codable, CaseIterable, Identifiable, Hashable, Sendable {
+            case automatic
+            case hd720
+            case hd1080
+            case qhd1440
+            case uhd4k
+            case native
+            case custom
+
+            var id: Self { self }
+
+            var title: String {
+                switch self {
+                case .automatic: "Default (1920px)"
+                case .hd720: "720p (1280 × 720)"
+                case .hd1080: "1080p (1920 × 1080)"
+                case .qhd1440: "1440p (2560 × 1440)"
+                case .uhd4k: "4K (3840 × 2160)"
+                case .native: "Native"
+                case .custom: "Custom"
+                }
+            }
+
+            var shortTitle: String {
+                switch self {
+                case .automatic: "Default (1920px)"
+                case .hd720: "720p"
+                case .hd1080: "1080p"
+                case .qhd1440: "1440p"
+                case .uhd4k: "4K"
+                case .native: "Native"
+                case .custom: "Custom"
+                }
+            }
+        }
+
+        static let frameRatePresets = [30, 60, 120]
+        static let bitRatePresets = [2_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000]
+
+        var resolution = Resolution.automatic
+        var customWidth = 1920
+        var customHeight = 1080
+        var framesPerSecond = Int(StreamParameters.defaultFramesPerSecond)
+        var maximumVideoBitRate = StreamParameters.defaultMaximumVideoBitRate
+        var streamsAudio = false
+
+        init(
+            resolution: Resolution = .automatic,
+            customWidth: Int = 1920,
+            customHeight: Int = 1080,
+            framesPerSecond: Int = Int(StreamParameters.defaultFramesPerSecond),
+            maximumVideoBitRate: Int = StreamParameters.defaultMaximumVideoBitRate,
+            streamsAudio: Bool = false
+        ) {
+            self.resolution = resolution
+            self.customWidth = customWidth
+            self.customHeight = customHeight
+            self.framesPerSecond = framesPerSecond
+            self.maximumVideoBitRate = maximumVideoBitRate
+            self.streamsAudio = streamsAudio
+        }
+
+        init(from decoder: any Decoder) throws {
+            self.init()
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            func decode<Value: Decodable>(_ key: CodingKeys, into value: inout Value) {
+                if let decoded = try? container.decode(Value.self, forKey: key) { value = decoded }
+            }
+            decode(.resolution, into: &resolution)
+            decode(.customWidth, into: &customWidth)
+            decode(.customHeight, into: &customHeight)
+            decode(.framesPerSecond, into: &framesPerSecond)
+            decode(.maximumVideoBitRate, into: &maximumVideoBitRate)
+            decode(.streamsAudio, into: &streamsAudio)
+        }
+
+        var maximumSize: StreamParameters.Size? {
+            switch resolution {
+            case .automatic: nil
+            case .hd720: .init(width: 1280, height: 720)
+            case .hd1080: .init(width: 1920, height: 1080)
+            case .qhd1440: .init(width: 2560, height: 1440)
+            case .uhd4k: .init(width: 3840, height: 2160)
+            case .native: .init(width: 8192, height: 8192)
+            case .custom: .init(width: customWidth, height: customHeight)
+            }
+        }
+
+        var validationProblem: String? {
+            guard let fps = Int32(exactly: framesPerSecond) else {
+                return "The frame rate must be 1...240."
+            }
+            return StreamParameters(
+                maximumSize: maximumSize, framesPerSecond: fps,
+                maximumVideoBitRate: maximumVideoBitRate, streamsAudio: streamsAudio
+            ).validationProblem
+        }
+
+        var parameters: StreamParameters? {
+            guard let fps = Int32(exactly: framesPerSecond) else { return nil }
+            let parameters = StreamParameters(
+                maximumSize: maximumSize, framesPerSecond: fps,
+                maximumVideoBitRate: maximumVideoBitRate, streamsAudio: streamsAudio)
+            return parameters.isValid ? parameters : nil
+        }
+
+        var resolutionSummary: String {
+            resolution == .custom ? "\(customWidth) × \(customHeight)" : resolution.shortTitle
+        }
+
+        var bitRateSummary: String {
+            Self.formatBitRate(maximumVideoBitRate)
+        }
+
+        static func formatBitRate(_ bitsPerSecond: Int) -> String {
+            if bitsPerSecond >= 1_000_000 {
+                let mbps = Double(bitsPerSecond) / 1_000_000
+                return "\(mbps.formatted(.number.precision(.fractionLength(0...2)))) Mbps"
+            }
+            let kbps = Double(bitsPerSecond) / 1_000
+            return "\(kbps.formatted(.number.precision(.fractionLength(0...1)))) kbps"
+        }
+    }
+
     var id = UUID()
     var name = ""
     var useWireGuard = false
     var direct = Address()
     var wireGuard = WireGuard()
+    var stream = StreamSettings()
     var lastSessionAt: Date?
+
+    init(
+        id: UUID = UUID(), name: String = "", useWireGuard: Bool = false,
+        direct: Address = Address(), wireGuard: WireGuard = WireGuard(),
+        stream: StreamSettings = StreamSettings(), lastSessionAt: Date? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.useWireGuard = useWireGuard
+        self.direct = direct
+        self.wireGuard = wireGuard
+        self.stream = stream
+        self.lastSessionAt = lastSessionAt
+    }
+
+    /// Decodes missing keys as their defaults so servers saved by earlier builds still load.
+    init(from decoder: any Decoder) throws {
+        self.init()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        useWireGuard = try container.decodeIfPresent(Bool.self, forKey: .useWireGuard) ?? false
+        direct = try container.decodeIfPresent(Address.self, forKey: .direct) ?? Address()
+        wireGuard = try container.decodeIfPresent(WireGuard.self, forKey: .wireGuard) ?? WireGuard()
+        stream = try container.decodeIfPresent(StreamSettings.self, forKey: .stream) ?? StreamSettings()
+        lastSessionAt = try container.decodeIfPresent(Date.self, forKey: .lastSessionAt)
+    }
 
     /// The Remo server address for the selected transport.
     var address: Address {
@@ -90,7 +243,8 @@ nonisolated struct RemoteServer: Codable, Identifiable, Hashable, Sendable {
     }
 
     var isValid: Bool {
-        useWireGuard ? wireGuard.configuration != nil : direct.endpoint != nil
+        (useWireGuard ? wireGuard.configuration != nil : direct.endpoint != nil)
+            && stream.parameters != nil
     }
 
     /// Orders servers by name, falling back to their identifiers so equal names never reshuffle.

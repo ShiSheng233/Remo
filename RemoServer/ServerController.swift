@@ -137,29 +137,21 @@ final class ServerController {
                 $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true)
             })
         let source: RemoteScreenServer.Source
-        let resolution = settings.limitsResolution ? (width: settings.width, height: settings.height) : nil
         switch settings.source {
         case .screen:
-            source = .mainDisplay(
-                maximumWidth: resolution?.width ?? ServerSettings.screenDefaultEdge,
-                maximumHeight: resolution?.height ?? ServerSettings.screenDefaultEdge,
-                capturesAudio: settings.capturesAudio)
+            source = .mainDisplay
         case .testPattern:
-            let size = resolution ?? ServerSettings.testPatternDefault
-            let fps = Int32(settings.framesPerSecond)
-            do {
-                _ = try TestPatternSource(width: size.width, height: size.height, framesPerSecond: fps)
-            } catch {
-                finish(failure: "\(error)")
-                return
+            append(.event, nil, "Test pattern source")
+            source = .custom { parameters in
+                let size = parameters.maximumSize ?? StreamParameters.Size(width: 640, height: 360)
+                return try TestPatternSource(
+                    width: size.width, height: size.height,
+                    framesPerSecond: parameters.framesPerSecond)
             }
-            append(.event, nil, "Test pattern source: \(size.width) × \(size.height)")
-            source = .custom { try TestPatternSource(width: size.width, height: size.height, framesPerSecond: fps) }
         }
         let configuration = RemoteScreenServer.Configuration(
-            source: source, framesPerSecond: Int32(settings.framesPerSecond),
-            maximumVideoBitRate: settings.maximumVideoBitRate,
-            allowsRemoteControl: settings.allowsRemoteControl, diagnostics: diagnostics)
+            source: source, allowsRemoteControl: settings.allowsRemoteControl,
+            diagnostics: diagnostics)
 
         let server: RemoteScreenServer
         do {
@@ -178,9 +170,7 @@ final class ServerController {
         self.server = server
         if let size = server.screenSize {
             screenSize = size
-            append(
-                .event, nil,
-                "Screen source: main display, \(size.width) × \(size.height) at up to \(settings.framesPerSecond) fps")
+            append(.event, nil, "Screen source: main display (\(size.width) × \(size.height) native)")
         }
         do {
             try await server.listen(on: UInt16(settings.port))
@@ -216,9 +206,13 @@ final class ServerController {
         case .clientConnected(let peer):
             clients.insert(ClientMonitor(peer: peer), at: 0)
             append(.event, peer, "client connected")
-        case .streamingStarted(let peer):
-            client(peer)?.startStreaming()
-            append(.event, peer, "streaming started")
+        case let .streamingStarted(peer, session):
+            client(peer)?.startStreaming(session: session)
+            let audio = session.streamsAudio ? "audio on" : "audio off"
+            append(
+                .event, peer,
+                "streaming started: \(session.width) × \(session.height), up to \(session.framesPerSecond) fps, max \(Format.megabits(Double(session.maximumVideoBitRate))), \(audio)"
+            )
         case .clientDisconnected(let peer, let reason, let failed):
             client(peer)?.disconnect(reason: reason, failed: failed)
             append(failed ? .error : .event, peer, reason)

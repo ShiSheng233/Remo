@@ -14,6 +14,13 @@
             let height: Int
             let framesPerSecond: Int32
 
+            /// Resolves the main display and screen recording permission, returning its native
+            /// pixel dimensions.
+            static func discoverMainDisplay() async throws -> (width: Int, height: Int) {
+                let (_, pixelSize) = try await resolveMainDisplay()
+                return (Int(pixelSize.width.rounded()), Int(pixelSize.height.rounded()))
+            }
+
             /// Resolves the main display and screen recording permission, and scales its pixel
             /// size to fit within the maximum, keeping its aspect ratio.
             static func mainDisplay(
@@ -22,6 +29,17 @@
                 guard maximumWidth >= 2, maximumHeight >= 2, framesPerSecond > 0 else {
                     throw Failure.invalidConfiguration
                 }
+                let (filter, pixelSize) = try await resolveMainDisplay()
+                let scale = min(
+                    1, CGFloat(maximumWidth) / pixelSize.width,
+                    CGFloat(maximumHeight) / pixelSize.height)
+                func even(_ length: CGFloat) -> Int { max(2, Int(length * scale) / 2 * 2) }
+                return Self(
+                    filter: filter, width: even(pixelSize.width), height: even(pixelSize.height),
+                    framesPerSecond: framesPerSecond)
+            }
+
+            private static func resolveMainDisplay() async throws -> (SCContentFilter, CGSize) {
                 let content = try await SCShareableContent.excludingDesktopWindows(
                     false, onScreenWindowsOnly: true)
                 guard
@@ -52,13 +70,7 @@
                 guard pixelSize.width.isFinite, pixelSize.height.isFinite,
                     pixelSize.width >= 2, pixelSize.height >= 2
                 else { throw Failure.invalidConfiguration }
-                let scale = min(
-                    1, CGFloat(maximumWidth) / pixelSize.width,
-                    CGFloat(maximumHeight) / pixelSize.height)
-                func even(_ length: CGFloat) -> Int { max(2, Int(length * scale) / 2 * 2) }
-                return Self(
-                    filter: filter, width: even(pixelSize.width), height: even(pixelSize.height),
-                    framesPerSecond: framesPerSecond)
+                return (filter, pixelSize)
             }
 
             nonisolated(nonsending) func start(

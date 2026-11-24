@@ -99,13 +99,16 @@ struct ContentView: View {
     }
 
     private func connect(_ server: RemoteServer) {
-        guard let endpoint = server.address.endpoint else { return }
+        guard let endpoint = server.address.endpoint, let stream = server.stream.parameters else {
+            return
+        }
         let wireGuard = server.useWireGuard ? server.wireGuard.configuration : nil
         guard !server.useWireGuard || wireGuard != nil else { return }
         activeServer = server
         let id = server.id
-        player.connect(to: endpoint, wireGuard: wireGuard, log: store.beginSessionLog(id)) {
-            [store] frame in
+        player.connect(
+            to: endpoint, wireGuard: wireGuard, stream: stream, log: store.beginSessionLog(id)
+        ) { [store] frame in
             store.recordSession(id, finalFrame: frame)
         }
     }

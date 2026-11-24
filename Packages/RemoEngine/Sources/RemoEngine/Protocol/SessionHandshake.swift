@@ -7,8 +7,9 @@ import CoreGraphics
 import Foundation
 import RemoTransport
 
-/// One-round-trip session handshake: the client opens the stream and optionally requests remote
-/// control, and the server replies once with whether control was granted and its initial state.
+/// One-round-trip session handshake: the client opens the stream with its requested video/audio
+/// parameters and optional remote control request, and the server replies once with whether
+/// control was granted and its initial state.
 enum SessionHandshake: Equatable {
     struct ControlGrant: Equatable {
         let pointerPosition: CGPoint
@@ -17,7 +18,13 @@ enum SessionHandshake: Equatable {
         let capsLock: Bool
     }
 
-    case hello(requestsControl: Bool)
+    private enum HelloFlag {
+        static let requestsControl: UInt8 = 1 << 0
+        static let streamsAudio: UInt8 = 1 << 1
+        static let all: UInt8 = requestsControl | streamsAudio
+    }
+
+    case hello(requestsControl: Bool, stream: StreamParameters = StreamParameters())
     case ready(control: ControlGrant?)
 
     var delivery: MessageTransport.Delivery { .essential }
@@ -25,9 +32,16 @@ enum SessionHandshake: Equatable {
     var encoded: Data {
         var data = Data()
         switch self {
-        case .hello(let requestsControl):
+        case let .hello(requestsControl, stream):
             data.put(MessageKind.hello.rawValue)
-            data.put(UInt8(requestsControl ? 1 : 0))
+            var flags: UInt8 = 0
+            if requestsControl { flags |= HelloFlag.requestsControl }
+            if stream.streamsAudio { flags |= HelloFlag.streamsAudio }
+            data.put(flags)
+            data.put(UInt16(stream.maximumSize?.width ?? 0))
+            data.put(UInt16(stream.maximumSize?.height ?? 0))
+            data.put(UInt16(stream.framesPerSecond))
+            data.put(UInt32(stream.maximumVideoBitRate))
         case .ready(let control):
             data.put(MessageKind.sessionReady.rawValue)
             if let control {
@@ -48,8 +62,28 @@ enum SessionHandshake: Equatable {
         switch MessageKind(rawValue: try data.take(UInt8.self)) {
         case .hello:
             let flags = try data.take(UInt8.self)
-            guard flags <= 1 else { throw WireFormatError.invalid }
-            self = .hello(requestsControl: flags == 1)
+            guard flags & ~HelloFlag.all == 0 else { throw WireFormatError.invalid }
+            let width = Int(try data.take(UInt16.self))
+            let height = Int(try data.take(UInt16.self))
+            let maximumSize: StreamParameters.Size?
+            if width == 0 && height == 0 {
+                maximumSize = nil
+            } else {
+                let size = StreamParameters.Size(width: width, height: height)
+                guard size.isValid else { throw WireFormatError.invalid }
+                maximumSize = size
+            }
+            let framesPerSecond = Int32(try data.take(UInt16.self))
+            let maximumVideoBitRate = Int(try data.take(UInt32.self))
+            let stream = StreamParameters(
+                maximumSize: maximumSize,
+                framesPerSecond: framesPerSecond,
+                maximumVideoBitRate: maximumVideoBitRate,
+                streamsAudio: flags & HelloFlag.streamsAudio != 0)
+            guard stream.isValid else { throw WireFormatError.invalid }
+            self = .hello(
+                requestsControl: flags & HelloFlag.requestsControl != 0,
+                stream: stream)
         case .sessionReady:
             let granted = try data.take(UInt8.self)
             switch granted {

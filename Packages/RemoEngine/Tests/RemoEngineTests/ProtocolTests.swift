@@ -27,9 +27,16 @@ import RemoTransport
         displayWidth: 1512,
         displayHeight: 982,
         capsLock: true)
+    let customStream = StreamParameters(
+        maximumSize: .init(width: 2560, height: 1440),
+        framesPerSecond: 120,
+        maximumVideoBitRate: 12_000_000,
+        streamsAudio: true)
     let messages: [SessionHandshake] = [
         .hello(requestsControl: false),
         .hello(requestsControl: true),
+        .hello(requestsControl: false, stream: customStream),
+        .hello(requestsControl: true, stream: customStream),
         .ready(control: nil),
         .ready(control: grant),
     ]
@@ -44,8 +51,29 @@ import RemoTransport
             try SessionHandshake(decoding: message.encoded + [0])
         }
     }
-    let badFlags = Data([MessageKind.hello.rawValue, 2])
-    #expect(throws: WireFormatError.self) { try SessionHandshake(decoding: badFlags) }
+    func rawHello(flags: UInt8, w: UInt16, h: UInt16, fps: UInt16, bps: UInt32) -> Data {
+        var data = Data()
+        data.put(MessageKind.hello.rawValue)
+        data.put(flags)
+        data.put(w)
+        data.put(h)
+        data.put(fps)
+        data.put(bps)
+        return data
+    }
+    for invalid in [
+        rawHello(flags: 0x04, w: 0, h: 0, fps: 60, bps: 5_000_000),
+        rawHello(flags: 0, w: 1920, h: 0, fps: 60, bps: 5_000_000),
+        rawHello(flags: 0, w: 0, h: 1080, fps: 60, bps: 5_000_000),
+        rawHello(flags: 0, w: 321, h: 240, fps: 60, bps: 5_000_000),
+        rawHello(flags: 0, w: 8194, h: 1080, fps: 60, bps: 5_000_000),
+        rawHello(flags: 0, w: 0, h: 0, fps: 0, bps: 5_000_000),
+        rawHello(flags: 0, w: 0, h: 0, fps: 241, bps: 5_000_000),
+        rawHello(flags: 0, w: 0, h: 0, fps: 60, bps: 0),
+        rawHello(flags: 0, w: 0, h: 0, fps: 60, bps: UInt32(Int32.max) + 1),
+    ] {
+        #expect(throws: WireFormatError.self) { try SessionHandshake(decoding: invalid) }
+    }
 }
 
 @Test func frameRedundancyFollowsLossAndFrameSize() {

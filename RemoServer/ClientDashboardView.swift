@@ -28,8 +28,6 @@ enum ChartWindow: Int, CaseIterable, Identifiable {
 /// their history.
 struct ClientDashboardView: View {
     let client: ClientMonitor
-    /// The settings the session runs with, for drawing the configured limits.
-    let settings: ServerSettings?
 
     @AppStorage("ChartWindow") private var window = ChartWindow.oneMinute
 
@@ -78,6 +76,13 @@ struct ClientDashboardView: View {
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                if let session = client.session {
+                    Text(
+                        "\(session.width) × \(session.height) · up to \(session.framesPerSecond) fps · max \(Format.megabits(Double(session.maximumVideoBitRate)))\(session.streamsAudio ? " · Audio" : "")"
+                    )
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                }
             }
             Spacer()
         }
@@ -183,7 +188,7 @@ struct ClientDashboardView: View {
                 detail: "estimated link rate")
             MetricTile(
                 title: "Frame rate", value: Format.fps(statistics.framesPerSecond),
-                detail: settings.map { "up to \($0.framesPerSecond) fps" })
+                detail: client.session.map { "up to \($0.framesPerSecond) fps" })
             MetricTile(
                 title: "Repair", value: Format.percent(statistics.videoRedundancy, digits: 0),
                 detail: "of predicted frames")
@@ -229,7 +234,11 @@ struct ClientDashboardView: View {
                 ChartSeries(name: "Send budget", color: ChartPalette.aqua, points: points(samples) { $0.link.bitsPerSecond / 1e6 }),
             ],
             domain: domain, format: { Format.megabits($0 * 1e6) },
-            reference: settings.map { ChartReference(label: "Max \(Format.megabits(Double($0.maximumVideoBitRate)))", value: Double($0.maximumVideoBitRate) / 1e6) },
+            reference: client.session.map {
+                ChartReference(
+                    label: "Max \(Format.megabits(Double($0.maximumVideoBitRate)))",
+                    value: Double($0.maximumVideoBitRate) / 1e6)
+            },
             minimumUpperBound: 1)
     }
 
@@ -263,7 +272,9 @@ struct ClientDashboardView: View {
                 ChartSeries(name: "Frames sent", color: ChartPalette.blue, points: points(samples) { $0.statistics.framesPerSecond })
             ],
             domain: domain, format: Format.fps,
-            reference: settings.map { ChartReference(label: "Target \($0.framesPerSecond) fps", value: Double($0.framesPerSecond)) },
+            reference: client.session.map {
+                ChartReference(label: "Target \($0.framesPerSecond) fps", value: Double($0.framesPerSecond))
+            },
             minimumUpperBound: 10)
     }
 

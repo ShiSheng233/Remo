@@ -84,6 +84,7 @@ final class ClientMonitor: Identifiable {
     let peer: String
     let connectedAt = Date.now
     private(set) var status = Status.connected
+    private(set) var session: RemoteScreenServer.SessionInfo?
     private(set) var streamingSince: Date?
     private(set) var disconnectedAt: Date?
     private(set) var samples: [StatisticsSample] = []
@@ -97,7 +98,8 @@ final class ClientMonitor: Identifiable {
     var latest: StatisticsSample? { samples.last }
     var latestWire: WireSample? { wireSamples.last }
 
-    func startStreaming() {
+    func startStreaming(session: RemoteScreenServer.SessionInfo? = nil) {
+        if let session { self.session = session }
         status = .streaming
         streamingSince = .now
     }

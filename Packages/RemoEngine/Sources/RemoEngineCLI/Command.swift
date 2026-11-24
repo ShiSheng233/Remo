@@ -12,17 +12,17 @@ import RemoEngine
 enum Command {
     static let usage = """
         Usage:
-          remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--audio] [--control] [--wire-stats] [--trace-heartbeats]
-          remo-engine client <host> [port] [--screen] [--wire-stats] [--trace-heartbeats]
+          remo-engine server [port] [--screen] [--control] [--wire-stats] [--trace-heartbeats]
+          remo-engine client <host> [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--audio] [--wire-stats] [--trace-heartbeats]
 
         Default UDP port: \(RemoProtocol.defaultPort)
-        --resolution sets the test pattern size or caps the screen capture at WIDTHxHEIGHT pixels.
+        --resolution sets the test pattern size or caps screen capture at WIDTHxHEIGHT pixels (client).
         Dimensions must be even (2...8192). Defaults: 640x360 test pattern, screen longest edge 1920.
-        --fps sets the server frame rate (1...240, default 60). Screen capture runs VFR up to this rate.
-        --max-video-bitrate sets the video bitrate ceiling in bits per second (default 5000000).
+        --fps sets the target frame rate (1...240, default 60, client). Screen capture runs VFR up to this rate.
+        --max-video-bitrate sets the video bitrate ceiling in bits per second (default 5000000, client).
         --screen streams the main display on the server and opens a video window on the client (macOS).
           Without it, the server streams a test pattern and the client verifies every frame of it.
-        --audio includes system playback audio on a screen server (macOS 13 or later).
+        --audio requests system playback audio from a screen server (client, macOS 13 or later on server).
         --control enables remote pointer and keyboard input on a macOS screen server (requires Accessibility access).
         --trace-heartbeats traces heartbeat submission, UDP framing, session delivery, and timeouts.
         REMO_AUDIO_TRACE_DIR records diagnostic PCM (.f32le) and timing (.csv) in that directory.
@@ -65,12 +65,12 @@ enum Command {
         }
         let screen = present.contains("--screen")
         let audio = present.contains("--audio")
-        var resolution: (width: Int, height: Int)?
-        var fps: Int32 = 60
-        var bitRate = 5_000_000
+        var resolution: StreamParameters.Size?
+        var fps: Int32 = StreamParameters.defaultFramesPerSecond
+        var bitRate = StreamParameters.defaultMaximumVideoBitRate
         for option in ["--resolution", "--fps", "--max-video-bitrate"] {
             guard let index = args.firstIndex(of: option) else { continue }
-            guard args.first == "server" else { fail("\(option) is a server option.") }
+            guard args.first == "client" else { fail("\(option) is a client option.") }
             guard index + 1 < args.count else { fail("Missing value for \(option).") }
             let value = args[index + 1]
             switch option {
@@ -88,7 +88,7 @@ enum Command {
                 guard parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) else {
                     fail("Expected --resolution WIDTHxHEIGHT.")
                 }
-                resolution = (w, h)
+                resolution = StreamParameters.Size(width: w, height: h)
             }
             args.removeSubrange(index...index + 1)
         }
@@ -97,7 +97,7 @@ enum Command {
                 || (args.first == "client" && (2...3).contains(args.count))
         else { fail(usage) }
         let server = args[0] == "server"
-        if audio && (!server || !screen) { fail("--audio requires server --screen.") }
+        if audio && server { fail("--audio is a client option.") }
         if present.contains("--control") && (!server || !screen) {
             fail("--control requires server --screen.")
         }
@@ -110,23 +110,22 @@ enum Command {
                 .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) })
 
         if server {
-            let source: RemoteScreenServer.Source =
-                screen
-                ? .mainDisplay(
-                    maximumWidth: resolution?.width ?? 1920,
-                    maximumHeight: resolution?.height ?? 1920, capturesAudio: audio)
-                : testPattern(
-                    width: resolution?.width ?? 640, height: resolution?.height ?? 360, fps: fps)
+            let source: RemoteScreenServer.Source = screen ? .mainDisplay : testPattern()
             await serve(
                 RemoteScreenServer.Configuration(
-                    source: source, framesPerSecond: fps, maximumVideoBitRate: bitRate,
+                    source: source,
                     allowsRemoteControl: present.contains("--control"),
                     diagnostics: diagnostics),
                 port: port)
         } else {
+            let stream = StreamParameters(
+                maximumSize: resolution, framesPerSecond: fps, maximumVideoBitRate: bitRate,
+                streamsAudio: audio)
+            if let problem = stream.validationProblem { fail(problem) }
             let endpoint = NWEndpoint.hostPort(
                 host: NWEndpoint.Host(args[1]), port: NWEndpoint.Port(rawValue: port)!)
-            let success = await view(endpoint, screen: screen, diagnostics: diagnostics)
+            let success = await view(
+                endpoint, screen: screen, stream: stream, diagnostics: diagnostics)
             if !success { exit(EXIT_FAILURE) }
         }
     }
@@ -139,7 +138,10 @@ enum Command {
                 switch event {
                 case .listening(let port): log("Listening on UDP port \(port)")
                 case .clientConnected: break
-                case .streamingStarted(let peer): log("[\(peer)] streaming started")
+                case let .streamingStarted(peer, session):
+                    log(
+                        "[\(peer)] streaming started (\(session.width) × \(session.height), up to \(session.framesPerSecond) fps, max \(session.maximumVideoBitRate) bps, audio \(session.streamsAudio ? "on" : "off"))"
+                    )
                 case .clientDisconnected(let peer, let reason, _): log("[\(peer)] \(reason)")
                 case .statistics(let peer, let statistics):
                     let stamp = Date.now.formatted(.iso8601.time(includingFractionalSeconds: true))
@@ -150,9 +152,7 @@ enum Command {
             fail("\(error)")
         }
         if let size = server.screenSize {
-            log(
-                "Screen source: main display, \(size.width) × \(size.height) at up to \(configuration.framesPerSecond) fps"
-            )
+            log("Screen source: main display (\(size.width) × \(size.height) native)")
         }
         let signals = onTermination { server.stop() }
         defer { signals.forEach { $0.cancel() } }
@@ -163,19 +163,20 @@ enum Command {
         }
     }
 
-    /// A new source for each client, checked once up front.
-    static func testPattern(width: Int, height: Int, fps: Int32) -> RemoteScreenServer.Source {
-        do {
-            _ = try TestPatternSource(width: width, height: height, framesPerSecond: fps)
-        } catch {
-            fail("\(error)")
+    /// A new test pattern source for each client, using the client's requested size and frame rate.
+    static func testPattern() -> RemoteScreenServer.Source {
+        log("Test pattern source")
+        return .custom { parameters in
+            let size = parameters.maximumSize ?? StreamParameters.Size(width: 640, height: 360)
+            return try TestPatternSource(
+                width: size.width, height: size.height, framesPerSecond: parameters.framesPerSecond)
         }
-        log("Test pattern source: \(width) × \(height)")
-        return .custom { try TestPatternSource(width: width, height: height, framesPerSecond: fps) }
     }
 
     @MainActor
-    static func view(_ endpoint: NWEndpoint, screen: Bool, diagnostics: Diagnostics) async -> Bool {
+    static func view(
+        _ endpoint: NWEndpoint, screen: Bool, stream: StreamParameters, diagnostics: Diagnostics
+    ) async -> Bool {
         #if os(macOS)
             var client: RemoteScreenClient?
             let window =
@@ -191,7 +192,8 @@ enum Command {
         var displayEnqueued = 0
         var verifier = TestPatternVerifier()
         let viewer = RemoteScreenClient(
-            configuration: .init(requestsRemoteControl: false, diagnostics: diagnostics),
+            configuration: .init(
+                requestsRemoteControl: false, stream: stream, diagnostics: diagnostics),
             onFrame: { frame in
                 #if os(macOS)
                     if let window {

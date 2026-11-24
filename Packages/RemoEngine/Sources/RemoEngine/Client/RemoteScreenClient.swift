@@ -28,15 +28,19 @@ public final class RemoteScreenClient {
         public var noVideoTimeout = Duration.seconds(15)
         /// Asks the server for remote pointer and keyboard control. A server grants it to one client at a time.
         public var requestsRemoteControl = true
+        /// Video and audio settings requested during the session handshake.
+        public var stream = StreamParameters()
         public var diagnostics = Diagnostics()
 
         public init(
             setupTimeout: Duration = .seconds(8), noVideoTimeout: Duration = .seconds(15),
-            requestsRemoteControl: Bool = true, diagnostics: Diagnostics = Diagnostics()
+            requestsRemoteControl: Bool = true, stream: StreamParameters = StreamParameters(),
+            diagnostics: Diagnostics = Diagnostics()
         ) {
             self.setupTimeout = setupTimeout
             self.noVideoTimeout = noVideoTimeout
             self.requestsRemoteControl = requestsRemoteControl
+            self.stream = stream
             self.diagnostics = diagnostics
         }
     }
@@ -46,6 +50,7 @@ public final class RemoteScreenClient {
     }
 
     public enum Failure: Error {
+        case invalidConfiguration(String)
         case setupTimedOut
         case connectionFailed(any Error)
         case connectionClosed
@@ -335,6 +340,10 @@ public final class RemoteScreenClient {
     }
 
     private func stream(_ link: Link) async {
+        if let problem = configuration.stream.validationProblem {
+            fail(.invalidConfiguration(problem))
+            return
+        }
         let setupTimeout = Task { [weak self, configuration] in
             try await Task.sleep(for: configuration.setupTimeout)
             self?.fail(.setupTimedOut)
@@ -376,7 +385,9 @@ public final class RemoteScreenClient {
                     configuration.diagnostics.info(nil, line)
                 },
                 onFailure: { [weak self] error in self?.fail(.videoFailed(error)) })
-            let hello = SessionHandshake.hello(requestsControl: configuration.requestsRemoteControl)
+            let hello = SessionHandshake.hello(
+                requestsControl: configuration.requestsRemoteControl,
+                stream: configuration.stream)
             try session.send(hello.encoded, delivery: hello.delivery)
             trace.write(nil, "hello queued")
             setState(.waitingForVideo)
@@ -452,7 +463,7 @@ public final class RemoteScreenClient {
         if byte == MessageKind.audio.rawValue {
             guard let packet = try? AudioMessage(decoding: data) else { return }
             lastSeen = .now
-            guard !audioDisabled else { return }
+            guard configuration.stream.streamsAudio, !audioDisabled else { return }
             if playback == nil {
                 playback = AudioPlayback(
                     traceDirectory: configuration.diagnostics.audioTraceDirectory
@@ -528,6 +539,7 @@ public final class RemoteScreenClient {
 extension RemoteScreenClient.Failure: CustomStringConvertible {
     public var description: String {
         switch self {
+        case .invalidConfiguration(let problem): "invalid configuration: \(problem)"
         case .setupTimedOut: "connection setup timed out"
         case .connectionFailed(let error): "connection setup: \(error)"
         case .connectionClosed: "connection closed"
