@@ -159,7 +159,7 @@ final class ServerController {
         let configuration = RemoteScreenServer.Configuration(
             source: source, framesPerSecond: Int32(settings.framesPerSecond),
             maximumVideoBitRate: settings.maximumVideoBitRate,
-            allowsPointerControl: settings.allowsPointerControl, diagnostics: diagnostics)
+            allowsRemoteControl: settings.allowsRemoteControl, diagnostics: diagnostics)
 
         let server: RemoteScreenServer
         do {

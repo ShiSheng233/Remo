@@ -3,61 +3,82 @@
 //  Copyright (c) 2026 Cyandev. All rights reserved.
 //
 
+import RemoEngine
 import SwiftUI
 import UIKit
+
+enum RemoteModifierKey: Hashable, CaseIterable {
+    case control, option, command, shift
+
+    var wireFlag: KeyboardModifiers {
+        switch self {
+        case .control: .control
+        case .option: .option
+        case .command: .command
+        case .shift: .shift
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .control: "control"
+        case .option: "option"
+        case .command: "command"
+        case .shift: "shift"
+        }
+    }
+
+    var filledSymbolName: String {
+        self == .shift ? "shift.fill" : symbolName
+    }
+
+    var accessibilityName: String {
+        switch self {
+        case .control: "Control"
+        case .option: "Option"
+        case .command: "Command"
+        case .shift: "Shift"
+        }
+    }
+}
+
+enum RemoteModifierState: Equatable {
+    case idle, selected, locked
+}
 
 /// A Mac-complete on-screen keyboard with a top-rounded Liquid Glass backdrop and plain translucent
 /// keycaps styled to sit naturally alongside iOS system controls.
 ///
-/// Modifiers follow native iOS shift semantics: a single tap selects for one keystroke (white, no
+/// Modifiers synchronize immediately on state change: single tap selects for one key (white, no
 /// dot), a second tap after the double-tap window cancels back to idle, and a quick double-tap
-/// locks the modifier (white with a dark dot matching the glyph).
+/// locks the modifier (white with a dark dot matching the glyph). Normal keys send an atomic
+/// keystroke on short tap, or keyDown/keyUp when held.
 struct RemoteKeyboardView: View {
+    let modifierStates: [RemoteModifierKey: RemoteModifierState]
+    let capsLockActive: Bool
+    let onToggleModifier: (RemoteModifierKey) -> Void
+    let onKeystroke: (KeyboardKeyCode) -> Void
+    let onKeyDown: (KeyboardKeyCode) -> Void
+    let onKeyUp: (KeyboardKeyCode) -> Void
+    let onScrubStep: (KeyboardKeyCode) -> Void
+    let onScrubEnd: () -> Void
     let onDismiss: () -> Void
 
     @State private var containerWidth: CGFloat = 0
     @State private var symbolMode = false
     @State private var fnMode = false
-    @State private var capsLockActive = false
     @State private var scrubbingCursor = false
-    @State private var modifiers: [ModifierKey: ModifierState] = [:]
-    @State private var lastModifierSelectTime: [ModifierKey: ContinuousClock.Instant] = [:]
 
-    private static let doubleTapWindow: Duration = .milliseconds(350)
-
-    private enum ModifierKey: Hashable, CaseIterable {
-        case control, option, command, shift
-
-        var symbolName: String {
-            switch self {
-            case .control: "control"
-            case .option: "option"
-            case .command: "command"
-            case .shift: "shift"
-            }
-        }
-
-        var filledSymbolName: String {
-            self == .shift ? "shift.fill" : symbolName
-        }
-
-        var accessibilityName: String {
-            switch self {
-            case .control: "Control"
-            case .option: "Option"
-            case .command: "Command"
-            case .shift: "Shift"
-            }
-        }
-    }
-
-    enum ModifierState {
-        case idle, selected, locked
+    private struct LetterKey: Identifiable {
+        let label: String
+        let code: KeyboardKeyCode
+        var id: String { label }
     }
 
     private struct DualKey: Identifiable {
         let lower: String
         let upper: String
+        let code: KeyboardKeyCode
         var id: String { lower }
     }
 
@@ -66,68 +87,104 @@ struct RemoteKeyboardView: View {
         let label: String?
         let systemImage: String?
         let width: CGFloat
+        let code: KeyboardKeyCode
         let isCapsLock: Bool
 
-        init(_ label: String, width: CGFloat = 38) {
+        init(_ label: String, code: KeyboardKeyCode, width: CGFloat = 38) {
             self.id = label
             self.label = label
             self.systemImage = nil
             self.width = width
+            self.code = code
             self.isCapsLock = false
         }
 
-        init(id: String, systemImage: String, width: CGFloat = 32, isCapsLock: Bool = false) {
+        init(
+            id: String, systemImage: String, code: KeyboardKeyCode, width: CGFloat = 32,
+            isCapsLock: Bool = false
+        ) {
             self.id = id
             self.label = nil
             self.systemImage = systemImage
             self.width = width
+            self.code = code
             self.isCapsLock = isCapsLock
         }
     }
 
-    private static let qwertyRow1 = ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"]
-    private static let qwertyRow2 = ["a", "s", "d", "f", "g", "h", "j", "k", "l"]
-    private static let qwertyRow3 = ["z", "x", "c", "v", "b", "n", "m"]
+    private struct FnKey: Identifiable {
+        let label: String
+        let code: KeyboardKeyCode
+        var id: String { label }
+    }
+
+    private static let qwertyRow1: [LetterKey] = [
+        .init(label: "q", code: .q), .init(label: "w", code: .w), .init(label: "e", code: .e),
+        .init(label: "r", code: .r), .init(label: "t", code: .t), .init(label: "y", code: .y),
+        .init(label: "u", code: .u), .init(label: "i", code: .i), .init(label: "o", code: .o),
+        .init(label: "p", code: .p),
+    ]
+    private static let qwertyRow2: [LetterKey] = [
+        .init(label: "a", code: .a), .init(label: "s", code: .s), .init(label: "d", code: .d),
+        .init(label: "f", code: .f), .init(label: "g", code: .g), .init(label: "h", code: .h),
+        .init(label: "j", code: .j), .init(label: "k", code: .k), .init(label: "l", code: .l),
+    ]
+    private static let qwertyRow3: [LetterKey] = [
+        .init(label: "z", code: .z), .init(label: "x", code: .x), .init(label: "c", code: .c),
+        .init(label: "v", code: .v), .init(label: "b", code: .b), .init(label: "n", code: .n),
+        .init(label: "m", code: .m),
+    ]
 
     /// All 21 non-letter printable keys on a US ANSI Mac keyboard.
     private static let symbolRow1: [DualKey] = [
-        .init(lower: "1", upper: "!"), .init(lower: "2", upper: "@"),
-        .init(lower: "3", upper: "#"), .init(lower: "4", upper: "$"),
-        .init(lower: "5", upper: "%"), .init(lower: "6", upper: "^"),
-        .init(lower: "7", upper: "&"), .init(lower: "8", upper: "*"),
-        .init(lower: "9", upper: "("), .init(lower: "0", upper: ")"),
+        .init(lower: "1", upper: "!", code: .digit1), .init(lower: "2", upper: "@", code: .digit2),
+        .init(lower: "3", upper: "#", code: .digit3), .init(lower: "4", upper: "$", code: .digit4),
+        .init(lower: "5", upper: "%", code: .digit5), .init(lower: "6", upper: "^", code: .digit6),
+        .init(lower: "7", upper: "&", code: .digit7), .init(lower: "8", upper: "*", code: .digit8),
+        .init(lower: "9", upper: "(", code: .digit9), .init(lower: "0", upper: ")", code: .digit0),
     ]
     private static let symbolRow2: [DualKey] = [
-        .init(lower: "`", upper: "~"), .init(lower: "-", upper: "_"),
-        .init(lower: "=", upper: "+"), .init(lower: "[", upper: "{"),
-        .init(lower: "]", upper: "}"), .init(lower: "\\", upper: "|"),
+        .init(lower: "`", upper: "~", code: .grave), .init(lower: "-", upper: "_", code: .minus),
+        .init(lower: "=", upper: "+", code: .equal),
+        .init(lower: "[", upper: "{", code: .leftBracket),
+        .init(lower: "]", upper: "}", code: .rightBracket),
+        .init(lower: "\\", upper: "|", code: .backslash),
     ]
     private static let symbolRow3: [DualKey] = [
-        .init(lower: ";", upper: ":"), .init(lower: "'", upper: "\""),
-        .init(lower: ",", upper: "<"), .init(lower: ".", upper: ">"),
-        .init(lower: "/", upper: "?"),
+        .init(lower: ";", upper: ":", code: .semicolon),
+        .init(lower: "'", upper: "\"", code: .quote),
+        .init(lower: ",", upper: "<", code: .comma),
+        .init(lower: ".", upper: ">", code: .period),
+        .init(lower: "/", upper: "?", code: .slash),
     ]
 
     /// Placed in physical Mac left-edge order: Esc, Tab, Caps Lock, followed by navigation keys.
     private static let navKeys: [NavKey] = [
-        .init("Esc", width: 38),
-        .init("Tab", width: 38),
-        .init(id: "Caps Lock", systemImage: "capslock", width: 34, isCapsLock: true),
-        .init(id: "Left", systemImage: "chevron.left"),
-        .init(id: "Down", systemImage: "chevron.down"),
-        .init(id: "Up", systemImage: "chevron.up"),
-        .init(id: "Right", systemImage: "chevron.right"),
-        .init("Del", width: 38),
-        .init("Home", width: 46),
-        .init("End", width: 38),
-        .init("PgUp", width: 46),
-        .init("PgDn", width: 46),
+        .init("Esc", code: .escape, width: 38),
+        .init("Tab", code: .tab, width: 38),
+        .init(id: "Caps Lock", systemImage: "capslock", code: .capsLock, width: 34, isCapsLock: true),
+        .init(id: "Left", systemImage: "chevron.left", code: .leftArrow),
+        .init(id: "Down", systemImage: "chevron.down", code: .downArrow),
+        .init(id: "Up", systemImage: "chevron.up", code: .upArrow),
+        .init(id: "Right", systemImage: "chevron.right", code: .rightArrow),
+        .init("Del", code: .forwardDelete, width: 38),
+        .init("Home", code: .home, width: 46),
+        .init("End", code: .end, width: 38),
+        .init("PgUp", code: .pageUp, width: 46),
+        .init("PgDn", code: .pageDown, width: 46),
     ]
 
-    private static let fnKeys = (1...12).map { "F\($0)" }
+    private static let fnKeys: [FnKey] = [
+        .init(label: "F1", code: .f1), .init(label: "F2", code: .f2),
+        .init(label: "F3", code: .f3), .init(label: "F4", code: .f4),
+        .init(label: "F5", code: .f5), .init(label: "F6", code: .f6),
+        .init(label: "F7", code: .f7), .init(label: "F8", code: .f8),
+        .init(label: "F9", code: .f9), .init(label: "F10", code: .f10),
+        .init(label: "F11", code: .f11), .init(label: "F12", code: .f12),
+    ]
 
     private var isCompact: Bool { containerWidth > 0 && containerWidth < 560 }
-    private var shiftState: ModifierState { modifiers[.shift] ?? .idle }
+    private var shiftState: RemoteModifierState { modifierStates[.shift] ?? .idle }
     private var shiftActive: Bool { shiftState != .idle }
 
     var body: some View {
@@ -174,14 +231,14 @@ struct RemoteKeyboardView: View {
         return HStack(spacing: 0) {
             // Left pinned modifiers (Control, Option, Command; Shift lives in row 3).
             HStack(spacing: isCompact ? 4 : 6) {
-                ForEach([ModifierKey.control, .option, .command], id: \.self) { key in
+                ForEach([RemoteModifierKey.control, .option, .command], id: \.self) { key in
                     ModifierKeyCap(
                         symbolName: key.symbolName,
                         filledSymbolName: key.filledSymbolName,
-                        state: modifiers[key] ?? .idle,
+                        state: modifierStates[key] ?? .idle,
                         compact: isCompact
                     ) {
-                        toggleModifier(key)
+                        withoutAnimation { onToggleModifier(key) }
                     }
                     .frame(width: modWidth, height: barHeight)
                     .accessibilityLabel(key.accessibilityName)
@@ -196,51 +253,38 @@ struct RemoteKeyboardView: View {
             FadingHorizontalScrollView(restInset: isCompact ? 7 : 10) {
                 HStack(spacing: isCompact ? 4 : 5) {
                     if fnMode {
-                        ForEach(Self.fnKeys, id: \.self) { label in
+                        ForEach(Self.fnKeys) { item in
                             UtilityKeyCap(
-                                label: label,
+                                label: item.label,
                                 systemImage: nil,
                                 active: false,
-                                compact: isCompact
-                            ) {
-                                handleNonModifierKey()
-                            }
+                                compact: isCompact,
+                                onKeystroke: { onKeystroke(item.code) },
+                                onKeyDown: { onKeyDown(item.code) },
+                                onKeyUp: { onKeyUp(item.code) }
+                            )
                             .frame(width: isCompact ? 36 : 42, height: barHeight)
                         }
                     } else {
                         ForEach(Self.navKeys) { item in
-                            if item.isCapsLock {
-                                UtilityKeyCap(
-                                    label: nil,
-                                    systemImage: capsLockActive ? "capslock.fill" : "capslock",
-                                    active: capsLockActive,
-                                    compact: isCompact
-                                ) {
-                                    withoutAnimation {
-                                        capsLockActive.toggle()
-                                    }
-                                    handleNonModifierKey()
-                                }
-                                .frame(
-                                    width: isCompact ? max(32, item.width - 2) : item.width,
-                                    height: barHeight
-                                )
-                                .accessibilityLabel(item.id)
-                            } else {
-                                UtilityKeyCap(
-                                    label: item.label,
-                                    systemImage: item.systemImage,
-                                    active: false,
-                                    compact: isCompact
-                                ) {
-                                    handleNonModifierKey()
-                                }
-                                .frame(
-                                    width: isCompact ? max(30, item.width - 2) : item.width,
-                                    height: barHeight
-                                )
-                                .accessibilityLabel(item.id)
-                            }
+                            UtilityKeyCap(
+                                label: item.label,
+                                systemImage: item.isCapsLock
+                                    ? (capsLockActive ? "capslock.fill" : "capslock")
+                                    : item.systemImage,
+                                active: item.isCapsLock ? capsLockActive : false,
+                                compact: isCompact,
+                                onKeystroke: { onKeystroke(item.code) },
+                                onKeyDown: { onKeyDown(item.code) },
+                                onKeyUp: { onKeyUp(item.code) }
+                            )
+                            .frame(
+                                width: isCompact
+                                    ? max(item.isCapsLock ? 32 : 30, item.width - 2)
+                                    : item.width,
+                                height: barHeight
+                            )
+                            .accessibilityLabel(item.id)
                         }
                     }
                 }
@@ -252,7 +296,7 @@ struct RemoteKeyboardView: View {
             topDivider
 
             // Right pinned dismiss button.
-            UtilityKeyCap(
+            TapKeyCap(
                 label: nil,
                 systemImage: "keyboard.chevron.compact.down",
                 active: false,
@@ -289,20 +333,22 @@ struct RemoteKeyboardView: View {
                             lower: key.lower,
                             upper: key.upper,
                             shiftActive: shiftActive,
-                            compact: isCompact
-                        ) {
-                            handleNonModifierKey()
-                        }
+                            compact: isCompact,
+                            onKeystroke: { onKeystroke(key.code) },
+                            onKeyDown: { onKeyDown(key.code) },
+                            onKeyUp: { onKeyUp(key.code) }
+                        )
                         .frame(height: keyHeight)
                     }
                 } else {
-                    ForEach(Self.qwertyRow1, id: \.self) { letter in
+                    ForEach(Self.qwertyRow1) { key in
                         CharacterKeyCap(
-                            label: (shiftActive || capsLockActive) ? letter.uppercased() : letter,
-                            compact: isCompact
-                        ) {
-                            handleNonModifierKey()
-                        }
+                            label: (shiftActive || capsLockActive) ? key.label.uppercased() : key.label,
+                            compact: isCompact,
+                            onKeystroke: { onKeystroke(key.code) },
+                            onKeyDown: { onKeyDown(key.code) },
+                            onKeyUp: { onKeyUp(key.code) }
+                        )
                         .frame(height: keyHeight)
                     }
                 }
@@ -318,20 +364,22 @@ struct RemoteKeyboardView: View {
                             lower: key.lower,
                             upper: key.upper,
                             shiftActive: shiftActive,
-                            compact: isCompact
-                        ) {
-                            handleNonModifierKey()
-                        }
+                            compact: isCompact,
+                            onKeystroke: { onKeystroke(key.code) },
+                            onKeyDown: { onKeyDown(key.code) },
+                            onKeyUp: { onKeyUp(key.code) }
+                        )
                         .frame(height: keyHeight)
                     }
                 } else {
-                    ForEach(Self.qwertyRow2, id: \.self) { letter in
+                    ForEach(Self.qwertyRow2) { key in
                         CharacterKeyCap(
-                            label: (shiftActive || capsLockActive) ? letter.uppercased() : letter,
-                            compact: isCompact
-                        ) {
-                            handleNonModifierKey()
-                        }
+                            label: (shiftActive || capsLockActive) ? key.label.uppercased() : key.label,
+                            compact: isCompact,
+                            onKeystroke: { onKeystroke(key.code) },
+                            onKeyDown: { onKeyDown(key.code) },
+                            onKeyUp: { onKeyUp(key.code) }
+                        )
                         .frame(height: keyHeight)
                     }
                 }
@@ -343,13 +391,13 @@ struct RemoteKeyboardView: View {
             // Row 3 (Shift + Z-M / remaining Mac symbols + Delete)
             HStack(spacing: hGap) {
                 ModifierKeyCap(
-                    symbolName: ModifierKey.shift.symbolName,
-                    filledSymbolName: ModifierKey.shift.filledSymbolName,
+                    symbolName: RemoteModifierKey.shift.symbolName,
+                    filledSymbolName: RemoteModifierKey.shift.filledSymbolName,
                     state: shiftState,
                     compact: isCompact,
                     cornerRadius: isCompact ? 8 : 10
                 ) {
-                    toggleModifier(.shift)
+                    withoutAnimation { onToggleModifier(.shift) }
                 }
                 .frame(width: isCompact ? 44 : 88, height: keyHeight)
                 .accessibilityLabel("Shift")
@@ -360,32 +408,35 @@ struct RemoteKeyboardView: View {
                             lower: key.lower,
                             upper: key.upper,
                             shiftActive: shiftActive,
-                            compact: isCompact
-                        ) {
-                            handleNonModifierKey()
-                        }
+                            compact: isCompact,
+                            onKeystroke: { onKeystroke(key.code) },
+                            onKeyDown: { onKeyDown(key.code) },
+                            onKeyUp: { onKeyUp(key.code) }
+                        )
                         .frame(height: keyHeight)
                     }
                 } else {
-                    ForEach(Self.qwertyRow3, id: \.self) { letter in
+                    ForEach(Self.qwertyRow3) { key in
                         CharacterKeyCap(
-                            label: (shiftActive || capsLockActive) ? letter.uppercased() : letter,
-                            compact: isCompact
-                        ) {
-                            handleNonModifierKey()
-                        }
+                            label: (shiftActive || capsLockActive) ? key.label.uppercased() : key.label,
+                            compact: isCompact,
+                            onKeystroke: { onKeystroke(key.code) },
+                            onKeyDown: { onKeyDown(key.code) },
+                            onKeyUp: { onKeyUp(key.code) }
+                        )
                         .frame(height: keyHeight)
                     }
                 }
 
-                ActionKeyCap(
+                HoldActionKeyCap(
                     label: nil,
                     systemImage: "delete.left",
                     prominent: false,
-                    compact: isCompact
-                ) {
-                    handleNonModifierKey()
-                }
+                    compact: isCompact,
+                    onKeystroke: { onKeystroke(.delete) },
+                    onKeyDown: { onKeyDown(.delete) },
+                    onKeyUp: { onKeyUp(.delete) }
+                )
                 .frame(width: isCompact ? 44 : 88, height: keyHeight)
                 .accessibilityLabel("Delete")
             }
@@ -419,56 +470,25 @@ struct RemoteKeyboardView: View {
                 SpacebarKeyCap(
                     scrubbing: $scrubbingCursor,
                     compact: isCompact,
-                    onTap: handleNonModifierKey
+                    onTap: { onKeystroke(.space) },
+                    onScrubStep: onScrubStep,
+                    onScrubEnd: onScrubEnd
                 )
                 .frame(height: keyHeight)
 
-                ActionKeyCap(
+                HoldActionKeyCap(
                     label: nil,
                     systemImage: "return",
                     prominent: true,
-                    compact: isCompact
-                ) {
-                    handleNonModifierKey()
-                }
+                    compact: isCompact,
+                    onKeystroke: { onKeystroke(.return) },
+                    onKeyDown: { onKeyDown(.return) },
+                    onKeyUp: { onKeyUp(.return) }
+                )
                 .frame(width: isCompact ? 72 : 112, height: keyHeight)
                 .opacity(dimOpacity)
                 .animation(.easeOut(duration: 0.16), value: scrubbingCursor)
                 .accessibilityLabel("Return")
-            }
-        }
-    }
-
-    // MARK: - Local UI State (Zero-Animation Instant Transitions)
-
-    private func toggleModifier(_ key: ModifierKey) {
-        let now = ContinuousClock.now
-        withoutAnimation {
-            switch modifiers[key] ?? .idle {
-            case .idle:
-                modifiers[key] = .selected
-                lastModifierSelectTime[key] = now
-            case .selected:
-                if let previous = lastModifierSelectTime[key],
-                   previous.duration(to: now) <= Self.doubleTapWindow
-                {
-                    modifiers[key] = .locked
-                } else {
-                    modifiers[key] = .idle
-                }
-                lastModifierSelectTime[key] = nil
-            case .locked:
-                modifiers[key] = .idle
-                lastModifierSelectTime[key] = nil
-            }
-        }
-    }
-
-    private func handleNonModifierKey() {
-        withoutAnimation {
-            for key in ModifierKey.allCases where modifiers[key] == .selected {
-                modifiers[key] = .idle
-                lastModifierSelectTime[key] = nil
             }
         }
     }
@@ -558,6 +578,165 @@ private struct FadingHorizontalScrollView<Content: View>: View {
     }
 }
 
+// MARK: - Key Touch Recognition (Short Tap = Keystroke, Hold = KeyDown + KeyUp)
+
+/// Distinguishes a short tap (`onKeystroke`) from a press-and-hold (`onKeyDown` → `onKeyUp`)
+/// without blocking multi-touch roll-typing or horizontal scroll gestures in ancestor scroll views.
+private struct KeyTouchArea: UIViewRepresentable {
+    let onPressChanged: (Bool) -> Void
+    let onKeystroke: () -> Void
+    let onKeyDown: () -> Void
+    let onKeyUp: () -> Void
+
+    func makeUIView(context: Context) -> TouchView {
+        let view = TouchView()
+        view.configure(self)
+        return view
+    }
+
+    func updateUIView(_ uiView: TouchView, context: Context) {
+        uiView.configure(self)
+    }
+
+    final class TouchView: UIView {
+        private static let holdThreshold: Duration = .milliseconds(250)
+
+        private var onPressChanged: ((Bool) -> Void)?
+        private var onKeystroke: (() -> Void)?
+        private var onKeyDown: (() -> Void)?
+        private var onKeyUp: (() -> Void)?
+
+        private var activeTouch: UITouch?
+        private var holdTask: Task<Void, Never>?
+        private var didSendKeyDown = false
+        private var isHighlighted = false
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            backgroundColor = .clear
+            isMultipleTouchEnabled = false
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        func configure(_ area: KeyTouchArea) {
+            onPressChanged = area.onPressChanged
+            onKeystroke = area.onKeystroke
+            onKeyDown = area.onKeyDown
+            onKeyUp = area.onKeyUp
+        }
+
+        override func willMove(toWindow newWindow: UIWindow?) {
+            super.willMove(toWindow: newWindow)
+            if newWindow == nil {
+                cancelActiveTouch()
+            }
+        }
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            guard activeTouch == nil, let touch = touches.first else { return }
+            activeTouch = touch
+            didSendKeyDown = false
+            setHighlighted(true)
+            holdTask?.cancel()
+            holdTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: Self.holdThreshold)
+                guard !Task.isCancelled, let self, self.activeTouch != nil, self.isHighlighted else {
+                    return
+                }
+                self.didSendKeyDown = true
+                self.onKeyDown?()
+            }
+        }
+
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            guard let activeTouch, touches.contains(activeTouch) else { return }
+            if didSendKeyDown { return }
+            let inside = bounds.insetBy(dx: -16, dy: -16).contains(activeTouch.location(in: self))
+            if inside != isHighlighted {
+                setHighlighted(inside)
+                if !inside {
+                    holdTask?.cancel()
+                    holdTask = nil
+                }
+            }
+        }
+
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            guard let activeTouch, touches.contains(activeTouch) else { return }
+            let wasHeld = didSendKeyDown
+            let inside = bounds.insetBy(dx: -16, dy: -16).contains(activeTouch.location(in: self))
+            finishTouch()
+            if wasHeld {
+                onKeyUp?()
+            } else if inside {
+                onKeystroke?()
+            }
+        }
+
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            guard let activeTouch, touches.contains(activeTouch) else { return }
+            cancelActiveTouch()
+        }
+
+        private func cancelActiveTouch() {
+            guard activeTouch != nil || didSendKeyDown else { return }
+            let wasHeld = didSendKeyDown
+            finishTouch()
+            if wasHeld {
+                onKeyUp?()
+            }
+        }
+
+        private func finishTouch() {
+            holdTask?.cancel()
+            holdTask = nil
+            activeTouch = nil
+            didSendKeyDown = false
+            setHighlighted(false)
+        }
+
+        private func setHighlighted(_ highlighted: Bool) {
+            guard isHighlighted != highlighted else { return }
+            isHighlighted = highlighted
+            onPressChanged?(highlighted)
+        }
+    }
+}
+
+private struct HoldableKeySurface<Label: View>: View {
+    let normalFill: Color
+    let pressedFill: Color
+    let cornerRadius: CGFloat
+    let onKeystroke: () -> Void
+    let onKeyDown: () -> Void
+    let onKeyUp: () -> Void
+    @ViewBuilder let label: Label
+
+    @State private var pressed = false
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        label
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(pressed ? pressedFill : normalFill, in: shape)
+            .contentShape(shape)
+            .overlay {
+                KeyTouchArea(
+                    onPressChanged: { isPressed in
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) { pressed = isPressed }
+                    },
+                    onKeystroke: onKeystroke,
+                    onKeyDown: onKeyDown,
+                    onKeyUp: onKeyUp
+                )
+            }
+            .transaction { $0.animation = nil }
+    }
+}
+
 // MARK: - Keycaps (Plain Translucent Views, Instant Highlight Only)
 
 private struct TranslucentKeyStyle: ButtonStyle {
@@ -578,22 +757,26 @@ private struct TranslucentKeyStyle: ButtonStyle {
 private struct CharacterKeyCap: View {
     let label: String
     let compact: Bool
-    let action: () -> Void
+    let onKeystroke: () -> Void
+    let onKeyDown: () -> Void
+    let onKeyUp: () -> Void
 
     var body: some View {
-        Button(action: action) {
+        HoldableKeySurface(
+            normalFill: .white.opacity(0.20),
+            pressedFill: .white.opacity(0.38),
+            cornerRadius: compact ? 8 : 10,
+            onKeystroke: onKeystroke,
+            onKeyDown: onKeyDown,
+            onKeyUp: onKeyUp
+        ) {
             Text(label)
                 .font(.system(size: compact ? 20 : 21, weight: .regular))
                 .foregroundStyle(.white)
         }
-        .buttonStyle(
-            TranslucentKeyStyle(
-                normalFill: .white.opacity(0.20),
-                pressedFill: .white.opacity(0.38),
-                cornerRadius: compact ? 8 : 10
-            )
-        )
-        .transaction { $0.animation = nil }
+        .accessibilityElement()
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(.isButton)
     }
 }
 
@@ -602,10 +785,19 @@ private struct DualSymbolKeyCap: View {
     let upper: String
     let shiftActive: Bool
     let compact: Bool
-    let action: () -> Void
+    let onKeystroke: () -> Void
+    let onKeyDown: () -> Void
+    let onKeyUp: () -> Void
 
     var body: some View {
-        Button(action: action) {
+        HoldableKeySurface(
+            normalFill: .white.opacity(0.20),
+            pressedFill: .white.opacity(0.38),
+            cornerRadius: compact ? 8 : 10,
+            onKeystroke: onKeystroke,
+            onKeyDown: onKeyDown,
+            onKeyUp: onKeyUp
+        ) {
             VStack(spacing: 0) {
                 Text(upper)
                     .font(.system(
@@ -623,14 +815,42 @@ private struct DualSymbolKeyCap: View {
             }
             .padding(.vertical, compact ? 3 : 4)
         }
-        .buttonStyle(
-            TranslucentKeyStyle(
-                normalFill: .white.opacity(0.20),
-                pressedFill: .white.opacity(0.38),
-                cornerRadius: compact ? 8 : 10
-            )
-        )
-        .transaction { $0.animation = nil }
+        .accessibilityElement()
+        .accessibilityLabel(shiftActive ? upper : lower)
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+private struct HoldActionKeyCap: View {
+    let label: String?
+    let systemImage: String?
+    let prominent: Bool
+    let compact: Bool
+    let onKeystroke: () -> Void
+    let onKeyDown: () -> Void
+    let onKeyUp: () -> Void
+
+    var body: some View {
+        HoldableKeySurface(
+            normalFill: .white.opacity(prominent ? 0.28 : 0.12),
+            pressedFill: .white.opacity(prominent ? 0.42 : 0.28),
+            cornerRadius: compact ? 8 : 10,
+            onKeystroke: onKeystroke,
+            onKeyDown: onKeyDown,
+            onKeyUp: onKeyUp
+        ) {
+            if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.system(size: compact ? 16 : 18, weight: .medium))
+                    .foregroundStyle(.white)
+            } else if let label {
+                Text(label)
+                    .font(.system(size: compact ? 13 : 14, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+        }
+        .accessibilityElement()
+        .accessibilityAddTraits(.isButton)
     }
 }
 
@@ -669,6 +889,44 @@ private struct UtilityKeyCap: View {
     let systemImage: String?
     let active: Bool
     let compact: Bool
+    let onKeystroke: () -> Void
+    let onKeyDown: () -> Void
+    let onKeyUp: () -> Void
+
+    private static let activeFill = Color(white: 0.96)
+    private static let activeInk = Color(white: 0.08)
+
+    var body: some View {
+        let ink: Color = active ? Self.activeInk : .white
+        HoldableKeySurface(
+            normalFill: active ? Self.activeFill : .white.opacity(0.11),
+            pressedFill: active ? .white.opacity(0.82) : .white.opacity(0.28),
+            cornerRadius: compact ? 8 : 9,
+            onKeystroke: onKeystroke,
+            onKeyDown: onKeyDown,
+            onKeyUp: onKeyUp
+        ) {
+            if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.system(size: compact ? 13 : 14, weight: .medium))
+                    .foregroundStyle(ink)
+            } else if let label {
+                Text(label)
+                    .font(.system(size: compact ? 11.5 : 12.5, weight: .medium))
+                    .foregroundStyle(ink)
+                    .lineLimit(1)
+            }
+        }
+        .accessibilityElement()
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+private struct TapKeyCap: View {
+    let label: String?
+    let systemImage: String?
+    let active: Bool
+    let compact: Bool
     let action: () -> Void
 
     private static let activeFill = Color(white: 0.96)
@@ -702,7 +960,7 @@ private struct UtilityKeyCap: View {
 private struct ModifierKeyCap: View {
     let symbolName: String
     let filledSymbolName: String
-    let state: RemoteKeyboardView.ModifierState
+    let state: RemoteModifierState
     let compact: Bool
     var cornerRadius: CGFloat? = nil
     let action: () -> Void
@@ -782,11 +1040,13 @@ private struct MacFnGlobeKeyCap: View {
     }
 }
 
-/// Spacebar that inserts a space on tap and quietly dims the other keys on long-press.
+/// Spacebar that inserts a space on tap and scrubs left/right arrows on long-press drag.
 private struct SpacebarKeyCap: View {
     @Binding var scrubbing: Bool
     let compact: Bool
     let onTap: () -> Void
+    let onScrubStep: (KeyboardKeyCode) -> Void
+    let onScrubEnd: () -> Void
 
     @State private var pressed = false
 
@@ -806,10 +1066,12 @@ private struct SpacebarKeyCap: View {
             SpacebarTouchArea(
                 onTouchDown: { pressed = true },
                 onLongPressBegan: { scrubbing = true },
+                onScrubStep: onScrubStep,
                 onEnded: { wasLongPress in
                     pressed = false
                     if wasLongPress {
                         scrubbing = false
+                        onScrubEnd()
                     } else {
                         onTap()
                     }
@@ -822,10 +1084,12 @@ private struct SpacebarKeyCap: View {
     }
 }
 
-/// Distinguishes tap from hold-and-drag on the spacebar from touch-down.
+/// Distinguishes tap from hold-and-drag on the spacebar from touch-down, emitting horizontal arrow
+/// steps while scrubbing.
 private struct SpacebarTouchArea: UIViewRepresentable {
     let onTouchDown: () -> Void
     let onLongPressBegan: () -> Void
+    let onScrubStep: (KeyboardKeyCode) -> Void
     let onEnded: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -845,22 +1109,51 @@ private struct SpacebarTouchArea: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject {
+        private static let scrubStepWidth: CGFloat = 14
+
         var area: SpacebarTouchArea?
+        private let activateFeedback = UIImpactFeedbackGenerator(style: .medium)
+        private let stepFeedback = UISelectionFeedbackGenerator()
         private var holdTask: Task<Void, Never>?
         private var isLongPress = false
+        private var lastStepX: CGFloat = 0
 
         @objc func handlePress(_ gesture: UILongPressGestureRecognizer) {
-            guard let area else { return }
+            guard let area, let view = gesture.view else { return }
+            let locationX = gesture.location(in: view).x
             switch gesture.state {
             case .began:
                 isLongPress = false
+                lastStepX = locationX
+                activateFeedback.prepare()
+                stepFeedback.prepare()
                 area.onTouchDown()
                 holdTask?.cancel()
-                holdTask = Task {
+                holdTask = Task { @MainActor [weak self, weak gesture] in
                     try? await Task.sleep(for: .milliseconds(280))
-                    guard !Task.isCancelled else { return }
-                    isLongPress = true
-                    area.onLongPressBegan()
+                    guard !Task.isCancelled, let self, let gesture, let view = gesture.view else {
+                        return
+                    }
+                    self.isLongPress = true
+                    self.lastStepX = gesture.location(in: view).x
+                    self.activateFeedback.impactOccurred()
+                    self.stepFeedback.prepare()
+                    self.area?.onLongPressBegan()
+                }
+            case .changed:
+                guard isLongPress else { return }
+                var delta = locationX - lastStepX
+                while delta >= Self.scrubStepWidth {
+                    stepFeedback.selectionChanged()
+                    area.onScrubStep(.rightArrow)
+                    lastStepX += Self.scrubStepWidth
+                    delta -= Self.scrubStepWidth
+                }
+                while delta <= -Self.scrubStepWidth {
+                    stepFeedback.selectionChanged()
+                    area.onScrubStep(.leftArrow)
+                    lastStepX -= Self.scrubStepWidth
+                    delta += Self.scrubStepWidth
                 }
             case .ended, .cancelled, .failed:
                 holdTask?.cancel()
@@ -880,15 +1173,35 @@ private struct SpacebarTouchArea: UIViewRepresentable {
 #Preview("Keyboard — Landscape", traits: .landscapeLeft) {
     ZStack(alignment: .bottom) {
         Color.black.ignoresSafeArea()
-        RemoteKeyboardView(onDismiss: {})
-            .ignoresSafeArea(edges: [.bottom, .horizontal])
+        RemoteKeyboardView(
+            modifierStates: [:],
+            capsLockActive: false,
+            onToggleModifier: { _ in },
+            onKeystroke: { _ in },
+            onKeyDown: { _ in },
+            onKeyUp: { _ in },
+            onScrubStep: { _ in },
+            onScrubEnd: {},
+            onDismiss: {}
+        )
+        .ignoresSafeArea(edges: [.bottom, .horizontal])
     }
 }
 
 #Preview("Keyboard — Portrait") {
     ZStack(alignment: .bottom) {
         Color.black.ignoresSafeArea()
-        RemoteKeyboardView(onDismiss: {})
-            .ignoresSafeArea(edges: [.bottom, .horizontal])
+        RemoteKeyboardView(
+            modifierStates: [:],
+            capsLockActive: false,
+            onToggleModifier: { _ in },
+            onKeystroke: { _ in },
+            onKeyDown: { _ in },
+            onKeyUp: { _ in },
+            onScrubStep: { _ in },
+            onScrubEnd: {},
+            onDismiss: {}
+        )
+        .ignoresSafeArea(edges: [.bottom, .horizontal])
     }
 }

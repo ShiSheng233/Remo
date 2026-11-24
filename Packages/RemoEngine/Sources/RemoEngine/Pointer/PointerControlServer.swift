@@ -20,7 +20,13 @@ final class PointerControlServer {
         let position: CGPoint
     }
 
-    private let initialState: () -> PointerMessage?
+    struct InitialState: Equatable {
+        let position: CGPoint
+        let width: UInt32
+        let height: UInt32
+    }
+
+    private let initialState: () -> InitialState?
     private let emit: @MainActor (Event) -> Void
     private var owner: UUID?
     private var position = CGPoint.zero
@@ -31,18 +37,16 @@ final class PointerControlServer {
     /// Button changes that arrived before the one they follow, keyed by that one's sequence.
     private var pendingButtons: [UInt64: PointerMessage] = [:]
 
-    init(initialState: @escaping () -> PointerMessage?, emit: @escaping @MainActor (Event) -> Void) {
+    init(initialState: @escaping () -> InitialState?, emit: @escaping @MainActor (Event) -> Void) {
         self.initialState = initialState
         self.emit = emit
     }
 
-    func begin(for peer: UUID) -> PointerMessage? {
-        guard owner == nil, let message = initialState(),
-            case .ready(let position, _, _) = message
-        else { return nil }
+    func begin(for peer: UUID) -> InitialState? {
+        guard owner == nil, let state = initialState() else { return nil }
         owner = peer
-        self.position = position
-        return message
+        self.position = state.position
+        return state
     }
 
     @discardableResult
@@ -55,7 +59,6 @@ final class PointerControlServer {
             emit(.scroll(lines: lines))
         case .button:
             receiveButton(input)
-        case .ready: return false
         }
         return true
     }
@@ -130,8 +133,11 @@ final class PointerControlServer {
 
     extension PointerControlServer {
         /// `onPost` hears the position of every pointer event posted to the display.
+        /// `modifierFlags` supplies active remote keyboard modifiers so `⌘+Click`, `⇧+Drag`, etc. work.
         convenience init(
-            displayID: CGDirectDisplayID, onPost: @escaping @MainActor (CGPoint) -> Void = { _ in }
+            displayID: CGDirectDisplayID,
+            modifierFlags: @escaping @MainActor () -> CGEventFlags = { [] },
+            onPost: @escaping @MainActor (CGPoint) -> Void = { _ in }
         ) {
             nonisolated(unsafe) let source = CGEventSource(stateID: .hidSystemState)
             self.init(initialState: {
@@ -140,14 +146,18 @@ final class PointerControlServer {
                     let height = UInt32(exactly: geometry.bounds.height), height > 0,
                     let location = CGEvent(source: nil)?.location
                 else { return nil }
-                return .ready(position: geometry.normalize(location), width: width, height: height)
+                return InitialState(position: geometry.normalize(location), width: width, height: height)
             }, emit: { event in
                 guard let geometry = DisplayGeometry(displayID: displayID) else { return }
+                let remoteFlags = modifierFlags()
                 let post: @MainActor (CGEventType, CGMouseButton, CGPoint) -> Void = {
                     type, button, position in
                     let event = CGEvent(
                         mouseEventSource: source, mouseType: type,
                         mouseCursorPosition: geometry.location(of: position), mouseButton: button)
+                    if !remoteFlags.isEmpty, let event {
+                        event.flags = event.flags.union(remoteFlags)
+                    }
                     if type != .mouseMoved && type != .leftMouseDragged {
                         event?.setIntegerValueField(.mouseEventClickState, value: 1)
                     }
@@ -171,8 +181,13 @@ final class PointerControlServer {
                         post(.leftMouseUp, .left, position)
                     }
                 case let .scroll(lines):
-                    CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 1,
-                        wheel1: lines, wheel2: 0, wheel3: 0)?.post(tap: .cghidEventTap)
+                    let scrollEvent = CGEvent(
+                        scrollWheelEvent2Source: source, units: .line, wheelCount: 1,
+                        wheel1: lines, wheel2: 0, wheel3: 0)
+                    if !remoteFlags.isEmpty, let scrollEvent {
+                        scrollEvent.flags = scrollEvent.flags.union(remoteFlags)
+                    }
+                    scrollEvent?.post(tap: .cghidEventTap)
                 }
             })
         }

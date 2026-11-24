@@ -26,17 +26,17 @@ public final class RemoteScreenClient {
         public var setupTimeout = Duration.seconds(8)
         /// How long the server may answer without sending a single frame.
         public var noVideoTimeout = Duration.seconds(15)
-        /// Asks the server for pointer control. A server grants it to one client at a time.
-        public var requestsPointerControl = true
+        /// Asks the server for remote pointer and keyboard control. A server grants it to one client at a time.
+        public var requestsRemoteControl = true
         public var diagnostics = Diagnostics()
 
         public init(
             setupTimeout: Duration = .seconds(8), noVideoTimeout: Duration = .seconds(15),
-            requestsPointerControl: Bool = true, diagnostics: Diagnostics = Diagnostics()
+            requestsRemoteControl: Bool = true, diagnostics: Diagnostics = Diagnostics()
         ) {
             self.setupTimeout = setupTimeout
             self.noVideoTimeout = noVideoTimeout
-            self.requestsPointerControl = requestsPointerControl
+            self.requestsRemoteControl = requestsRemoteControl
             self.diagnostics = diagnostics
         }
     }
@@ -56,13 +56,15 @@ public final class RemoteScreenClient {
         case videoFailed(any Error)
         /// The `onFrame` handler threw.
         case presentationFailed(any Error)
-        case pointerInputFailed(any Error)
+        case inputFailed(any Error)
     }
 
     public enum Event {
         case state(State)
-        /// The server granted pointer control. Sizes are in remote display points.
-        case pointerAvailable(displaySize: CGSize)
+        /// The server granted remote control. Sizes are in remote display points.
+        case controlAvailable(displaySize: CGSize, capsLock: Bool)
+        /// The remote Mac's Caps Lock indicator state changed.
+        case capsLockChanged(Bool)
         /// The cursor to draw over the picture changed: the server's, or where this client's
         /// pointer input put it.
         case cursor(RemoteCursor)
@@ -70,8 +72,10 @@ public final class RemoteScreenClient {
     }
 
     public private(set) var state = State.idle
-    /// The remote display's size in points while this client controls its pointer.
-    public var pointerDisplaySize: CGSize? { pointer.displaySize }
+    /// The remote display's size in points while this client has remote control.
+    public var remoteControlDisplaySize: CGSize? { pointer.displaySize }
+    /// The host Mac's latest Caps Lock indicator state.
+    public var capsLock: Bool { keyboard.capsLock }
     /// The cursor to draw over the picture, once the server has described it.
     public private(set) var cursor: RemoteCursor?
 
@@ -86,6 +90,7 @@ public final class RemoteScreenClient {
     private var playback: AudioPlayback?
     private var audioDisabled = false
     private var pointer = PointerControlClient()
+    private var keyboard = KeyboardControlClient()
     private var cursorTracker = CursorTracker()
     /// Whether this client has moved the pointer since it last took the server's position.
     private var pointerMovedLocally = false
@@ -223,7 +228,53 @@ public final class RemoteScreenClient {
         } catch {
             // A move or scroll that finds no room is simply late. A button change must not vanish.
             guard case .button = message else { return }
-            fail(.pointerInputFailed(error))
+            fail(.inputFailed(error))
+        }
+    }
+
+    // MARK: Keyboard
+
+    /// Synchronizes the active modifier keys immediately, in strict order with all key events.
+    public func setKeyboardModifiers(_ modifiers: KeyboardModifiers) {
+        sendKeyboard { $0.setModifiers(modifiers) }
+    }
+
+    /// Sends an atomic key press + release (short tap).
+    public func pressKeystroke(_ key: KeyboardKeyCode) {
+        sendKeyboard { $0.keystroke(key) }
+    }
+
+    /// Sends a key-down event for a held key; pair with `keyUp(_:)` on release.
+    public func keyDown(_ key: KeyboardKeyCode) {
+        sendKeyboard { $0.keyDown(key) }
+    }
+
+    /// Sends a key-up event for a previously held key.
+    public func keyUp(_ key: KeyboardKeyCode) {
+        sendKeyboard { $0.keyUp(key) }
+    }
+
+    /// Releases any held keys and optionally clears all active modifiers.
+    public func releaseKeyboard(includingModifiers: Bool = true) {
+        guard isRunning, state == .streaming, let transport else { return }
+        for message in keyboard.releaseAll(includingModifiers: includingModifiers) {
+            do {
+                try transport.send(message.encoded, delivery: message.delivery)
+            } catch {
+                fail(.inputFailed(error))
+                return
+            }
+        }
+    }
+
+    private func sendKeyboard(_ make: (inout KeyboardControlClient) -> KeyboardMessage?) {
+        guard isRunning, state == .streaming, let transport, let message = make(&keyboard) else {
+            return
+        }
+        do {
+            try transport.send(message.encoded, delivery: message.delivery)
+        } catch {
+            fail(.inputFailed(error))
         }
     }
 
@@ -247,6 +298,7 @@ public final class RemoteScreenClient {
     private func session(_ link: Link) async {
         audioDisabled = false
         pointer = PointerControlClient()
+        keyboard = KeyboardControlClient()
         cursorTracker = CursorTracker()
         cursor = nil
         pointerMovedLocally = false
@@ -324,7 +376,8 @@ public final class RemoteScreenClient {
                     configuration.diagnostics.info(nil, line)
                 },
                 onFailure: { [weak self] error in self?.fail(.videoFailed(error)) })
-            try session.send(MessageKind.screenHello.encoded, delivery: .essential)
+            let hello = SessionHandshake.hello(requestsControl: configuration.requestsRemoteControl)
+            try session.send(hello.encoded, delivery: hello.delivery)
             trace.write(nil, "hello queued")
             setState(.waitingForVideo)
             try await keepAlive(session)
@@ -363,7 +416,6 @@ public final class RemoteScreenClient {
         lastSeen = started
         lastFrame = started
         counters.lastReport = started
-        var nextPointerHello = started
         while isRunning {
             let now = Instant.now
             if now - lastSeen >= SessionTiming.serverTimeout {
@@ -378,18 +430,6 @@ public final class RemoteScreenClient {
                 try video?.requestRefresh()
             }
             do {
-                if configuration.requestsPointerControl, pointer.displaySize == nil,
-                    now >= nextPointerHello
-                {
-                    // The server answers only once it can grant control, so keep asking. Each
-                    // request is retried until the next one takes over.
-                    nextPointerHello = now + SessionTiming.pointerHelloRetry
-                    try session.send(
-                        MessageKind.pointerHello.encoded,
-                        delivery: .retrying(
-                            for: SessionTiming.pointerHelloRetry, priority: .high,
-                            replacing: .pointerHello))
-                }
                 try session.send(
                     MessageKind.heartbeat.encoded, delivery: .retrying(replacing: .heartbeat))
                 counters.heartbeats += 1
@@ -431,11 +471,20 @@ public final class RemoteScreenClient {
             counters.controls += 1
             counters.latestControl = max(counters.latestControl, control.sequence)
             lastSeen = .now
-        case .pointerReady:
-            if pointer.receiveReady(data), let size = pointer.displaySize {
-                lastSeen = .now
-                onEvent(.pointerAvailable(displaySize: size))
+        case .sessionReady:
+            guard case let .ready(control) = try? SessionHandshake(decoding: data) else { return }
+            lastSeen = .now
+            guard let control else { return }
+            let size = CGSize(width: Int(control.displayWidth), height: Int(control.displayHeight))
+            if pointer.begin(position: control.pointerPosition, displaySize: size) {
+                keyboard.begin(capsLock: control.capsLock)
+                onEvent(.controlAvailable(displaySize: size, capsLock: control.capsLock))
                 publishCursor()
+            }
+        case .keyboardState:
+            lastSeen = .now
+            if keyboard.receiveState(data) {
+                onEvent(.capsLockChanged(keyboard.capsLock))
             }
         case .cursorShape, .cursorState:
             receiveCursor(data)
@@ -488,7 +537,7 @@ extension RemoteScreenClient.Failure: CustomStringConvertible {
         case .sendFailed(let error): "send failed: \(error)"
         case .videoFailed(let error): "video failed: \(error)"
         case .presentationFailed(let error): "frame handler failed: \(error)"
-        case .pointerInputFailed(let error): "pointer input failed: \(error)"
+        case .inputFailed(let error): "remote input failed: \(error)"
         }
     }
 }

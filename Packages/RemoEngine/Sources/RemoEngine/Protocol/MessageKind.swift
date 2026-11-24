@@ -7,19 +7,14 @@ import Foundation
 
 /// The first byte of every application message. All kinds share this one namespace.
 enum MessageKind: UInt8, CaseIterable {
-    /// Asks for video, from clients that predate `screenHello`.
+    /// `SessionHandshake.hello`.
     case hello = 1
     case heartbeat = 2
     case goodbye = 3
     /// `ControlMessage`.
     case control = 5
-    /// Asks for the server's video.
-    case screenHello = 6
-    /// Retired: refused a `hello`. Not to be reused.
-    case modeMismatch = 7
-    case pointerHello = 8
-    /// `PointerMessage.ready`.
-    case pointerReady = 9
+    /// `SessionHandshake.ready`.
+    case sessionReady = 6
     /// `PointerMessage` input.
     case pointerInput = 10
     /// `AudioMessage`.
@@ -28,6 +23,10 @@ enum MessageKind: UInt8, CaseIterable {
     case cursorShape = 12
     /// `CursorMessage.state`.
     case cursorState = 13
+    /// `KeyboardMessage` input.
+    case keyboardInput = 14
+    /// `KeyboardMessage.state` (Caps Lock indicator echo).
+    case keyboardState = 15
 
     /// `VideoFrameMessage`.
     case videoFrame = 0x40

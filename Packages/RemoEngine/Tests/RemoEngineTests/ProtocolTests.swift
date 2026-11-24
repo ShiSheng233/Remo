@@ -21,6 +21,33 @@ import RemoTransport
     }
 }
 
+@Test func sessionHandshakeRoundTripsAndRejectsInvalidBytes() throws {
+    let grant = SessionHandshake.ControlGrant(
+        pointerPosition: CGPoint(x: 0.25, y: 0.75),
+        displayWidth: 1512,
+        displayHeight: 982,
+        capsLock: true)
+    let messages: [SessionHandshake] = [
+        .hello(requestsControl: false),
+        .hello(requestsControl: true),
+        .ready(control: nil),
+        .ready(control: grant),
+    ]
+    for message in messages {
+        #expect(try SessionHandshake(decoding: message.encoded) == message)
+        #expect(message.delivery.retryBudget == .infinity)
+        #expect(message.delivery.priority == .high)
+        #expect(throws: WireFormatError.self) {
+            try SessionHandshake(decoding: message.encoded.dropLast())
+        }
+        #expect(throws: WireFormatError.self) {
+            try SessionHandshake(decoding: message.encoded + [0])
+        }
+    }
+    let badFlags = Data([MessageKind.hello.rawValue, 2])
+    #expect(throws: WireFormatError.self) { try SessionHandshake(decoding: badFlags) }
+}
+
 @Test func frameRedundancyFollowsLossAndFrameSize() {
     let frame = 8000
     #expect(MessageTransport.repairableFragments(in: frame) == 7)

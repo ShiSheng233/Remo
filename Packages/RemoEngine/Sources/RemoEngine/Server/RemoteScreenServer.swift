@@ -30,19 +30,19 @@ public final class RemoteScreenServer {
         public var source: Source
         public var framesPerSecond: Int32 = 60
         public var maximumVideoBitRate = 5_000_000
-        /// Lets one client at a time drive the main display's pointer. Requires Accessibility access.
-        public var allowsPointerControl = false
+        /// Lets one client at a time drive the main display's pointer and keyboard. Requires Accessibility access.
+        public var allowsRemoteControl = false
         public var diagnostics = Diagnostics()
 
         public init(
             source: Source = .mainDisplay(), framesPerSecond: Int32 = 60,
-            maximumVideoBitRate: Int = 5_000_000, allowsPointerControl: Bool = false,
+            maximumVideoBitRate: Int = 5_000_000, allowsRemoteControl: Bool = false,
             diagnostics: Diagnostics = Diagnostics()
         ) {
             self.source = source
             self.framesPerSecond = framesPerSecond
             self.maximumVideoBitRate = maximumVideoBitRate
-            self.allowsPointerControl = allowsPointerControl
+            self.allowsRemoteControl = allowsRemoteControl
             self.diagnostics = diagnostics
         }
     }
@@ -54,7 +54,7 @@ public final class RemoteScreenServer {
         case invalidSource
         case screenCaptureUnavailable
         case screenDiscoveryFailed(any Error)
-        case pointerControlUnavailable
+        case remoteControlUnavailable
         case accessibilityAccessRequired
 
         public var description: String {
@@ -66,9 +66,9 @@ public final class RemoteScreenServer {
             case .screenCaptureUnavailable: "Screen capture requires macOS."
             case .screenDiscoveryFailed(let error):
                 "Screen discovery failed: \(error.localizedDescription). Check Screen Recording access in System Settings → Privacy & Security."
-            case .pointerControlUnavailable: "Pointer control requires a macOS main display source."
+            case .remoteControlUnavailable: "Remote control requires a macOS main display source."
             case .accessibilityAccessRequired:
-                "Pointer control requires Accessibility access in System Settings → Privacy & Security."
+                "Remote control requires Accessibility access in System Settings → Privacy & Security."
             }
         }
     }
@@ -105,9 +105,11 @@ public final class RemoteScreenServer {
         try await self.init(configuration: configuration, cursor: nil, onEvent: onEvent)
     }
 
-    /// `cursor` stands in for the system cursor, which only a main display source has.
+    /// `cursor`, `pointer`, and `keyboard` stand in for the system hooks in tests.
     init(
         configuration: Configuration, cursor: (@MainActor () -> CursorSample?)?,
+        pointer testPointer: PointerControlServer? = nil,
+        keyboard testKeyboard: KeyboardControlServer? = nil,
         onEvent: @escaping @MainActor (Event) -> Void = { _ in }
     ) async throws {
         guard (1...240).contains(configuration.framesPerSecond) else {
@@ -123,20 +125,28 @@ public final class RemoteScreenServer {
                 cursorMonitor = CursorMonitor(interval: cursorInterval, sample: system.sample)
             }
         #endif
-        var pointer: PointerControlServer?
-        if configuration.allowsPointerControl {
+        var pointer = testPointer
+        var keyboard = testKeyboard
+        if pointer == nil, keyboard == nil, configuration.allowsRemoteControl {
             #if os(macOS)
                 guard case .mainDisplay = configuration.source else {
-                    throw SetupError.pointerControlUnavailable
+                    throw SetupError.remoteControlUnavailable
                 }
                 guard CGPreflightPostEventAccess() else {
                     throw SetupError.accessibilityAccessRequired
                 }
-                pointer = PointerControlServer(displayID: CGMainDisplayID()) { [cursorMonitor] in
-                    cursorMonitor?.notePosted($0)
-                }
+                let keyboardServer = KeyboardControlServer()
+                keyboard = keyboardServer
+                pointer = PointerControlServer(
+                    displayID: CGMainDisplayID(),
+                    modifierFlags: { [weak keyboardServer] in
+                        keyboardServer?.activeModifiers.cgEventFlags ?? []
+                    },
+                    onPost: { [cursorMonitor] in
+                        cursorMonitor?.notePosted($0)
+                    })
             #else
-                throw SetupError.pointerControlUnavailable
+                throw SetupError.remoteControlUnavailable
             #endif
         }
         let startSource: ServerConnection.StartSource
@@ -175,7 +185,7 @@ public final class RemoteScreenServer {
         context = ServerConnection.Context(
             framesPerSecond: configuration.framesPerSecond,
             maximumVideoBitRate: configuration.maximumVideoBitRate,
-            startSource: startSource, pointer: pointer, cursor: cursorMonitor,
+            startSource: startSource, pointer: pointer, keyboard: keyboard, cursor: cursorMonitor,
             diagnostics: configuration.diagnostics,
             onEvent: onEvent)
     }
@@ -224,6 +234,7 @@ public final class RemoteScreenServer {
             connection.stop("server stopped", failed: false)
         }
         context.pointer?.stop()
+        context.keyboard?.stop()
     }
 
     private func updateActivity() {

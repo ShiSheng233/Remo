@@ -30,8 +30,8 @@ struct ServerSettings: Codable, Equatable, Sendable {
     var maximumVideoBitRate = 5_000_000
     /// `--audio`.
     var capturesAudio = false
-    /// `--mouse-control`.
-    var allowsPointerControl = false
+    /// `--control`.
+    var allowsRemoteControl = false
     /// `--wire-stats`.
     var wireStatistics = false
     /// `--trace-heartbeats`.
@@ -65,12 +65,12 @@ struct ServerSettings: Codable, Equatable, Sendable {
         return problems
     }
 
-    /// The options that apply to the chosen source. Audio and pointer control need the screen.
+    /// The options that apply to the chosen source. Audio and remote control need the screen.
     var effective: ServerSettings {
         var settings = self
         if source != .screen {
             settings.capturesAudio = false
-            settings.allowsPointerControl = false
+            settings.allowsRemoteControl = false
         }
         return settings
     }
@@ -86,7 +86,7 @@ struct ServerSettings: Codable, Equatable, Sendable {
         }
         if settings.source == .screen { parts.append("--screen") }
         if settings.capturesAudio { parts.append("--audio") }
-        if settings.allowsPointerControl { parts.append("--mouse-control") }
+        if settings.allowsRemoteControl { parts.append("--control") }
         if settings.wireStatistics { parts.append("--wire-stats") }
         if settings.traceHeartbeats { parts.append("--trace-heartbeats") }
         let command = parts.joined(separator: " ")
@@ -134,7 +134,7 @@ extension ServerSettings {
         decode(.framesPerSecond, into: &framesPerSecond)
         decode(.maximumVideoBitRate, into: &maximumVideoBitRate)
         decode(.capturesAudio, into: &capturesAudio)
-        decode(.allowsPointerControl, into: &allowsPointerControl)
+        decode(.allowsRemoteControl, into: &allowsRemoteControl)
         decode(.wireStatistics, into: &wireStatistics)
         decode(.traceHeartbeats, into: &traceHeartbeats)
         audioTraceDirectory = try? container.decodeIfPresent(String.self, forKey: .audioTraceDirectory)

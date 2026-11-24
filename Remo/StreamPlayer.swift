@@ -24,13 +24,20 @@ final class StreamPlayer {
     private(set) var phase = Phase.idle
     /// Pixel size of the remote picture once the first frame arrives.
     private(set) var videoSize: CGSize?
-    var mouseAvailable: Bool { mouseDisplaySize != nil }
+    var remoteControlAvailable: Bool { controlDisplaySize != nil }
+    /// Authoritative Caps Lock indicator echoed from the remote Mac.
+    private(set) var capsLockActive = false
+    /// Persisted modifier UI states (kept across keyboard hide/show until changed or backgrounded).
+    private(set) var modifierStates: [RemoteModifierKey: RemoteModifierState] = [:]
 
-    private var mouseDisplaySize: CGSize?
+    private var controlDisplaySize: CGSize?
+    @ObservationIgnored private var lastModifierSelectTime: [RemoteModifierKey: ContinuousClock.Instant] = [:]
     @ObservationIgnored private var client: RemoteScreenClient?
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var lastPixels: CVPixelBuffer?
     @ObservationIgnored private var log: SessionLog?
+
+    private static let modifierDoubleTapWindow: Duration = .milliseconds(350)
 
     /// Starts a session; `onFinalFrame` receives a JPEG of the last frame shown once it ends.
     /// `log` receives the same diagnostics and statistics the CLI prints.
@@ -66,7 +73,10 @@ final class StreamPlayer {
             self.surface = nil
             self.client = nil
             videoSize = nil
-            mouseDisplaySize = nil
+            controlDisplaySize = nil
+            capsLockActive = false
+            modifierStates.removeAll()
+            lastModifierSelectTime.removeAll()
             phase = failure.map { .failed(Self.message(for: $0, wireGuard: wireGuard != nil)) } ?? .idle
             task = nil
         }
@@ -89,14 +99,17 @@ final class StreamPlayer {
         case .statistics(let statistics): log?.write(statistics.description)
         case .cursor(let cursor):
             surface?.cursor = cursor
-        case .pointerAvailable(let size):
-            mouseDisplaySize = size
-            log?.write("pointer control granted for a \(Int(size.width))x\(Int(size.height)) display")
+        case let .controlAvailable(size, capsLock):
+            controlDisplaySize = size
+            capsLockActive = capsLock
+            log?.write("remote control granted for a \(Int(size.width))x\(Int(size.height)) display")
+        case .capsLockChanged(let isOn):
+            capsLockActive = isOn
         }
     }
 
     func handleTrackpad(_ gesture: TrackpadGesture) {
-        guard let client, let displaySize = mouseDisplaySize, let surface, !surface.bounds.isEmpty
+        guard let client, let displaySize = controlDisplaySize, let surface, !surface.bounds.isEmpty
         else { return }
         switch gesture {
         case let .move(delta):
@@ -112,6 +125,80 @@ final class StreamPlayer {
         case let .scroll(lines):
             client.scroll(lines: lines)
         }
+    }
+
+    // MARK: Keyboard
+
+    func toggleModifier(_ key: RemoteModifierKey) {
+        let now = ContinuousClock.now
+        switch modifierStates[key] ?? .idle {
+        case .idle:
+            modifierStates[key] = .selected
+            lastModifierSelectTime[key] = now
+        case .selected:
+            if let previous = lastModifierSelectTime[key],
+                previous.duration(to: now) <= Self.modifierDoubleTapWindow
+            {
+                modifierStates[key] = .locked
+            } else {
+                modifierStates[key] = .idle
+            }
+            lastModifierSelectTime[key] = nil
+        case .locked:
+            modifierStates[key] = .idle
+            lastModifierSelectTime[key] = nil
+        }
+        syncModifiers()
+    }
+
+    func sendKeystroke(_ key: KeyboardKeyCode) {
+        client?.pressKeystroke(key)
+        clearOneShotModifiers()
+    }
+
+    func sendKeyDown(_ key: KeyboardKeyCode) {
+        client?.keyDown(key)
+    }
+
+    func sendKeyUp(_ key: KeyboardKeyCode) {
+        client?.keyUp(key)
+        clearOneShotModifiers()
+    }
+
+    func sendCursorScrubStep(_ key: KeyboardKeyCode) {
+        client?.pressKeystroke(key)
+    }
+
+    func finishCursorScrub() {
+        clearOneShotModifiers()
+    }
+
+    /// Releases held keys when the keyboard closes without clearing active modifiers, or clears
+    /// everything when backgrounding/leaving.
+    func releaseKeyboard(includingModifiers: Bool) {
+        client?.releaseKeyboard(includingModifiers: includingModifiers)
+        if includingModifiers {
+            modifierStates.removeAll()
+            lastModifierSelectTime.removeAll()
+        }
+    }
+
+    private func clearOneShotModifiers() {
+        var changed = false
+        for key in RemoteModifierKey.allCases where modifierStates[key] == .selected {
+            modifierStates[key] = .idle
+            lastModifierSelectTime[key] = nil
+            changed = true
+        }
+        if changed { syncModifiers() }
+    }
+
+    private func syncModifiers() {
+        var flags: KeyboardModifiers = []
+        for (key, state) in modifierStates where state != .idle {
+            flags.insert(key.wireFlag)
+        }
+        client?.setKeyboardModifiers(flags)
     }
 
     private func present(_ frame: VideoFrame, on surface: VideoSurface) throws {
@@ -133,7 +220,7 @@ final class StreamPlayer {
         case .noVideo: "The server responded but no video arrived."
         case .videoFailed(let error): "Video decoding failed. \(error.localizedDescription)"
         case .presentationFailed(let error): "Video display failed. \(error.localizedDescription)"
-        case .pointerInputFailed(let error): "Mouse input couldn’t be sent. \(error.localizedDescription)"
+        case .inputFailed(let error): "Remote input couldn’t be sent. \(error.localizedDescription)"
         }
     }
 

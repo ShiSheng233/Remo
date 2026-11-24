@@ -71,13 +71,13 @@ struct SettingsView: View {
             Section {
                 Toggle("Stream system audio", isOn: $controller.settings.capturesAudio)
                     .help("--audio")
-                Toggle("Allow remote mouse control", isOn: $controller.settings.allowsPointerControl)
-                    .help("--mouse-control")
+                Toggle("Allow remote control", isOn: $controller.settings.allowsRemoteControl)
+                    .help("--control")
                 PermissionRow(
                     title: "Screen Recording", check: { CGPreflightScreenCaptureAccess() },
                     request: { _ = CGRequestScreenCaptureAccess() },
                     settingsAnchor: "Privacy_ScreenCapture")
-                if controller.settings.allowsPointerControl {
+                if controller.settings.allowsRemoteControl {
                     PermissionRow(
                         title: "Accessibility", check: { CGPreflightPostEventAccess() },
                         request: { _ = CGRequestPostEventAccess() },
@@ -87,7 +87,7 @@ struct SettingsView: View {
                 Text("Screen")
             } footer: {
                 if controller.settings.source != .screen {
-                    Text("Audio and mouse control need the main display source.")
+                    Text("Audio and remote control need the main display source.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

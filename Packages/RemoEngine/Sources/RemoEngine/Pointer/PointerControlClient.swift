@@ -22,13 +22,12 @@ struct PointerControlClient {
     private var sequence: UInt64 = 0
     private var buttonSequence: UInt64 = 0
 
-    /// Accepts the server's grant. Returns false for anything else or a repeated grant.
-    mutating func receiveReady(_ message: Data) -> Bool {
-        guard displaySize == nil,
-            case let .ready(position, width, height) = try? PointerMessage(decoding: message)
-        else { return false }
+    /// Accepts the server's control grant. Returns false if control is already active.
+    @discardableResult
+    mutating func begin(position: CGPoint, displaySize: CGSize) -> Bool {
+        guard self.displaySize == nil else { return false }
         self.position = position
-        displaySize = CGSize(width: Int(width), height: Int(height))
+        self.displaySize = displaySize
         return true
     }
 

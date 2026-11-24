@@ -2,6 +2,7 @@
 //  Created by Cyandev on 11/21/26.
 //
 
+import RemoEngine
 import SwiftUI
 import UIKit
 
@@ -12,6 +13,7 @@ struct PlayerView: View {
     let title: String
 
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+    @Environment(\.scenePhase) private var scenePhase
     @State private var controlsDimmed = false
     @State private var controlsFrame = CGRect.zero
     @State private var keyboardVisible = false
@@ -29,7 +31,7 @@ struct PlayerView: View {
             TrackpadView(
                 onInput: player.handleTrackpad,
                 excludedRects: [controlsFrame] + (keyboardVisible ? [keyboardFrame] : []),
-                showsWheel: player.phase == .streaming && player.mouseAvailable,
+                showsWheel: player.phase == .streaming && player.remoteControlAvailable,
                 surface: surface, videoSize: player.videoSize,
                 bottomInset: keyboardVisible ? keyboardFrame.height : 0)
                 .ignoresSafeArea(edges: .vertical)
@@ -46,9 +48,17 @@ struct PlayerView: View {
             if keyboardVisible {
                 ZStack(alignment: .bottom) {
                     Color.clear.allowsHitTesting(false)
-                    RemoteKeyboardView {
-                        setKeyboardVisible(false)
-                    }
+                    RemoteKeyboardView(
+                        modifierStates: player.modifierStates,
+                        capsLockActive: player.capsLockActive,
+                        onToggleModifier: { player.toggleModifier($0) },
+                        onKeystroke: { player.sendKeystroke($0) },
+                        onKeyDown: { player.sendKeyDown($0) },
+                        onKeyUp: { player.sendKeyUp($0) },
+                        onScrubStep: { player.sendCursorScrubStep($0) },
+                        onScrubEnd: { player.finishCursorScrub() },
+                        onDismiss: { setKeyboardVisible(false) }
+                    )
                     .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { keyboardFrame = $0 }
                 }
                 .ignoresSafeArea(edges: [.bottom, .horizontal])
@@ -67,7 +77,18 @@ struct PlayerView: View {
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
         .onDisappear {
             fadeTask?.cancel()
+            player.releaseKeyboard(includingModifiers: true)
             UIApplication.shared.isIdleTimerDisabled = false
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase != .active {
+                player.releaseKeyboard(includingModifiers: true)
+            }
+        }
+        .onChange(of: player.remoteControlAvailable) { _, available in
+            if !available && keyboardVisible {
+                setKeyboardVisible(false)
+            }
         }
         .task(id: player.phase) {
             withAnimation { controlsDimmed = false }
@@ -85,7 +106,7 @@ struct PlayerView: View {
     }
 
     private var controls: some View {
-        let showKeyboardButton = !controlsDimmed || keyboardVisible
+        let showKeyboardButton = player.remoteControlAvailable && (!controlsDimmed || keyboardVisible)
 
         return HStack(spacing: 0) {
             Button {
@@ -146,6 +167,11 @@ struct PlayerView: View {
     }
 
     private func setKeyboardVisible(_ visible: Bool) {
+        if !visible {
+            // Release any key mid-hold without clearing active modifiers, so modified trackpad
+            // actions (e.g. ⌘+Click) continue to work after dismissing the keyboard.
+            player.releaseKeyboard(includingModifiers: false)
+        }
         withAnimation(.spring) {
             keyboardVisible = visible
             if visible {

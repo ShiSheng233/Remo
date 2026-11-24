@@ -18,8 +18,6 @@ enum SessionTiming {
     static let serverTimeout = Duration.seconds(4)
     /// The client asks for a refresh when no frame has decoded for this long.
     static let videoStall = Duration.seconds(2)
-    /// A pointer request repeats until the server answers or the session ends.
-    static let pointerHelloRetry = Duration.milliseconds(1200)
     /// A scroll is worthless once this old.
     static let pointerDeadline = Duration.milliseconds(50)
     /// The client draws the cursor where the finger puts it and tells the server at most this

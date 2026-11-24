@@ -216,7 +216,7 @@ private final class StillSource: ScreenFrameSource {
     var cursors: [RemoteCursor] = []
     var client: RemoteScreenClient!
     client = RemoteScreenClient(
-        configuration: .init(requestsPointerControl: false), onFrame: { _ in },
+        configuration: .init(requestsRemoteControl: false), onFrame: { _ in },
         onEvent: { event in
             guard case .cursor(let cursor) = event else { return }
             cursors.append(cursor)

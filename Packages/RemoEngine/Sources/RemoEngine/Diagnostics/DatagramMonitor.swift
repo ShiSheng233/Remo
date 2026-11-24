@@ -51,12 +51,11 @@ final class DatagramMonitor: NWProtocolFramerImplementation {
     }
 
     private func traceHeader(_ buffer: UnsafeMutableRawBufferPointer, size: Int) -> String? {
-        guard trace.enabled, size == 10, buffer.count >= 10 else { return nil }
+        guard trace.enabled, buffer.count >= 10 else { return nil }
         let name: String
-        switch (buffer[0], buffer[9]) {
-        case (0, MessageKind.heartbeat.rawValue): name = "heartbeat"
-        case (0, MessageKind.hello.rawValue): name = "hello"
-        case (0, MessageKind.screenHello.rawValue): name = "screen hello"
+        switch (buffer[0], buffer[9], size) {
+        case (0, MessageKind.heartbeat.rawValue, 10): name = "heartbeat"
+        case (0, MessageKind.hello.rawValue, 11): name = "hello"
         default: return nil
         }
         let packet = UInt32(bigEndian: buffer.loadUnaligned(fromByteOffset: 1, as: UInt32.self))

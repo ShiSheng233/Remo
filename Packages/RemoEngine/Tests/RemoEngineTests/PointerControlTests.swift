@@ -12,7 +12,6 @@ import Testing
 @Test func pointerMessagesRoundTripAndRejectInvalidPositions() throws {
     let position = CGPoint(x: 0.125, y: 0.875)
     let messages: [PointerMessage] = [
-        .ready(position: position, width: 1512, height: 982),
         .move(sequence: 4, afterButton: 3, position: position),
         .button(sequence: 5, afterButton: 3, action: .rightClick, position: position),
         .scroll(lines: -3),
@@ -31,10 +30,10 @@ import Testing
         sequence: 4, afterButton: 4, action: .leftClick, position: position)
     #expect(throws: WireFormatError.self) { try PointerMessage(decoding: selfReferential.encoded) }
     // Button changes must arrive; a move only matters while it is fresh.
-    #expect(messages[2].delivery.retryBudget == .infinity)
+    #expect(messages[1].delivery.retryBudget == .infinity)
     // The newest move must arrive too: the client already draws the cursor there.
-    #expect(messages[1].delivery.retryBudget == .infinity && messages[1].delivery.priority == .high)
-    #expect(messages[1].delivery.replacing != nil && messages[3].delivery.replacing == nil)
+    #expect(messages[0].delivery.retryBudget == .infinity && messages[0].delivery.priority == .high)
+    #expect(messages[0].delivery.replacing != nil && messages[2].delivery.replacing == nil)
 }
 
 @Test @MainActor func pointerMovesRespectButtonOrderAndClickPositions() {
@@ -45,7 +44,7 @@ import Testing
     let id = UUID()
     var events: [PointerControlServer.Event] = []
     let server = PointerControlServer(
-        initialState: { .ready(position: start, width: 1512, height: 982) },
+        initialState: { .init(position: start, width: 1512, height: 982) },
         emit: { events.append($0) })
     #expect(server.begin(for: id) != nil)
 
@@ -77,7 +76,7 @@ import Testing
     let id = UUID()
     var events: [PointerControlServer.Event] = []
     let server = PointerControlServer(
-        initialState: { .ready(position: .zero, width: 1512, height: 982) },
+        initialState: { .init(position: .zero, width: 1512, height: 982) },
         emit: { events.append($0) })
     #expect(server.begin(for: id) != nil)
     func send(_ input: PointerMessage) { server.receive(input.encoded, from: id) }
@@ -104,7 +103,7 @@ import Testing
     let viewer = UUID()
     var events: [PointerControlServer.Event] = []
     let server = PointerControlServer(
-        initialState: { .ready(position: .zero, width: 1512, height: 982) },
+        initialState: { .init(position: .zero, width: 1512, height: 982) },
         emit: { events.append($0) })
     #expect(server.begin(for: owner) != nil)
     #expect(server.begin(for: viewer) == nil)
@@ -133,11 +132,15 @@ import Testing
     let start = CGPoint(x: 0.5, y: 0.5)
     var events: [PointerControlServer.Event] = []
     let server = PointerControlServer(
-        initialState: { .ready(position: start, width: 1000, height: 500) },
+        initialState: { .init(position: start, width: 1000, height: 500) },
         emit: { events.append($0) })
     let id = UUID()
     let ready = try #require(server.begin(for: id))
-    let granted = [client.receiveReady(ready.encoded), client.receiveReady(ready.encoded)]
+    let size = CGSize(width: Int(ready.width), height: Int(ready.height))
+    let granted = [
+        client.begin(position: ready.position, displaySize: size),
+        client.begin(position: ready.position, displaySize: size),
+    ]
     #expect(granted == [true, false])
     #expect(client.displaySize == CGSize(width: 1000, height: 500))
 

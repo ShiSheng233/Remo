@@ -20,6 +20,7 @@ final class ServerConnection {
         let maximumVideoBitRate: Int
         let startSource: StartSource
         let pointer: PointerControlServer?
+        let keyboard: KeyboardControlServer?
         let cursor: CursorMonitor?
         let diagnostics: Diagnostics
         let onEvent: @MainActor (RemoteScreenServer.Event) -> Void
@@ -33,7 +34,7 @@ final class ServerConnection {
     private let peer: String
     private let context: Context
     private let trace: HeartbeatTrace
-    private let pointerPeer = UUID()
+    private let controlPeer = UUID()
     private var session: NetworkMessageSession?
     private var setup: Task<Void, Never>?
     private var video: VideoSession?
@@ -46,11 +47,12 @@ final class ServerConnection {
     private var lastNewAck: Instant?
     private var previousAcceptedDataPackets: UInt32 = 0
 
-    // Cursor
+    // Cursor & keyboard state
     private var cursorSubscription: UUID?
     private var cursorSequence: UInt64 = 0
     /// Shapes this client has been sent, so each goes once.
     private var sentCursorShapes: Set<UInt64> = []
+    private var keyboardStateSequence: UInt64 = 0
 
     // Source
     private var source: (any ScreenFrameSource)?
@@ -171,7 +173,8 @@ final class ServerConnection {
         stopping = true
         stopReason = reason
         self.failed = failed
-        context.pointer?.end(for: pointerPeer)
+        context.pointer?.end(for: controlPeer)
+        context.keyboard?.end(for: controlPeer)
         setup?.cancel()
         streamWake?.yield(())
         let idle = Instant.now - lastSeen
@@ -224,17 +227,33 @@ final class ServerConnection {
             return
         }
         switch kind {
-        case .hello, .screenHello:
-            guard bytes.count == 1 else { return }
-            if !active { context.onEvent(.streamingStarted(peer: peer)) }
-            active = true
-            if cursorSubscription == nil, let cursor = context.cursor {
-                cursorSubscription = cursor.subscribe { [weak self] state, shape in
-                    self?.sendCursor(state, shape: shape)
-                }
+        case .hello:
+            guard case let .hello(requestsControl) = try? SessionHandshake(decoding: bytes) else {
+                return
             }
-            streamWake?.yield(())
-            trace.write(peer, "hello accepted")
+            if !active {
+                active = true
+                context.onEvent(.streamingStarted(peer: peer))
+                if cursorSubscription == nil, let cursor = context.cursor {
+                    cursorSubscription = cursor.subscribe { [weak self] state, shape in
+                        self?.sendCursor(state, shape: shape)
+                    }
+                }
+                let grant = requestsControl ? beginControl() : nil
+                if let session {
+                    let ready = SessionHandshake.ready(control: grant)
+                    do {
+                        try session.send(ready.encoded, delivery: ready.delivery)
+                    } catch {
+                        if grant != nil {
+                            context.pointer?.end(for: controlPeer)
+                            context.keyboard?.end(for: controlPeer)
+                        }
+                    }
+                }
+                streamWake?.yield(())
+                trace.write(peer, "hello accepted control=\(grant != nil)")
+            }
         case .heartbeat:
             guard bytes.count == 1, active else {
                 trace.write(peer, "heartbeat ignored active=\(active) bytes=\(bytes.count)")
@@ -244,20 +263,47 @@ final class ServerConnection {
             trace.write(peer, "heartbeat accepted count=\(heartbeats)")
         case .goodbye where bytes.count == 1:
             stop("client left", failed: false)
-        case .pointerHello where active && bytes.count == 1:
-            lastSeen = .now
-            guard let pointer = context.pointer, let session, let ready = pointer.begin(for: pointerPeer)
-            else { return }
-            do {
-                try session.send(ready.encoded, delivery: ready.delivery)
-            } catch {
-                pointer.end(for: pointerPeer)
-            }
         case .pointerInput where active:
-            guard context.pointer?.receive(bytes, from: pointerPeer) == true else { return }
+            guard context.pointer?.receive(bytes, from: controlPeer) == true else { return }
+        case .keyboardInput where active:
+            guard context.keyboard?.receive(bytes, from: controlPeer) == true else { return }
         default: return
         }
         lastSeen = .now
+    }
+
+    private func beginControl() -> SessionHandshake.ControlGrant? {
+        guard let pointer = context.pointer, let keyboard = context.keyboard,
+            let pointerState = pointer.begin(for: controlPeer)
+        else { return nil }
+        guard
+            let capsLock = keyboard.begin(
+                for: controlPeer,
+                onCapsLockChanged: { [weak self] isOn in
+                    self?.sendKeyboardState(capsLock: isOn)
+                })
+        else {
+            pointer.end(for: controlPeer)
+            return nil
+        }
+        return SessionHandshake.ControlGrant(
+            pointerPosition: pointerState.position,
+            displayWidth: pointerState.width,
+            displayHeight: pointerState.height,
+            capsLock: capsLock)
+    }
+
+    private func sendKeyboardState(capsLock: Bool) {
+        guard !stopping, active, let session else { return }
+        keyboardStateSequence += 1
+        let message = KeyboardMessage.state(sequence: keyboardStateSequence, capsLock: capsLock)
+        do {
+            try session.send(message.encoded, delivery: message.delivery)
+        } catch NetworkMessageSession.SendError.backpressure {
+            // The next state change replaces this one.
+        } catch {
+            stop("send failed: \(error)", failed: true)
+        }
     }
 
     private func sendCursor(_ state: CursorState, shape: CursorShape?) {

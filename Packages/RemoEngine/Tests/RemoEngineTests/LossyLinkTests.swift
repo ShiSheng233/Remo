@@ -177,7 +177,7 @@ func movingPictureSurvivesALossyLink(link: LinkQuality) async throws {
     var client: RemoteScreenClient!
     client = RemoteScreenClient(
         configuration: .init(
-            requestsPointerControl: false,
+            requestsRemoteControl: false,
             diagnostics: .init {
                 if $0.message.hasPrefix("recovery requested") { requests.increment() }
             }),

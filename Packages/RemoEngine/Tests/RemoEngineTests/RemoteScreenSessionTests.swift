@@ -78,7 +78,7 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     var client: RemoteScreenClient!
     let (recoveries, recoveryEvents) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
     client = RemoteScreenClient(
-        configuration: .init(requestsPointerControl: false, diagnostics: .init { event in
+        configuration: .init(requestsRemoteControl: false, diagnostics: .init { event in
             if event.message.hasPrefix("recovery requested lastDecoded=0 ") { recoveryEvents.yield(()) }
         }),
         onFrame: { frame in
@@ -143,7 +143,8 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
         data in
         if (try? ControlMessage(decoding: data)) != nil { controls += 1 }
     } closeHandler: { _ in }
-    try client.send(MessageKind.screenHello.encoded, delivery: .essential)
+    let hello = SessionHandshake.hello(requestsControl: false)
+    try client.send(hello.encoded, delivery: hello.delivery)
     try await Task.sleep(for: .seconds(5))
     #expect(reason == nil)
     #expect(controls >= 4)
@@ -161,7 +162,7 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
         .init(source: .mainDisplay(maximumWidth: 321)),
         .init(framesPerSecond: 0),
         .init(maximumVideoBitRate: 0),
-        .init(source: .custom { SteppingSource() }, allowsPointerControl: true),
+        .init(source: .custom { SteppingSource() }, allowsRemoteControl: true),
     ] {
         await #expect(throws: RemoteScreenServer.SetupError.self) {
             _ = try await RemoteScreenServer(configuration: configuration)

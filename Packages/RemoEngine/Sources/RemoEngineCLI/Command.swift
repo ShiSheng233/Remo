@@ -12,7 +12,7 @@ import RemoEngine
 enum Command {
     static let usage = """
         Usage:
-          remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--audio] [--mouse-control] [--wire-stats] [--trace-heartbeats]
+          remo-engine server [port] [--resolution WIDTHxHEIGHT] [--fps FPS] [--max-video-bitrate BPS] [--screen] [--audio] [--control] [--wire-stats] [--trace-heartbeats]
           remo-engine client <host> [port] [--screen] [--wire-stats] [--trace-heartbeats]
 
         Default UDP port: \(RemoProtocol.defaultPort)
@@ -23,7 +23,7 @@ enum Command {
         --screen streams the main display on the server and opens a video window on the client (macOS).
           Without it, the server streams a test pattern and the client verifies every frame of it.
         --audio includes system playback audio on a screen server (macOS 13 or later).
-        --mouse-control enables remote mouse input on a macOS screen server (requires Accessibility access).
+        --control enables remote pointer and keyboard input on a macOS screen server (requires Accessibility access).
         --trace-heartbeats traces heartbeat submission, UDP framing, session delivery, and timeouts.
         REMO_AUDIO_TRACE_DIR records diagnostic PCM (.f32le) and timing (.csv) in that directory.
         --wire-stats observes outgoing UDP payload bytes, DATA, ACK, and retransmissions.
@@ -56,7 +56,7 @@ enum Command {
     @MainActor
     static func run() async {
         var args = Array(CommandLine.arguments.dropFirst())
-        let flags = ["--screen", "--audio", "--mouse-control", "--wire-stats", "--trace-heartbeats"]
+        let flags = ["--screen", "--audio", "--control", "--wire-stats", "--trace-heartbeats"]
         let present = Set(args.filter(flags.contains))
         args.removeAll(where: flags.contains)
         if args == ["--help"] || args == ["-h"] {
@@ -98,8 +98,8 @@ enum Command {
         else { fail(usage) }
         let server = args[0] == "server"
         if audio && (!server || !screen) { fail("--audio requires server --screen.") }
-        if present.contains("--mouse-control") && (!server || !screen) {
-            fail("--mouse-control requires server --screen.")
+        if present.contains("--control") && (!server || !screen) {
+            fail("--control requires server --screen.")
         }
         let value = args.dropFirst(server ? 1 : 2).first ?? String(RemoProtocol.defaultPort)
         guard let port = UInt16(value), port > 0 else { fail("Invalid UDP port: \(value)") }
@@ -120,7 +120,7 @@ enum Command {
             await serve(
                 RemoteScreenServer.Configuration(
                     source: source, framesPerSecond: fps, maximumVideoBitRate: bitRate,
-                    allowsPointerControl: present.contains("--mouse-control"),
+                    allowsRemoteControl: present.contains("--control"),
                     diagnostics: diagnostics),
                 port: port)
         } else {
@@ -191,7 +191,7 @@ enum Command {
         var displayEnqueued = 0
         var verifier = TestPatternVerifier()
         let viewer = RemoteScreenClient(
-            configuration: .init(requestsPointerControl: false, diagnostics: diagnostics),
+            configuration: .init(requestsRemoteControl: false, diagnostics: diagnostics),
             onFrame: { frame in
                 #if os(macOS)
                     if let window {
