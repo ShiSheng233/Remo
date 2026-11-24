@@ -30,17 +30,21 @@ struct TrackpadView: View {
     @State private var wheelFrame = CGRect.zero
 
     var body: some View {
-        // The trackpad’s UIKit view would otherwise take real touches meant for the wheel.
-        TrackpadRegion(
-            onInput: onInput, excludedRects: excludedRects + (showsWheel ? [wheelFrame] : []),
-            surface: surface, videoSize: videoSize, bottomInset: bottomInset)
-            .overlay(alignment: .trailing) {
-                if showsWheel {
-                    wheel
-                        .padding(.bottom, bottomInset)
-                        .animation(.spring(duration: 0.36, bounce: 0.06), value: bottomInset)
-                }
+        // The trackpad fills the entire screen (with the video aspect-fitted inside it), while the
+        // scroll wheel stays inside the safe area. The trackpad’s UIKit view excludes the wheel’s
+        // frame so touches meant for the wheel reach it.
+        ZStack(alignment: .trailing) {
+            TrackpadRegion(
+                onInput: onInput, excludedRects: excludedRects + (showsWheel ? [wheelFrame] : []),
+                surface: surface, videoSize: videoSize, bottomInset: bottomInset)
+                .ignoresSafeArea()
+            if showsWheel {
+                wheel
+                    .padding(.bottom, bottomInset)
+                    .animation(.spring(duration: 0.36, bounce: 0.06), value: bottomInset)
             }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var wheel: some View {

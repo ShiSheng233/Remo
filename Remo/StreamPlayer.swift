@@ -24,6 +24,8 @@ final class StreamPlayer {
     private(set) var phase = Phase.idle
     /// Pixel size of the remote picture once the first frame arrives.
     private(set) var videoSize: CGSize?
+    /// Stream parameters currently active or queued for an in-place reconnect.
+    var targetStream: StreamParameters? { pendingStream ?? activeStream }
     var remoteControlAvailable: Bool { controlDisplaySize != nil }
     /// Authoritative Caps Lock indicator echoed from the remote Mac.
     private(set) var capsLockActive = false
@@ -31,6 +33,9 @@ final class StreamPlayer {
     private(set) var modifierStates: [RemoteModifierKey: RemoteModifierState] = [:]
 
     private var controlDisplaySize: CGSize?
+    private var activeStream: StreamParameters?
+    private var pendingStream: StreamParameters?
+    private var isUserDisconnecting = false
     @ObservationIgnored private var lastModifierSelectTime: [RemoteModifierKey: ContinuousClock.Instant] = [:]
     @ObservationIgnored private var client: RemoteScreenClient?
     @ObservationIgnored private var task: Task<Void, Never>?
@@ -50,26 +55,46 @@ final class StreamPlayer {
         let surface = VideoSurface()
         self.surface = surface
         self.log = log
+        isUserDisconnecting = false
+        activeStream = stream
+        pendingStream = nil
         phase = .connecting
-        let diagnostics = Diagnostics(handler: log.map { log in { log.write($0.description) } })
-        let client = RemoteScreenClient(
-            configuration: .init(stream: stream, diagnostics: diagnostics),
-            onFrame: { [weak self] in try self?.present($0, on: surface) },
-            onEvent: { [weak self] in self?.handle($0) })
-        self.client = client
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        let sizeText = stream.maximumSize.map { "\($0.width)x\($0.height)" } ?? "default"
-        let virtualText =
-            stream.virtualDisplay.map {
-                " virtualDisplay=\($0.logicalWidth)x\($0.logicalHeight)@2x(\($0.pixelWidth)x\($0.pixelHeight))"
-            } ?? ""
-        log?.write(
-            "Remo \(version) connecting to \(endpoint)\(wireGuard == nil ? "" : " through WireGuard") (size=\(sizeText)\(virtualText) fps=\(stream.framesPerSecond) maxBps=\(stream.maximumVideoBitRate) audio=\(stream.streamsAudio))"
-        )
         task = Task {
-            let failure = await client.run(
-                wireGuard.map { .datagrams(WireGuardDatagramConnection($0, log: log)) } ?? .udp(endpoint))
-            log?.write(failure.map { "ended: \($0)" } ?? "disconnected")
+            var nextStream = stream
+            var finalFailure: RemoteScreenClient.Failure?
+            while true {
+                activeStream = nextStream
+                videoSize = nil
+                controlDisplaySize = nil
+                capsLockActive = false
+                modifierStates.removeAll()
+                lastModifierSelectTime.removeAll()
+                phase = .connecting
+                let client = makeClient(stream: nextStream, surface: surface, log: log)
+                self.client = client
+                let sizeText = nextStream.maximumSize.map { "\($0.width)x\($0.height)" } ?? "default"
+                let virtualText =
+                    nextStream.virtualDisplay.map {
+                        " virtualDisplay=\($0.logicalWidth)x\($0.logicalHeight)@2x(\($0.pixelWidth)x\($0.pixelHeight))"
+                    } ?? ""
+                log?.write(
+                    "Remo \(version) connecting to \(endpoint)\(wireGuard == nil ? "" : " through WireGuard") (size=\(sizeText)\(virtualText) fps=\(nextStream.framesPerSecond) maxBps=\(nextStream.maximumVideoBitRate) audio=\(nextStream.streamsAudio))"
+                )
+                let failure = await client.run(
+                    wireGuard.map { .datagrams(WireGuardDatagramConnection($0, log: log)) } ?? .udp(endpoint))
+                self.client = nil
+                if let pending = pendingStream, !isUserDisconnecting {
+                    pendingStream = nil
+                    nextStream = pending
+                    surface.clear()
+                    log?.write("reconnecting with updated stream parameters")
+                    continue
+                }
+                finalFailure = failure
+                break
+            }
+            log?.write(finalFailure.map { "ended: \($0)" } ?? "disconnected")
             log?.close()
             self.log = nil
             if let pixels = lastPixels, let onFinalFrame {
@@ -80,18 +105,43 @@ final class StreamPlayer {
             lastPixels = nil
             self.surface = nil
             self.client = nil
+            activeStream = nil
+            pendingStream = nil
+            isUserDisconnecting = false
             videoSize = nil
             controlDisplaySize = nil
             capsLockActive = false
             modifierStates.removeAll()
             lastModifierSelectTime.removeAll()
-            phase = failure.map { .failed(Self.message(for: $0, wireGuard: wireGuard != nil)) } ?? .idle
+            phase = finalFailure.map { .failed(Self.message(for: $0, wireGuard: wireGuard != nil)) } ?? .idle
             task = nil
         }
     }
 
-    func disconnect() {
+    /// Reconnects the active session in place with updated stream parameters (for example, after
+    /// rotation or window resizing changes the virtual display size) without dismissing the player.
+    func reconnect(stream: StreamParameters) {
+        guard task != nil, !isUserDisconnecting, stream != targetStream else { return }
+        pendingStream = stream
+        surface?.clear()
+        phase = .connecting
         client?.disconnect()
+    }
+
+    func disconnect() {
+        isUserDisconnecting = true
+        pendingStream = nil
+        client?.disconnect()
+    }
+
+    private func makeClient(
+        stream: StreamParameters, surface: VideoSurface, log: SessionLog?
+    ) -> RemoteScreenClient {
+        let diagnostics = Diagnostics(handler: log.map { log in { log.write($0.description) } })
+        return RemoteScreenClient(
+            configuration: .init(stream: stream, diagnostics: diagnostics),
+            onFrame: { [weak self] in try self?.present($0, on: surface) },
+            onEvent: { [weak self] in self?.handle($0) })
     }
 
     private func handle(_ event: RemoteScreenClient.Event) {

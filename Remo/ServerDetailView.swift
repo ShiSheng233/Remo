@@ -13,6 +13,8 @@ struct ServerDetailView: View {
     let thumbnail: UIImage?
     /// The most recent session's log, once there has been a session.
     let sessionLog: URL?
+    /// Logical size of the window scene hosting this view, used to preview virtual display size.
+    let sceneSize: CGSize
     let isNew: Bool
     let failure: String?
     let canConnect: Bool
@@ -32,13 +34,13 @@ struct ServerDetailView: View {
     @State private var customBitRateText: String
     @State private var saveFailed = false
     @State private var isWide = false
-    @State private var screenLogicalSize = DeviceScreen.logicalSize
 
     /// Detail width from which Connect sits beside the name instead of spanning the page.
     private static let wideLayoutWidth: CGFloat = 520
 
     init(
-        server: RemoteServer, thumbnail: UIImage?, sessionLog: URL?, isNew: Bool, failure: String?,
+        server: RemoteServer, thumbnail: UIImage?, sessionLog: URL?, sceneSize: CGSize,
+        isNew: Bool, failure: String?,
         canConnect: Bool,
         editRequest: Binding<UUID?>, onSave: @escaping (RemoteServer) -> Bool,
         onConnect: @escaping (RemoteServer) -> Void, onCancelNew: @escaping () -> Void,
@@ -47,6 +49,7 @@ struct ServerDetailView: View {
         self.server = server
         self.thumbnail = thumbnail
         self.sessionLog = sessionLog
+        self.sceneSize = sceneSize
         self.isNew = isNew
         self.failure = failure
         self.canConnect = canConnect
@@ -103,9 +106,6 @@ struct ServerDetailView: View {
             editRequest = nil
             beginEditing()
         }
-        .onGeometryChange(for: CGSize.self) { $0.size } action: { _ in
-            screenLogicalSize = DeviceScreen.logicalSize
-        }
     }
 
     // A plain stack rather than Form rows, which clip and inset the heading off the left edge.
@@ -150,7 +150,7 @@ struct ServerDetailView: View {
                 VStack(spacing: 0) {
                     if server.stream.usesVirtualDisplay {
                         let vd = RemoteServer.StreamSettings.virtualDisplay(
-                            for: screenLogicalSize)
+                            for: sceneSize)
                         LabeledContent(
                             "Display", value: "Virtual (\(vd.pixelWidth) × \(vd.pixelHeight))")
                             .frame(minHeight: 52)
@@ -284,7 +284,7 @@ struct ServerDetailView: View {
         Section {
             Toggle("Virtual display", isOn: $draft.stream.usesVirtualDisplay)
             if draft.stream.usesVirtualDisplay {
-                let vd = RemoteServer.StreamSettings.virtualDisplay(for: screenLogicalSize)
+                let vd = RemoteServer.StreamSettings.virtualDisplay(for: sceneSize)
                 LabeledContent(
                     "Display size",
                     value: "\(vd.pixelWidth) × \(vd.pixelHeight) (\(vd.logicalWidth) × \(vd.logicalHeight) @2x)"

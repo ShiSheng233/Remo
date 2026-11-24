@@ -19,22 +19,23 @@ struct PlayerView: View {
     @State private var keyboardVisible = false
     @State private var keyboardFrame = CGRect.zero
     @State private var fadeTask: Task<Void, Never>?
+    @State private var resizeReconnectTask: Task<Void, Never>?
+    @State private var measuredSceneSize = CGSize.zero
 
     var body: some View {
         // Controls and the trackpad stay inside the safe area; only the backdrop and video reach
         // beyond it, from the background so they can’t stretch this stack to the full screen.
         ZStack {
             // Hosts the video as the view it zooms, so it stays up from the moment the session
-            // starts: the surface only draws frames while it is in a window. It stays clear of
-            // the sensor housing at the sides but uses the full height, like the picture.
-            // The trackpad’s UIKit view takes real touches from SwiftUI controls drawn over it.
+            // starts: the surface only draws frames while it is in a window. The trackpad canvas
+            // fills the entire screen (ignoring all safe areas) and aspect-fits the picture inside
+            // it, while SwiftUI controls stay within the safe area.
             TrackpadView(
                 onInput: player.handleTrackpad,
                 excludedRects: [controlsFrame] + (keyboardVisible ? [keyboardFrame] : []),
                 showsWheel: player.phase == .streaming && player.remoteControlAvailable,
                 surface: surface, videoSize: player.videoSize,
                 bottomInset: keyboardVisible ? keyboardFrame.height : 0)
-                .ignoresSafeArea(edges: .vertical)
 
             if let status {
                 ProgressView(status)
@@ -43,7 +44,14 @@ struct PlayerView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black, ignoresSafeAreaEdges: .all)
+        .background {
+            Color.black
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { newSize in
+                    measuredSceneSize = newSize
+                    handleSceneResize(newSize)
+                }
+                .ignoresSafeArea()
+        }
         .overlay {
             if keyboardVisible {
                 ZStack(alignment: .bottom) {
@@ -77,12 +85,18 @@ struct PlayerView: View {
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
         .onDisappear {
             fadeTask?.cancel()
+            resizeReconnectTask?.cancel()
+            resizeReconnectTask = nil
             player.releaseKeyboard(includingModifiers: true)
             UIApplication.shared.isIdleTimerDisabled = false
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase != .active {
+                resizeReconnectTask?.cancel()
+                resizeReconnectTask = nil
                 player.releaseKeyboard(includingModifiers: true)
+            } else if measuredSceneSize.width > 0, measuredSceneSize.height > 0 {
+                handleSceneResize(measuredSceneSize)
             }
         }
         .onChange(of: player.remoteControlAvailable) { _, available in
@@ -182,6 +196,31 @@ struct PlayerView: View {
             fadeTask?.cancel()
         } else {
             scheduleFadeOut()
+        }
+    }
+
+    private func handleSceneResize(_ size: CGSize) {
+        guard scenePhase == .active, size.width > 0, size.height > 0,
+            let current = player.targetStream,
+            let currentVirtualDisplay = current.virtualDisplay
+        else { return }
+        let target = RemoteServer.StreamSettings.virtualDisplay(for: size)
+        if target == currentVirtualDisplay {
+            resizeReconnectTask?.cancel()
+            resizeReconnectTask = nil
+            return
+        }
+        resizeReconnectTask?.cancel()
+        resizeReconnectTask = Task {
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled, scenePhase == .active,
+                let latest = player.targetStream, latest.virtualDisplay != nil
+            else { return }
+            let settledTarget = RemoteServer.StreamSettings.virtualDisplay(for: measuredSceneSize)
+            guard settledTarget != latest.virtualDisplay else { return }
+            var updated = latest
+            updated.virtualDisplay = settledTarget
+            player.reconnect(stream: updated)
         }
     }
 

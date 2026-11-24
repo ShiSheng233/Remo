@@ -133,6 +133,24 @@ final class VideoSurface: UIView {
         return try render(image)
     }
 
+    /// Clears the rendered picture and hides the cursor while reconnecting at a new resolution.
+    func clear() {
+        lastImage = nil
+        redrawPending = false
+        cursor = nil
+        detail = 1
+        guard window != nil, !bounds.isEmpty,
+            let queue, let context,
+            let drawable = display.nextDrawable(), let commands = queue.makeCommandBuffer()
+        else { return }
+        let canvas = CGRect(x: 0, y: 0, width: drawable.texture.width, height: drawable.texture.height)
+        context.render(
+            CIImage(color: .black), to: drawable.texture, commandBuffer: commands, bounds: canvas,
+            colorSpace: colorSpace)
+        commands.present(drawable)
+        commands.commit()
+    }
+
     private func render(_ image: CIImage) throws -> Bool {
         guard let queue, let context else { throw CocoaError(.featureUnsupported) }
         guard window != nil, !bounds.isEmpty,
