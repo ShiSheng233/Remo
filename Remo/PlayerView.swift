@@ -12,6 +12,8 @@ struct PlayerView: View {
     let surface: VideoSurface
     let title: String
 
+    private static let controlsHitPadding: CGFloat = 12
+
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
     @Environment(\.scenePhase) private var scenePhase
     @State private var controlsDimmed = false
@@ -23,13 +25,14 @@ struct PlayerView: View {
     @State private var measuredSceneSize = CGSize.zero
 
     var body: some View {
-        // Controls and the trackpad stay inside the safe area; only the backdrop and video reach
-        // beyond it, from the background so they can’t stretch this stack to the full screen.
+        // The backdrop and video fill the full screen. On iOS 27.1+, floating controls and the
+        // scroll wheel position themselves against exact hardware occlusions and corner insets
+        // instead of the full-edge rectangular safe area.
         ZStack {
             // Hosts the video as the view it zooms, so it stays up from the moment the session
             // starts: the surface only draws frames while it is in a window. The trackpad canvas
             // fills the entire screen (ignoring all safe areas) and aspect-fits the picture inside
-            // it, while SwiftUI controls stay within the safe area.
+            // it.
             TrackpadView(
                 onInput: player.handleTrackpad,
                 excludedRects: [controlsFrame] + (keyboardVisible ? [keyboardFrame] : []),
@@ -46,7 +49,9 @@ struct PlayerView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
             Color.black
-                .onGeometryChange(for: CGSize.self) { $0.size } action: { newSize in
+                .onGeometryChange(for: CGSize.self) {
+                    $0.size
+                } action: { newSize in
                     measuredSceneSize = newSize
                     handleSceneResize(newSize)
                 }
@@ -67,16 +72,18 @@ struct PlayerView: View {
                         onScrubEnd: { player.finishCursorScrub() },
                         onDismiss: { setKeyboardVisible(false) }
                     )
-                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { keyboardFrame = $0 }
+                    .onGeometryChange(for: CGRect.self) {
+                        $0.frame(in: .global)
+                    } action: {
+                        keyboardFrame = $0
+                    }
                 }
                 .ignoresSafeArea(edges: [.bottom, .horizontal])
                 .transition(.move(edge: .bottom))
             }
         }
-        .overlay(alignment: .topLeading) {
-            controls
-                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { controlsFrame = $0 }
-                .padding()
+        .overlay {
+            controlsOverlay
         }
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
@@ -119,8 +126,40 @@ struct PlayerView: View {
         }
     }
 
+    @ViewBuilder
+    private var controlsOverlay: some View {
+        if #available(iOS 27.1, *) {
+            GeometryReader { proxy in
+                let layout = ScreenOcclusionLayout(proxy: proxy)
+                let insets = layout.topLeadingInsets(
+                    for: controlsFrame.size,
+                    innerPadding: Self.controlsHitPadding)
+                controls
+                    .onGeometryChange(for: CGRect.self) {
+                        $0.frame(in: .global)
+                    } action: {
+                        controlsFrame = $0
+                    }
+                    .padding(.leading, insets.leading)
+                    .padding(.top, insets.top)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+            .ignoresSafeArea()
+        } else {
+            controls
+                .onGeometryChange(for: CGRect.self) {
+                    $0.frame(in: .global)
+                } action: {
+                    controlsFrame = $0
+                }
+                .padding()
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
     private var controls: some View {
-        let showKeyboardButton = player.remoteControlAvailable && (!controlsDimmed || keyboardVisible)
+        let showKeyboardButton =
+            player.remoteControlAvailable && (!controlsDimmed || keyboardVisible)
 
         return HStack(spacing: 0) {
             Button {
@@ -177,7 +216,7 @@ struct PlayerView: View {
                     }
             }
         }
-        .padding(12)
+        .padding(Self.controlsHitPadding)
     }
 
     private func setKeyboardVisible(_ visible: Bool) {

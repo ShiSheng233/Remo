@@ -30,30 +30,59 @@ struct TrackpadView: View {
     @State private var wheelFrame = CGRect.zero
 
     var body: some View {
-        // The trackpad fills the entire screen (with the video aspect-fitted inside it), while the
-        // scroll wheel stays inside the safe area. The trackpad’s UIKit view excludes the wheel’s
+        // The trackpad fills the entire screen (with the video aspect-fitted inside it). On
+        // iOS 27.1+, the scroll wheel avoids exact hardware occlusions and corner insets instead
+        // of the full-edge rectangular safe area. The trackpad’s UIKit view excludes the wheel’s
         // frame so touches meant for the wheel reach it.
         ZStack(alignment: .trailing) {
             TrackpadRegion(
                 onInput: onInput, excludedRects: excludedRects + (showsWheel ? [wheelFrame] : []),
-                surface: surface, videoSize: videoSize, bottomInset: bottomInset)
-                .ignoresSafeArea()
+                surface: surface, videoSize: videoSize, bottomInset: bottomInset
+            )
+            .ignoresSafeArea()
             if showsWheel {
-                wheel
-                    .padding(.bottom, bottomInset)
-                    .animation(.spring(duration: 0.36, bounce: 0.06), value: bottomInset)
+                wheelOverlay
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var wheel: some View {
+    @ViewBuilder
+    private var wheelOverlay: some View {
+        if #available(iOS 27.1, *) {
+            GeometryReader { proxy in
+                let layout = ScreenOcclusionLayout(proxy: proxy)
+                let wheelHeight = min(proxy.size.height * 0.6, 120)
+                let trailing = layout.trailingInset(
+                    forCenteredHeight: wheelHeight,
+                    width: ScrollWheel.hitWidth,
+                    bottomInset: bottomInset)
                 ScrollWheel(onInput: onInput)
-                    .containerRelativeFrame(.vertical) { height, _ in min(height * 0.6, 120) }
-                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                    .frame(height: wheelHeight)
+                    .onGeometryChange(for: CGRect.self) {
+                        $0.frame(in: .global)
+                    } action: {
                         wheelFrame = $0
                     }
-                    .padding(.trailing, 16)
+                    .padding(.trailing, trailing)
+                    .padding(.bottom, bottomInset)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                    .animation(.spring(duration: 0.36, bounce: 0.06), value: bottomInset)
+                    .animation(.spring(duration: 0.36, bounce: 0.06), value: trailing)
+            }
+            .ignoresSafeArea()
+        } else {
+            ScrollWheel(onInput: onInput)
+                .containerRelativeFrame(.vertical) { height, _ in min(height * 0.6, 120) }
+                .onGeometryChange(for: CGRect.self) {
+                    $0.frame(in: .global)
+                } action: {
+                    wheelFrame = $0
+                }
+                .padding(.trailing, 16)
+                .padding(.bottom, bottomInset)
+                .animation(.spring(duration: 0.36, bounce: 0.06), value: bottomInset)
+        }
     }
 }
 
@@ -66,6 +95,9 @@ private struct ScrollWheel: View {
 
     /// Finger travel for one detent.
     private static let step: CGFloat = 6
+    private static let capsuleWidth: CGFloat = 36
+    private static let horizontalHitPadding: CGFloat = 4
+    static let hitWidth: CGFloat = capsuleWidth + horizontalHitPadding * 2
     private static let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
 
     /// Where the ticks sit; follows the finger and springs onto a detent when it lifts.
@@ -89,12 +121,12 @@ private struct ScrollWheel: View {
             Self.shape.strokeBorder(.white.opacity(0.25), lineWidth: 1)
         }
         .clipShape(Self.shape)
-        .frame(width: 36)
+        .frame(width: Self.capsuleWidth)
         .scaleEffect(pressed ? 1.12 : 1)
         .opacity(pressed ? 1 : 0.45)
         .animation(.spring(duration: 0.35, bounce: 0.45), value: pressed)
         .allowsHitTesting(false)
-        .padding(.horizontal, 4)
+        .padding(.horizontal, Self.horizontalHitPadding)
         .overlay {
             WheelTouchArea(onBegan: { pressed = true }, onMoved: moved, onEnded: ended)
         }
@@ -298,7 +330,9 @@ private final class TouchSurface: UIScrollView {
         let visible = CGRect(
             x: bounds.minX, y: bounds.minY,
             width: bounds.width, height: max(0, bounds.height - bottomInset))
-        func shift(_ low: CGFloat, _ high: CGFloat, within start: CGFloat, _ end: CGFloat) -> CGFloat {
+        func shift(_ low: CGFloat, _ high: CGFloat, within start: CGFloat, _ end: CGFloat)
+            -> CGFloat
+        {
             if low < start { return low - start }
             if high > end { return high - end }
             return 0
@@ -308,10 +342,18 @@ private final class TouchSurface: UIScrollView {
             x: max(minimum.x, contentSize.width + contentInset.right - bounds.width),
             y: max(minimum.y, contentSize.height + contentInset.bottom - bounds.height))
         let offset = CGPoint(
-            x: min(maximum.x, max(minimum.x,
-                contentOffset.x + shift(target.minX, target.maxX, within: visible.minX, visible.maxX))),
-            y: min(maximum.y, max(minimum.y,
-                contentOffset.y + shift(target.minY, target.maxY, within: visible.minY, visible.maxY))))
+            x: min(
+                maximum.x,
+                max(
+                    minimum.x,
+                    contentOffset.x
+                        + shift(target.minX, target.maxX, within: visible.minX, visible.maxX))),
+            y: min(
+                maximum.y,
+                max(
+                    minimum.y,
+                    contentOffset.y
+                        + shift(target.minY, target.maxY, within: visible.minY, visible.maxY))))
         if offset != contentOffset { contentOffset = offset }
     }
 
@@ -333,7 +375,8 @@ private final class TouchSurface: UIScrollView {
         UIView.animate(.spring) {
             self.centerContent()
             let minimumY = -self.contentInset.top
-            let maximumY = max(minimumY, self.contentSize.height + self.contentInset.bottom - self.bounds.height)
+            let maximumY = max(
+                minimumY, self.contentSize.height + self.contentInset.bottom - self.bounds.height)
             let clampedY = min(maximumY, max(minimumY, self.contentOffset.y))
             if self.contentSize.height <= max(0, self.bounds.height - self.bottomInset) {
                 self.contentOffset.y = minimumY
@@ -438,7 +481,9 @@ private struct TrackpadRegion: UIViewRepresentable {
             cancelPointerDrag()
         }
 
-        func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        func scrollViewDidEndZooming(
+            _ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat
+        ) {
             (view as? VideoSurface)?.zoomDidSettle()
         }
 
@@ -456,7 +501,9 @@ private struct TrackpadRegion: UIViewRepresentable {
         // Touches on the controls drawn over the trackpad still reach these recognizers. Refusing
         // them would leave the recognizers pending, and SwiftUI buttons wait on them, so they are
         // taken and later ignored instead.
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch
+        ) -> Bool {
             touchDown = touch.location(in: nil)
             return true
         }
