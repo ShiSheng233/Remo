@@ -12,6 +12,8 @@ struct PlayerView: View {
     let surface: VideoSurface
     let title: String
 
+    private static let controlsHitPadding: CGFloat = 12
+
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
     @Environment(\.scenePhase) private var scenePhase
     @State private var controlsDimmed = false
@@ -19,15 +21,18 @@ struct PlayerView: View {
     @State private var keyboardVisible = false
     @State private var keyboardFrame = CGRect.zero
     @State private var fadeTask: Task<Void, Never>?
+    @State private var resizeReconnectTask: Task<Void, Never>?
+    @State private var measuredSceneSize = CGSize.zero
 
     var body: some View {
-        // Controls and the trackpad stay inside the safe area; only the backdrop and video reach
-        // beyond it, from the background so they can’t stretch this stack to the full screen.
+        // The backdrop and video fill the full screen. On iOS 27.1+, floating controls and the
+        // scroll wheel position themselves against exact hardware occlusions and corner insets
+        // instead of the full-edge rectangular safe area.
         ZStack {
             // Hosts the video as the view it zooms, so it stays up from the moment the session
-            // starts: the surface only draws frames while it is in a window. It stays clear of
-            // the sensor housing at the sides but uses the full height, like the picture.
-            // The trackpad’s UIKit view takes real touches from SwiftUI controls drawn over it.
+            // starts: the surface only draws frames while it is in a window. The trackpad canvas
+            // fills the entire screen (ignoring all safe areas) and aspect-fits the picture inside
+            // it.
             TrackpadView(
                 onInput: player.handleTrackpad,
                 excludedRects: [controlsFrame] + (keyboardVisible ? [keyboardFrame] : []),
@@ -35,7 +40,6 @@ struct PlayerView: View {
                 controlsPointer: player.phase == .streaming && player.remoteControlAvailable,
                 surface: surface, videoSize: player.videoSize,
                 bottomInset: keyboardVisible ? keyboardFrame.height : 0)
-                .ignoresSafeArea(edges: .vertical)
 
             if let status {
                 ProgressView(status)
@@ -44,7 +48,16 @@ struct PlayerView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black, ignoresSafeAreaEdges: .all)
+        .background {
+            Color.black
+                .onGeometryChange(for: CGSize.self) {
+                    $0.size
+                } action: { newSize in
+                    measuredSceneSize = newSize
+                    handleSceneResize(newSize)
+                }
+                .ignoresSafeArea()
+        }
         .overlay {
             if keyboardVisible {
                 ZStack(alignment: .bottom) {
@@ -60,16 +73,18 @@ struct PlayerView: View {
                         onScrubEnd: { player.finishCursorScrub() },
                         onDismiss: { setKeyboardVisible(false) }
                     )
-                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { keyboardFrame = $0 }
+                    .onGeometryChange(for: CGRect.self) {
+                        $0.frame(in: .global)
+                    } action: {
+                        keyboardFrame = $0
+                    }
                 }
                 .ignoresSafeArea(edges: [.bottom, .horizontal])
                 .transition(.move(edge: .bottom))
             }
         }
-        .overlay(alignment: .topLeading) {
-            controls
-                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { controlsFrame = $0 }
-                .padding()
+        .overlay {
+            controlsOverlay
         }
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
@@ -78,12 +93,18 @@ struct PlayerView: View {
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
         .onDisappear {
             fadeTask?.cancel()
+            resizeReconnectTask?.cancel()
+            resizeReconnectTask = nil
             player.releaseKeyboard(includingModifiers: true)
             UIApplication.shared.isIdleTimerDisabled = false
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase != .active {
+                resizeReconnectTask?.cancel()
+                resizeReconnectTask = nil
                 player.releaseKeyboard(includingModifiers: true)
+            } else if measuredSceneSize.width > 0, measuredSceneSize.height > 0 {
+                handleSceneResize(measuredSceneSize)
             }
         }
         .onChange(of: player.remoteControlAvailable) { _, available in
@@ -106,8 +127,40 @@ struct PlayerView: View {
         }
     }
 
+    @ViewBuilder
+    private var controlsOverlay: some View {
+        if #available(iOS 27.1, *) {
+            GeometryReader { proxy in
+                let layout = ScreenOcclusionLayout(proxy: proxy)
+                let insets = layout.topLeadingInsets(
+                    for: controlsFrame.size,
+                    innerPadding: Self.controlsHitPadding)
+                controls
+                    .onGeometryChange(for: CGRect.self) {
+                        $0.frame(in: .global)
+                    } action: {
+                        controlsFrame = $0
+                    }
+                    .padding(.leading, insets.leading)
+                    .padding(.top, insets.top)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+            .ignoresSafeArea()
+        } else {
+            controls
+                .onGeometryChange(for: CGRect.self) {
+                    $0.frame(in: .global)
+                } action: {
+                    controlsFrame = $0
+                }
+                .padding()
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
     private var controls: some View {
-        let showKeyboardButton = player.remoteControlAvailable && (!controlsDimmed || keyboardVisible)
+        let showKeyboardButton =
+            player.remoteControlAvailable && (!controlsDimmed || keyboardVisible)
 
         return HStack(spacing: 0) {
             Button {
@@ -164,7 +217,7 @@ struct PlayerView: View {
                     }
             }
         }
-        .padding(12)
+        .padding(Self.controlsHitPadding)
     }
 
     private func setKeyboardVisible(_ visible: Bool) {
@@ -183,6 +236,31 @@ struct PlayerView: View {
             fadeTask?.cancel()
         } else {
             scheduleFadeOut()
+        }
+    }
+
+    private func handleSceneResize(_ size: CGSize) {
+        guard scenePhase == .active, size.width > 0, size.height > 0,
+            let current = player.targetStream,
+            let currentVirtualDisplay = current.virtualDisplay
+        else { return }
+        let target = RemoteServer.StreamSettings.virtualDisplay(for: size)
+        if target == currentVirtualDisplay {
+            resizeReconnectTask?.cancel()
+            resizeReconnectTask = nil
+            return
+        }
+        resizeReconnectTask?.cancel()
+        resizeReconnectTask = Task {
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled, scenePhase == .active,
+                let latest = player.targetStream, latest.virtualDisplay != nil
+            else { return }
+            let settledTarget = RemoteServer.StreamSettings.virtualDisplay(for: measuredSceneSize)
+            guard settledTarget != latest.virtualDisplay else { return }
+            var updated = latest
+            updated.virtualDisplay = settledTarget
+            player.reconnect(stream: updated)
         }
     }
 

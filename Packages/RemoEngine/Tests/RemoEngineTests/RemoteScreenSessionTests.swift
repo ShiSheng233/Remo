@@ -14,14 +14,16 @@ import Testing
 
 /// A flat picture whose brightness steps every time it is polled.
 private final class SteppingSource: ScreenFrameSource {
-    let width = 320
-    let height = 180
+    let width: Int
+    let height: Int
     private(set) var started = 0
     private var step: Int64 = 0
 
     let firstFrameAt: SuspendingClock.Instant
 
-    init(delay: Duration = .zero) {
+    init(width: Int = 320, height: Int = 180, delay: Duration = .zero) {
+        self.width = width
+        self.height = height
         firstFrameAt = .now + delay
     }
 
@@ -55,7 +57,7 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     var serverStatistics: ServerStatistics?
     let server = try await RemoteScreenServer(
         configuration: .init(
-            source: .custom {
+            source: .custom { _ in
                 let source = SteppingSource(delay: delayedVideo ? .seconds(5) : .zero)
                 sources.append(source)
                 return source
@@ -125,7 +127,7 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     var port: UInt16?
     var reason: String?
     let server = try await RemoteScreenServer(
-        configuration: .init(source: .custom { SteppingSource(delay: .seconds(30)) })
+        configuration: .init(source: .custom { _ in SteppingSource(delay: .seconds(30)) })
     ) { event in
         switch event {
         case .listening(let value): port = value
@@ -157,15 +159,128 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     try await listening.value
 }
 
+@Test @MainActor func clientNegotiatesStreamParametersInHandshake() async throws {
+    let requested = StreamParameters(
+        maximumSize: .init(width: 480, height: 270),
+        framesPerSecond: 30,
+        maximumVideoBitRate: 2_500_000,
+        streamsAudio: true)
+    var receivedParameters: StreamParameters?
+    var startedSession: RemoteScreenServer.SessionInfo?
+    var port: UInt16?
+    let server = try await RemoteScreenServer(
+        configuration: .init(
+            source: .custom { parameters in
+                receivedParameters = parameters
+                let size = parameters.maximumSize ?? .init(width: 320, height: 180)
+                return SteppingSource(width: size.width, height: size.height)
+            })
+    ) { event in
+        switch event {
+        case .listening(let value): port = value
+        case .streamingStarted(_, let session): startedSession = session
+        default: break
+        }
+    }
+    let listening = Task { try await server.listen(on: 0) }
+    defer { server.stop() }
+    while port == nil { try await Task.sleep(for: .milliseconds(10)) }
+
+    var decodedSize: (Int, Int)?
+    var client: RemoteScreenClient!
+    client = RemoteScreenClient(
+        configuration: .init(requestsRemoteControl: false, stream: requested),
+        onFrame: { frame in
+            decodedSize = (
+                CVPixelBufferGetWidth(frame.pixels), CVPixelBufferGetHeight(frame.pixels)
+            )
+            client.disconnect()
+        })
+    let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .init(rawValue: port!)!)
+    let failure = await client.run(.udp(endpoint))
+
+    #expect(failure == nil)
+    #expect(receivedParameters == requested)
+    #expect(
+        startedSession
+            == RemoteScreenServer.SessionInfo(
+                width: 480, height: 270, framesPerSecond: 30, maximumVideoBitRate: 2_500_000,
+                streamsAudio: false))
+    #expect(decodedSize?.0 == 480 && decodedSize?.1 == 270)
+
+    server.stop()
+    try await listening.value
+}
+
+@Test @MainActor func clientNegotiatesVirtualDisplayParametersInHandshake() async throws {
+    let requested = StreamParameters(
+        virtualDisplay: .init(logicalWidth: 890, logicalHeight: 626),
+        framesPerSecond: 60,
+        maximumVideoBitRate: 6_000_000,
+        streamsAudio: false)
+    var receivedParameters: StreamParameters?
+    var port: UInt16?
+    let server = try await RemoteScreenServer(
+        configuration: .init(
+            source: .custom { parameters in
+                receivedParameters = parameters
+                let vd = try #require(parameters.virtualDisplay)
+                return SteppingSource(width: vd.pixelWidth, height: vd.pixelHeight)
+            })
+    ) { event in
+        if case .listening(let value) = event { port = value }
+    }
+    let listening = Task { try await server.listen(on: 0) }
+    defer { server.stop() }
+    while port == nil { try await Task.sleep(for: .milliseconds(10)) }
+
+    var decodedSize: (Int, Int)?
+    var client: RemoteScreenClient!
+    client = RemoteScreenClient(
+        configuration: .init(requestsRemoteControl: false, stream: requested),
+        onFrame: { frame in
+            decodedSize = (
+                CVPixelBufferGetWidth(frame.pixels), CVPixelBufferGetHeight(frame.pixels)
+            )
+            client.disconnect()
+        })
+    let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .init(rawValue: port!)!)
+    let failure = await client.run(.udp(endpoint))
+
+    #expect(failure == nil)
+    #expect(receivedParameters == requested)
+    #expect(decodedSize?.0 == 1780 && decodedSize?.1 == 1252)
+
+    server.stop()
+    try await listening.value
+}
+
 @Test @MainActor func serverRejectsInvalidConfigurations() async {
-    for configuration: RemoteScreenServer.Configuration in [
-        .init(source: .mainDisplay(maximumWidth: 321)),
-        .init(framesPerSecond: 0),
-        .init(maximumVideoBitRate: 0),
-        .init(source: .custom { SteppingSource() }, allowsRemoteControl: true),
+    await #expect(throws: RemoteScreenServer.SetupError.self) {
+        _ = try await RemoteScreenServer(
+            configuration: .init(
+                source: .custom { _ in SteppingSource() }, allowsRemoteControl: true))
+    }
+}
+
+@Test @MainActor func clientRejectsInvalidStreamParameters() async {
+    let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: 7711)
+    for stream in [
+        StreamParameters(maximumSize: .init(width: 321, height: 240)),
+        StreamParameters(virtualDisplay: .init(logicalWidth: 799, logicalHeight: 600)),
+        StreamParameters(virtualDisplay: .init(logicalWidth: 800, logicalHeight: 599)),
+        StreamParameters(virtualDisplay: .init(logicalWidth: 3601, logicalHeight: 1000)),
+        StreamParameters(framesPerSecond: 0),
+        StreamParameters(framesPerSecond: 241),
+        StreamParameters(maximumVideoBitRate: 0),
     ] {
-        await #expect(throws: RemoteScreenServer.SetupError.self) {
-            _ = try await RemoteScreenServer(configuration: configuration)
+        let client = RemoteScreenClient(
+            configuration: .init(requestsRemoteControl: false, stream: stream), onFrame: { _ in })
+        let failure = await client.run(.udp(endpoint))
+        if case .invalidConfiguration = failure {
+            // Expected.
+        } else {
+            Issue.record("Expected invalidConfiguration failure, got \(String(describing: failure))")
         }
     }
 }
@@ -183,7 +298,7 @@ func clientReceivesACustomSourceOverLoopback(delayedVideo: Bool) async throws {
     let keyboard = KeyboardControlServer(readCapsLock: { true }, emit: { _ in })
     var port: UInt16?
     let server = try await RemoteScreenServer(
-        configuration: .init(source: .custom { SteppingSource() }, allowsRemoteControl: true),
+        configuration: .init(source: .custom { _ in SteppingSource() }, allowsRemoteControl: true),
         cursor: nil, pointer: pointer, keyboard: keyboard
     ) { event in
         if case .listening(let value) = event { port = value }

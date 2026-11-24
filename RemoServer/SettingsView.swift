@@ -29,48 +29,14 @@ struct SettingsView: View {
                     Text("Test pattern").tag(ServerSettings.Source.testPattern)
                 }
                 .pickerStyle(.radioGroup)
-                Toggle("Limit resolution", isOn: $controller.settings.limitsResolution)
-                if controller.settings.limitsResolution {
-                    LabeledContent("Size") {
-                        HStack(spacing: 6) {
-                            TextField("Width", value: $controller.settings.width, format: .number.grouping(.never))
-                                .frame(width: 70)
-                            Text("×")
-                            TextField("Height", value: $controller.settings.height, format: .number.grouping(.never))
-                                .frame(width: 70)
-                            Text("pixels").foregroundStyle(.secondary)
-                        }
-                        .labelsHidden()
-                    }
-                }
-                LabeledContent("Frame rate") {
-                    HStack(spacing: 6) {
-                        TextField("Frame rate", value: $controller.settings.framesPerSecond, format: .number)
-                            .frame(width: 70)
-                            .labelsHidden()
-                        Stepper("", value: $controller.settings.framesPerSecond, in: 1...240, step: 5)
-                            .labelsHidden()
-                        Text("fps").foregroundStyle(.secondary)
-                    }
-                }
-                LabeledContent("Max video bit rate") {
-                    HStack(spacing: 6) {
-                        TextField("Max video bit rate", value: megabits, format: .number.precision(.fractionLength(0...3)))
-                            .frame(width: 70)
-                            .labelsHidden()
-                        Text("Mbps").foregroundStyle(.secondary)
-                    }
-                }
             } header: {
-                Text("Video")
+                Text("Source")
             } footer: {
-                Text(videoFooter)
+                Text("Resolution, virtual display, frame rate, max video bit rate, and audio streaming are requested by each client when it connects.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Section {
-                Toggle("Stream system audio", isOn: $controller.settings.capturesAudio)
-                    .help("--audio")
                 Toggle("Allow remote control", isOn: $controller.settings.allowsRemoteControl)
                     .help("--control")
                 PermissionRow(
@@ -87,7 +53,7 @@ struct SettingsView: View {
                 Text("Screen")
             } footer: {
                 if controller.settings.source != .screen {
-                    Text("Audio and remote control need the main display source.")
+                    Text("Remote control needs the main display source.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -150,22 +116,6 @@ struct SettingsView: View {
                 Button("Restart Server") { controller.restart() }
             }
         }
-    }
-
-    private var megabits: Binding<Double> {
-        Binding {
-            Double(controller.settings.maximumVideoBitRate) / 1e6
-        } set: { value in
-            controller.settings.maximumVideoBitRate = Int((min(max(value, 0), 2147.483647) * 1e6).rounded())
-        }
-    }
-
-    private var videoFooter: String {
-        let resolution =
-            controller.settings.source == .screen
-            ? "Without a limit, the display is scaled to fit 1920 pixels on its longest edge. Screen capture runs at a variable rate up to the frame rate."
-            : "Without a limit, the test pattern is 640 × 360."
-        return resolution + " Dimensions must be even, from 2 to 8192."
     }
 
     private func chooseTraceDirectory() {

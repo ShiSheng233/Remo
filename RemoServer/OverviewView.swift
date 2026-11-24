@@ -146,9 +146,18 @@ struct ClientSummaryCard: View {
                     Spacer()
                     Image(systemName: "chevron.right").foregroundStyle(.tertiary)
                 }
-                ClientStatusLabel(status: client.status)
-                    .font(.caption)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    ClientStatusLabel(status: client.status)
+                    if let session = client.session {
+                        Text("·").foregroundStyle(.tertiary)
+                        Text(
+                            "\(session.isVirtualDisplay ? "Virtual · " : "")\(session.width) × \(session.height) · \(session.framesPerSecond) fps"
+                        )
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                .font(.caption)
+                .lineLimit(1)
                 if let latest {
                     HStack(spacing: 16) {
                         reading("RTT", latest.link.roundTripTime.map { Format.milliseconds($0.milliseconds) } ?? "—")

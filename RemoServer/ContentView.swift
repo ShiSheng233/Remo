@@ -78,7 +78,7 @@ struct ContentView: View {
             EventLogView()
         case .client(let id):
             if let client = controller.clients.first(where: { $0.id == id }) {
-                ClientDashboardView(client: client, settings: controller.activeSettings)
+                ClientDashboardView(client: client)
                     .id(client.id)
             } else {
                 ContentUnavailableView("Client Gone", systemImage: "person.crop.circle.badge.xmark")

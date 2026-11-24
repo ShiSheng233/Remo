@@ -15,42 +15,58 @@ private func valid(_ length: Int) -> Bool {
     (2...8192).contains(length) && length.isMultiple(of: 2)
 }
 
-/// Streams a video source to every client that connects, adapting to each client's link.
+/// Streams a video source to every client that connects, adapting to each client's link and
+/// requested stream parameters.
 @MainActor
 public final class RemoteScreenServer {
     public enum Source: Sendable {
-        /// The main display, scaled to fit within the given pixel size, optionally with system
-        /// audio. macOS only.
-        case mainDisplay(maximumWidth: Int = 1920, maximumHeight: Int = 1920, capturesAudio: Bool = false)
-        /// Starts a source for each client once it asks for video.
-        case custom(@MainActor @Sendable () async throws -> any ScreenFrameSource)
+        /// The main display, scaled to fit each client's requested size and optionally capturing
+        /// system audio when the client asks for it. macOS only.
+        case mainDisplay
+        /// Starts a source for each client once its handshake arrives.
+        case custom(@MainActor @Sendable (StreamParameters) async throws -> any ScreenFrameSource)
     }
 
     public struct Configuration: Sendable {
         public var source: Source
-        public var framesPerSecond: Int32 = 60
-        public var maximumVideoBitRate = 5_000_000
         /// Lets one client at a time drive the main display's pointer and keyboard. Requires Accessibility access.
         public var allowsRemoteControl = false
         public var diagnostics = Diagnostics()
 
         public init(
-            source: Source = .mainDisplay(), framesPerSecond: Int32 = 60,
-            maximumVideoBitRate: Int = 5_000_000, allowsRemoteControl: Bool = false,
+            source: Source = .mainDisplay,
+            allowsRemoteControl: Bool = false,
             diagnostics: Diagnostics = Diagnostics()
         ) {
             self.source = source
-            self.framesPerSecond = framesPerSecond
-            self.maximumVideoBitRate = maximumVideoBitRate
             self.allowsRemoteControl = allowsRemoteControl
             self.diagnostics = diagnostics
         }
     }
 
+    /// The resolved stream settings a client is receiving after its handshake.
+    public struct SessionInfo: Equatable, Sendable {
+        public let width: Int
+        public let height: Int
+        public let framesPerSecond: Int32
+        public let maximumVideoBitRate: Int
+        public let streamsAudio: Bool
+        public let isVirtualDisplay: Bool
+
+        public init(
+            width: Int, height: Int, framesPerSecond: Int32, maximumVideoBitRate: Int,
+            streamsAudio: Bool, isVirtualDisplay: Bool = false
+        ) {
+            self.width = width
+            self.height = height
+            self.framesPerSecond = framesPerSecond
+            self.maximumVideoBitRate = maximumVideoBitRate
+            self.streamsAudio = streamsAudio
+            self.isVirtualDisplay = isVirtualDisplay
+        }
+    }
+
     public enum SetupError: Error, CustomStringConvertible {
-        case invalidFrameRate
-        case invalidBitRate
-        case invalidSize
         case invalidSource
         case screenCaptureUnavailable
         case screenDiscoveryFailed(any Error)
@@ -59,9 +75,6 @@ public final class RemoteScreenServer {
 
         public var description: String {
             switch self {
-            case .invalidFrameRate: "The frame rate must be 1...240."
-            case .invalidBitRate: "The video bit rate must be positive."
-            case .invalidSize: "Video dimensions must be even, from 2 to 8192."
             case .invalidSource: "The frame source must have even dimensions, from 2 to 8192."
             case .screenCaptureUnavailable: "Screen capture requires macOS."
             case .screenDiscoveryFailed(let error):
@@ -76,12 +89,12 @@ public final class RemoteScreenServer {
     public enum Event {
         case listening(port: UInt16)
         case clientConnected(peer: String)
-        case streamingStarted(peer: String)
+        case streamingStarted(peer: String, session: SessionInfo)
         case clientDisconnected(peer: String, reason: String, failed: Bool)
         case statistics(peer: String, ServerStatistics)
     }
 
-    /// The capture size of a main display source, before any adaptation.
+    /// The native pixel size of the main display, when streaming it.
     public let screenSize: (width: Int, height: Int)?
 
     private let context: ServerConnection.Context
@@ -112,12 +125,8 @@ public final class RemoteScreenServer {
         keyboard testKeyboard: KeyboardControlServer? = nil,
         onEvent: @escaping @MainActor (Event) -> Void = { _ in }
     ) async throws {
-        guard (1...240).contains(configuration.framesPerSecond) else {
-            throw SetupError.invalidFrameRate
-        }
-        guard configuration.maximumVideoBitRate > 0 else { throw SetupError.invalidBitRate }
-        // Polled at the frame rate, which is plenty for the eye, up to the 60 Hz of most displays.
-        let cursorInterval = Duration.seconds(1) / Int(min(60, configuration.framesPerSecond))
+        // 60 Hz is plenty for the eye and matches most displays; runs only while a client is subscribed.
+        let cursorInterval = Duration.seconds(1) / 60
         var cursorMonitor = cursor.map { CursorMonitor(interval: cursorInterval, sample: $0) }
         #if os(macOS)
             if cursorMonitor == nil, case .mainDisplay = configuration.source {
@@ -152,8 +161,8 @@ public final class RemoteScreenServer {
         let startSource: ServerConnection.StartSource
         switch configuration.source {
         case .custom(let start):
-            startSource = {
-                let source = try await start()
+            startSource = { parameters in
+                let source = try await start(parameters)
                 guard valid(source.width), valid(source.height) else {
                     try? await source.stop()
                     throw SetupError.invalidSource
@@ -161,30 +170,48 @@ public final class RemoteScreenServer {
                 return source
             }
             screenSize = nil
-        case .mainDisplay(let maximumWidth, let maximumHeight, let capturesAudio):
-            guard valid(maximumWidth), valid(maximumHeight) else { throw SetupError.invalidSize }
+        case .mainDisplay:
             #if os(macOS)
-                let capture: DisplayCapture.Configuration
                 do {
-                    capture = try await DisplayCapture.Configuration.mainDisplay(
-                        maximumWidth: maximumWidth, maximumHeight: maximumHeight,
-                        framesPerSecond: configuration.framesPerSecond)
+                    screenSize = try await DisplayCapture.Configuration.discoverMainDisplay()
                 } catch {
                     throw SetupError.screenDiscoveryFailed(error)
                 }
                 let traceDirectory = configuration.diagnostics.audioTraceDirectory
-                startSource = {
-                    try await capture.start(
-                        capturesAudio: capturesAudio, audioTraceDirectory: traceDirectory)
+                startSource = { parameters in
+                    if let spec = parameters.virtualDisplay {
+                        let virtualDisplay = try await VirtualDisplay.create(specification: spec)
+                        do {
+                            let capture = try await DisplayCapture.Configuration.display(
+                                displayID: virtualDisplay.displayID,
+                                maximumWidth: parameters.maximumSize?.width,
+                                maximumHeight: parameters.maximumSize?.height,
+                                framesPerSecond: parameters.framesPerSecond,
+                                retryAttempts: 20,
+                                retryDelay: .milliseconds(250))
+                            return try await capture.start(
+                                capturesAudio: parameters.streamsAudio,
+                                audioTraceDirectory: traceDirectory,
+                                virtualDisplay: virtualDisplay)
+                        } catch {
+                            virtualDisplay.destroy()
+                            throw error
+                        }
+                    }
+                    let maxWidth = parameters.maximumSize?.width ?? StreamParameters.defaultScreenEdge
+                    let maxHeight = parameters.maximumSize?.height ?? StreamParameters.defaultScreenEdge
+                    let capture = try await DisplayCapture.Configuration.mainDisplay(
+                        maximumWidth: maxWidth, maximumHeight: maxHeight,
+                        framesPerSecond: parameters.framesPerSecond)
+                    return try await capture.start(
+                        capturesAudio: parameters.streamsAudio,
+                        audioTraceDirectory: traceDirectory)
                 }
-                screenSize = (capture.width, capture.height)
             #else
                 throw SetupError.screenCaptureUnavailable
             #endif
         }
         context = ServerConnection.Context(
-            framesPerSecond: configuration.framesPerSecond,
-            maximumVideoBitRate: configuration.maximumVideoBitRate,
             startSource: startSource, pointer: pointer, keyboard: keyboard, cursor: cursorMonitor,
             diagnostics: configuration.diagnostics,
             onEvent: onEvent)
@@ -235,6 +262,14 @@ public final class RemoteScreenServer {
         }
         context.pointer?.stop()
         context.keyboard?.stop()
+    }
+
+    /// Synchronously tears down any active virtual displays. Call from `applicationWillTerminate`
+    /// so macOS removes virtual displays cleanly before the process exits.
+    public static func destroyVirtualDisplays() {
+        #if os(macOS)
+            VirtualDisplay.destroyAll()
+        #endif
     }
 
     private func updateActivity() {

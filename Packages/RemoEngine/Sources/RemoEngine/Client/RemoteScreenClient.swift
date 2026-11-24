@@ -28,15 +28,19 @@ public final class RemoteScreenClient {
         public var noVideoTimeout = Duration.seconds(15)
         /// Asks the server for remote pointer and keyboard control. A server grants it to one client at a time.
         public var requestsRemoteControl = true
+        /// Video and audio settings requested during the session handshake.
+        public var stream = StreamParameters()
         public var diagnostics = Diagnostics()
 
         public init(
             setupTimeout: Duration = .seconds(8), noVideoTimeout: Duration = .seconds(15),
-            requestsRemoteControl: Bool = true, diagnostics: Diagnostics = Diagnostics()
+            requestsRemoteControl: Bool = true, stream: StreamParameters = StreamParameters(),
+            diagnostics: Diagnostics = Diagnostics()
         ) {
             self.setupTimeout = setupTimeout
             self.noVideoTimeout = noVideoTimeout
             self.requestsRemoteControl = requestsRemoteControl
+            self.stream = stream
             self.diagnostics = diagnostics
         }
     }
@@ -46,6 +50,7 @@ public final class RemoteScreenClient {
     }
 
     public enum Failure: Error {
+        case invalidConfiguration(String)
         case setupTimedOut
         case connectionFailed(any Error)
         case connectionClosed
@@ -96,10 +101,6 @@ public final class RemoteScreenClient {
     private var pointerMovedLocally = false
     private var lastMoveSent: Instant?
     private var moveFlush: Task<Void, Never>?
-    /// Whether the server answered the handshake, control granted or denied, and whether
-    /// the client already asked again in the original format an old server understands.
-    private var helloAnswered = false
-    private var legacyHelloSent = false
     private var lastSeen = Instant.now
     private var lastFrame = Instant.now
     private var counters = Counters()
@@ -168,14 +169,7 @@ public final class RemoteScreenClient {
         scheduleMove()
     }
 
-    /// A single click or a hold's press or release; `pressPointer(_:clickCount:)`.
-    public func pressPointer(_ button: PointerButton) {
-        pressPointer(button, clickCount: 1)
-    }
-
-    /// `clickCount` and secondary holds ride the extended-pointer grant; elsewhere a count
-    /// falls back to one click and a secondary hold to a click on release.
-    public func pressPointer(_ button: PointerButton, clickCount: Int) {
+    public func pressPointer(_ button: PointerButton, clickCount: Int = 1) {
         // The button lands where the cursor is drawn; send the move first so hover is right.
         flushMove()
         sendPointer { $0.press(button, clickCount: clickCount) }
@@ -187,17 +181,10 @@ public final class RemoteScreenClient {
     }
 
     /// Scrolls both axes at `position`, normalized like `movePointer(to:)`, in `unit` steps
-    /// signed like `scroll(lines:)`; horizontal and pixel steps need the extended grant.
-    /// Without it the vertical scroll still lands at `position` when it differs: the move
-    /// goes first, best effort, since the old wire carries no scroll location.
+    /// signed like `scroll(lines:)`.
     public func scrollPointer(
         by delta: CGVector, unit: PointerScrollUnit, at position: CGPoint
     ) {
-        guard isRunning, state == .streaming else { return }
-        if !pointer.capabilities.contains(.vectorScroll) {
-            if position != pointer.position { movePointer(to: position) }
-            if pointer.moved { flushMove() }
-        }
         sendPointer { $0.scroll(by: delta, unit: unit, at: position) }
     }
 
@@ -338,8 +325,6 @@ public final class RemoteScreenClient {
         cursor = nil
         pointerMovedLocally = false
         lastMoveSent = nil
-        helloAnswered = false
-        legacyHelloSent = false
         counters = Counters()
         setState(.connecting)
         trace.write(nil, "client opening")
@@ -372,6 +357,10 @@ public final class RemoteScreenClient {
     }
 
     private func stream(_ link: Link) async {
+        if let problem = configuration.stream.validationProblem {
+            fail(.invalidConfiguration(problem))
+            return
+        }
         let setupTimeout = Task { [weak self, configuration] in
             try await Task.sleep(for: configuration.setupTimeout)
             self?.fail(.setupTimedOut)
@@ -415,7 +404,7 @@ public final class RemoteScreenClient {
                 onFailure: { [weak self] error in self?.fail(.videoFailed(error)) })
             let hello = SessionHandshake.hello(
                 requestsControl: configuration.requestsRemoteControl,
-                extendedPointer: configuration.requestsRemoteControl)
+                stream: configuration.stream)
             try session.send(hello.encoded, delivery: hello.delivery)
             trace.write(nil, "hello queued")
             setState(.waitingForVideo)
@@ -469,16 +458,6 @@ public final class RemoteScreenClient {
                 try video?.requestRefresh()
             }
             do {
-                if configuration.requestsRemoteControl, !helloAnswered, !legacyHelloSent,
-                    now.hasElapsed(SessionTiming.legacyHelloDelay, since: started)
-                {
-                    // The extended-pointer flag can leave an old server's hello unanswered;
-                    // ask once more in the original format, which still grants basic control.
-                    try session.send(
-                        SessionHandshake.hello(requestsControl: true).encoded,
-                        delivery: .essential)
-                    legacyHelloSent = true
-                }
                 try session.send(
                     MessageKind.heartbeat.encoded, delivery: .retrying(replacing: .heartbeat))
                 counters.heartbeats += 1
@@ -501,7 +480,7 @@ public final class RemoteScreenClient {
         if byte == MessageKind.audio.rawValue {
             guard let packet = try? AudioMessage(decoding: data) else { return }
             lastSeen = .now
-            guard !audioDisabled else { return }
+            guard configuration.stream.streamsAudio, !audioDisabled else { return }
             if playback == nil {
                 playback = AudioPlayback(
                     traceDirectory: configuration.diagnostics.audioTraceDirectory
@@ -523,13 +502,9 @@ public final class RemoteScreenClient {
         case .sessionReady:
             guard case let .ready(control) = try? SessionHandshake(decoding: data) else { return }
             lastSeen = .now
-            helloAnswered = true
             guard let control else { return }
             let size = CGSize(width: Int(control.displayWidth), height: Int(control.displayHeight))
-            if pointer.begin(
-                position: control.pointerPosition, displaySize: size,
-                capabilities: control.extendedPointer ? .current : [])
-            {
+            if pointer.begin(position: control.pointerPosition, displaySize: size) {
                 keyboard.begin(capsLock: control.capsLock)
                 onEvent(.controlAvailable(displaySize: size, capsLock: control.capsLock))
                 publishCursor()
@@ -581,6 +556,7 @@ public final class RemoteScreenClient {
 extension RemoteScreenClient.Failure: CustomStringConvertible {
     public var description: String {
         switch self {
+        case .invalidConfiguration(let problem): "invalid configuration: \(problem)"
         case .setupTimedOut: "connection setup timed out"
         case .connectionFailed(let error): "connection setup: \(error)"
         case .connectionClosed: "connection closed"

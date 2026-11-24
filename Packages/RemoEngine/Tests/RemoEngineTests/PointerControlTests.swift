@@ -27,11 +27,6 @@ import Testing
             try PointerMessage(decoding: message.encoded.dropLast())
         }
     }
-    // An old peer reads the position directly after the action byte.
-    #expect(messages[1].encoded.count == 35)
-    #expect(messages[1].encoded.prefix(2) == Data([10, 2]))
-    #expect(messages[3].encoded.count == 36)
-    #expect(messages[3].encoded.prefix(2) == Data([10, 4]))
     var badCount = messages[3].encoded
     badCount[19] = 0
     #expect(throws: WireFormatError.self) {
@@ -204,36 +199,32 @@ import Testing
     ])
 }
 
-@Test func pointerClientFollowsTheGrantedCapabilities() {
+@Test func pointerClientQuantizesScrollVectorsAndMovesAbsolutely() {
     let start = CGPoint(x: 0.25, y: 0.75)
     let target = CGPoint(x: 0.75, y: 0.25)
-    var legacy = PointerControlClient()
-    let size = CGSize(width: 640, height: 360)
-    let legacyAccepted = legacy.begin(position: start, displaySize: size)
-    let moved = legacy.move(to: target)
-    let primary = legacy.press(.leftDown, clickCount: 2)
-    #expect(legacyAccepted && moved)
-    #expect(primary == .button(sequence: 1, afterButton: 0, action: .leftDown, position: target))
-    _ = legacy.press(.leftUp)
-    let secondaryDown = legacy.press(.rightDown)
-    let secondaryUp = legacy.press(.rightUp)
-    #expect(secondaryDown == nil)
-    #expect(secondaryUp == .button(sequence: 3, afterButton: 2, action: .rightClick, position: target))
-    let fallback = legacy.scroll(by: CGVector(dx: 3, dy: -2), unit: .line, at: target)
-    #expect(fallback == .scroll(lines: -2))
+    var client = PointerControlClient()
+    let accepted = client.begin(position: start, displaySize: CGSize(width: 640, height: 360))
+    let moved = client.move(to: target)
+    let move = client.takeMove()
+    let primary = client.press(.leftDown, clickCount: 2)
+    #expect(accepted && moved)
+    #expect(move == .move(sequence: 1, afterButton: 0, position: target))
+    #expect(
+        primary == .button(
+            sequence: 2, afterButton: 0, action: .leftDown, clickCount: 2, position: target))
+    #expect(client.dragging)
+    _ = client.press(.leftUp, clickCount: 2)
+    #expect(!client.dragging)
 
-    var extended = PointerControlClient()
-    let extendedAccepted = extended.begin(position: start, displaySize: size, capabilities: .current)
-    #expect(extendedAccepted)
     let step = CGVector(dx: 0.5, dy: -0.75)
-    let fraction = extended.scroll(by: step, unit: .pixel, at: target)
+    let fraction = client.scroll(by: step, unit: .pixel, at: target)
+    let lines = client.scroll(by: CGVector(dx: 2, dy: 0), unit: .line, at: start)
+    let pixels = client.scroll(by: step, unit: .pixel, at: target)
+    let moveAfterScroll = client.takeMove()
     #expect(fraction == nil)
-    let lines = extended.scroll(by: CGVector(dx: 2, dy: 0), unit: .line, at: start)
     #expect(lines == .scrollVector(unit: .line, x: 2, y: 0, position: start))
-    let pixels = extended.scroll(by: step, unit: .pixel, at: target)
     #expect(pixels == .scrollVector(unit: .pixel, x: 1, y: -1, position: target))
-    let move = extended.takeMove()
-    #expect(move == nil)
+    #expect(moveAfterScroll == nil)
 }
 
 @Test @MainActor func secondaryDragIsOrderedAndScrollDoesNotMoveThePointer() {

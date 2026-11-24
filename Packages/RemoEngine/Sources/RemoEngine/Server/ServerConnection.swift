@@ -9,23 +9,23 @@ import Network
 import RemoCodec
 import RemoTransport
 
+#if os(macOS)
+    import CoreGraphics
+#endif
+
 /// One client of a `RemoteScreenServer`, from connection setup until it leaves or times out.
 @MainActor
 final class ServerConnection {
-    typealias StartSource = @MainActor () async throws -> any ScreenFrameSource
+    typealias StartSource = @MainActor (StreamParameters) async throws -> any ScreenFrameSource
 
     /// Shared by every connection of one server.
     struct Context {
-        let framesPerSecond: Int32
-        let maximumVideoBitRate: Int
         let startSource: StartSource
         let pointer: PointerControlServer?
         let keyboard: KeyboardControlServer?
         let cursor: CursorMonitor?
         let diagnostics: Diagnostics
         let onEvent: @MainActor (RemoteScreenServer.Event) -> Void
-
-        var frameInterval: Duration { .seconds(1) / Int(framesPerSecond) }
     }
 
     /// 96 kbps Opus in 20 ms packets, with their headers.
@@ -48,6 +48,8 @@ final class ServerConnection {
     private var previousAcceptedDataPackets: UInt32 = 0
 
     // Cursor & keyboard state
+    private var requestsControl = false
+    private var activeCursorMonitor: CursorMonitor?
     private var cursorSubscription: UUID?
     private var cursorSequence: UInt64 = 0
     /// Shapes this client has been sent, so each goes once.
@@ -55,16 +57,18 @@ final class ServerConnection {
     private var keyboardStateSequence: UInt64 = 0
 
     // Source
+    private var streamParameters = StreamParameters()
+    private var sourceStartTask: Task<Void, Error>?
     private var source: (any ScreenFrameSource)?
     private var frameForwardTask: Task<Void, Never>?
     private var streamWake: AsyncStream<Void>.Continuation?
     private var encoder: VideoEncoder?
     private var previousCapturePTS = CMTime.invalid
     private var lastCaptureSend: Instant?
-    private var targetBitRate: Int
-    private var encoderFrameRate: Int32
+    private var targetBitRate = StreamParameters.defaultMaximumVideoBitRate
+    private var encoderFrameRate = StreamParameters.defaultFramesPerSecond
     private var lastRateUpdate: Instant?
-    private var refreshBitRate: Int
+    private var refreshBitRate = StreamParameters.defaultMaximumVideoBitRate
     private var lastQualityRefresh: Instant?
     private var lastImageChange = Instant.now
     private var refreshWhenStill = false
@@ -102,9 +106,6 @@ final class ServerConnection {
         self.peer = peer
         self.context = context
         trace = HeartbeatTrace(layer: "session", diagnostics: context.diagnostics)
-        targetBitRate = context.maximumVideoBitRate
-        encoderFrameRate = context.framesPerSecond
-        refreshBitRate = context.maximumVideoBitRate
     }
 
     private func log(_ message: @autoclosure () -> String) {
@@ -151,8 +152,11 @@ final class ServerConnection {
                 stop("send failed: \(error)", failed: true)
             }
         }
-        if let cursorSubscription { context.cursor?.unsubscribe(cursorSubscription) }
+        sourceStartTask?.cancel()
+        sourceStartTask = nil
+        if let cursorSubscription { activeCursorMonitor?.unsubscribe(cursorSubscription) }
         cursorSubscription = nil
+        activeCursorMonitor = nil
         audioSendTask?.cancel()
         frameForwardTask?.cancel()
         frameForwardTask = nil
@@ -176,6 +180,7 @@ final class ServerConnection {
         context.pointer?.end(for: controlPeer)
         context.keyboard?.end(for: controlPeer)
         setup?.cancel()
+        sourceStartTask?.cancel()
         streamWake?.yield(())
         let idle = Instant.now - lastSeen
         trace.write(
@@ -228,31 +233,25 @@ final class ServerConnection {
         }
         switch kind {
         case .hello:
-            guard case let .hello(requestsControl, extendedPointer) = try? SessionHandshake(decoding: bytes) else {
+            guard case let .hello(requestsControl, stream) = try? SessionHandshake(decoding: bytes) else {
                 return
             }
             if !active {
                 active = true
-                context.onEvent(.streamingStarted(peer: peer))
-                if cursorSubscription == nil, let cursor = context.cursor {
-                    cursorSubscription = cursor.subscribe { [weak self] state, shape in
-                        self?.sendCursor(state, shape: shape)
-                    }
-                }
-                let grant = requestsControl ? beginControl(extended: extendedPointer) : nil
-                if let session {
-                    let ready = SessionHandshake.ready(control: grant)
-                    do {
-                        try session.send(ready.encoded, delivery: ready.delivery)
-                    } catch {
-                        if grant != nil {
-                            context.pointer?.end(for: controlPeer)
-                            context.keyboard?.end(for: controlPeer)
-                        }
-                    }
-                }
+                self.requestsControl = requestsControl
+                streamParameters = stream
+                targetBitRate = stream.maximumVideoBitRate
+                encoderFrameRate = stream.framesPerSecond
+                refreshBitRate = stream.maximumVideoBitRate
                 streamWake?.yield(())
-                trace.write(peer, "hello accepted control=\(grant != nil)")
+                let sizeText = stream.maximumSize.map { "\($0.width)x\($0.height)" } ?? "default"
+                let virtualText =
+                    stream.virtualDisplay.map { " virtualDisplay=\($0.logicalWidth)x\($0.logicalHeight)" }
+                    ?? ""
+                trace.write(
+                    peer,
+                    "hello accepted requestsControl=\(requestsControl) size=\(sizeText)\(virtualText) fps=\(stream.framesPerSecond) maxBps=\(stream.maximumVideoBitRate) audio=\(stream.streamsAudio)"
+                )
             }
         case .heartbeat:
             guard bytes.count == 1, active else {
@@ -272,10 +271,25 @@ final class ServerConnection {
         lastSeen = .now
     }
 
-    private func beginControl(extended: Bool) -> SessionHandshake.ControlGrant? {
-        guard let pointer = context.pointer, let keyboard = context.keyboard,
-            let pointerState = pointer.begin(for: controlPeer)
-        else { return nil }
+    private func beginControl(
+        source: any ScreenFrameSource, cursorMonitor: CursorMonitor?
+    ) -> SessionHandshake.ControlGrant? {
+        guard let pointer = context.pointer, let keyboard = context.keyboard else { return nil }
+        let pointerState: PointerControlServer.InitialState?
+        #if os(macOS)
+            if let displaySource = source as? any DisplayScreenFrameSource {
+                pointerState = pointer.begin(
+                    for: controlPeer, displayID: displaySource.displayID,
+                    onPost: { [weak cursorMonitor] in
+                        cursorMonitor?.notePosted($0)
+                    })
+            } else {
+                pointerState = pointer.begin(for: controlPeer)
+            }
+        #else
+            pointerState = pointer.begin(for: controlPeer)
+        #endif
+        guard let pointerState else { return nil }
         guard
             let capsLock = keyboard.begin(
                 for: controlPeer,
@@ -290,7 +304,19 @@ final class ServerConnection {
             pointerPosition: pointerState.position,
             displayWidth: pointerState.width,
             displayHeight: pointerState.height,
-            capsLock: capsLock, extendedPointer: extended)
+            capsLock: capsLock)
+    }
+
+    private func cursorMonitor(for source: any ScreenFrameSource) -> CursorMonitor? {
+        #if os(macOS)
+            if let displaySource = source as? any DisplayScreenFrameSource,
+                displaySource.isVirtualDisplay
+            {
+                let system = SystemCursor(displayID: displaySource.displayID)
+                return CursorMonitor(interval: .seconds(1) / 60, sample: system.sample)
+            }
+        #endif
+        return context.cursor
     }
 
     private func sendKeyboardState(capsLock: Bool) {
@@ -353,14 +379,54 @@ final class ServerConnection {
                     }
                 }
                 if source == nil {
-                    // Start the source once the client asks for video.
-                    let source = try await context.startSource()
-                    self.source = source
+                    // Start the source once the client sends its stream parameters.
+                    let startTask = Task { @MainActor [self] in
+                        self.source = try await context.startSource(streamParameters)
+                    }
+                    sourceStartTask = startTask
+                    try await startTask.value
+                    sourceStartTask = nil
                     if stopping { break }
+                    guard let source = self.source else { throw VideoSession.Failure.closed }
                     try prepareVideo(source)
-                    if let capture = source as? any AudioSource {
+                    if streamParameters.streamsAudio, let capture = source as? any AudioSource {
                         startAudio(capture, session: session)
                     }
+                    let cursor = cursorMonitor(for: source)
+                    activeCursorMonitor = cursor
+                    if cursorSubscription == nil, let cursor {
+                        cursorSubscription = cursor.subscribe { [weak self] state, shape in
+                            self?.sendCursor(state, shape: shape)
+                        }
+                    }
+                    let grant =
+                        requestsControl ? beginControl(source: source, cursorMonitor: cursor) : nil
+                    let ready = SessionHandshake.ready(control: grant)
+                    do {
+                        try session.send(ready.encoded, delivery: ready.delivery)
+                    } catch {
+                        if grant != nil {
+                            context.pointer?.end(for: controlPeer)
+                            context.keyboard?.end(for: controlPeer)
+                        }
+                        throw error
+                    }
+                    trace.write(peer, "session ready control=\(grant != nil)")
+                    let isVirtualDisplay: Bool
+                    #if os(macOS)
+                        isVirtualDisplay = (source as? any DisplayScreenFrameSource)?.isVirtualDisplay ?? false
+                    #else
+                        isVirtualDisplay = false
+                    #endif
+                    context.onEvent(
+                        .streamingStarted(
+                            peer: peer,
+                            session: RemoteScreenServer.SessionInfo(
+                                width: source.width, height: source.height,
+                                framesPerSecond: streamParameters.framesPerSecond,
+                                maximumVideoBitRate: streamParameters.maximumVideoBitRate,
+                                streamsAudio: sendsAudio,
+                                isVirtualDisplay: isVirtualDisplay)))
                     if let notifying = source as? any NotifyingScreenFrameSource {
                         eventDriven = true
                         let arrivals = notifying.frameArrivals
@@ -398,10 +464,10 @@ final class ServerConnection {
     /// higher-bitrate links (e.g. 5 Mbps), stepping down to 30 fps when bitrate is tight or loss
     /// is heavy so each frame gets twice the bit budget and half the per-second loss exposure.
     private var effectiveFramesPerSecond: Int32 {
-        if context.framesPerSecond > 30 && (targetBitRate < 2_000_000 || protectedLoss >= 0.05) {
+        if streamParameters.framesPerSecond > 30 && (targetBitRate < 2_000_000 || protectedLoss >= 0.05) {
             return 30
         }
-        return context.framesPerSecond
+        return streamParameters.framesPerSecond
     }
 
     private var effectiveFrameInterval: Duration {
@@ -449,7 +515,7 @@ final class ServerConnection {
     ) async throws {
         let stats = session.statistics
         let budget = stats.bitsPerSecond
-        let maximum = context.maximumVideoBitRate
+        let maximum = streamParameters.maximumVideoBitRate
         protectedLoss = max(
             stats.linkLossRatio, protectedLoss * pow(0.5, (now - protectedLossAt) / .seconds(5)))
         protectedLossAt = now
@@ -491,7 +557,7 @@ final class ServerConnection {
         }
         // Send a still desktop again periodically so a lost frame can be recovered.
         guard changed || now.hasElapsed(stillInterval, since: lastCaptureSend) else { return }
-        if eventDriven, changed, desiredFPS < context.framesPerSecond,
+        if eventDriven, changed, desiredFPS < streamParameters.framesPerSecond,
             !now.hasElapsed(effectiveFrameInterval - .milliseconds(2), since: lastCaptureSend)
         {
             return

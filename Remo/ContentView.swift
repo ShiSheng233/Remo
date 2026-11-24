@@ -4,6 +4,19 @@
 //
 
 import SwiftUI
+import UIKit
+
+enum DeviceScreen {
+    @MainActor
+    static var logicalSize: CGSize {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let active = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        if let size = active?.screen.bounds.size, size.width > 0, size.height > 0 {
+            return size
+        }
+        return CGSize(width: 1920, height: 1080)
+    }
+}
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -15,6 +28,7 @@ struct ContentView: View {
     @State private var pendingDeletion: RemoteServer?
     @State private var activeServer: RemoteServer?
     @State private var deletionFailed = false
+    @State private var sceneSize = CGSize.zero
     // The list is the home screen, so keep it beside the detail on the unfolded display.
     @State private var columnVisibility = NavigationSplitViewVisibility.all
 
@@ -31,6 +45,11 @@ struct ContentView: View {
             detail
         }
         .navigationSplitViewStyle(.balanced)
+        .background {
+            Color.clear
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { sceneSize = $0 }
+                .ignoresSafeArea()
+        }
         .fullScreenCover(isPresented: playerPresented) {
             if let surface = player.surface {
                 PlayerView(player: player, surface: surface, title: activeServer?.displayName ?? "")
@@ -63,6 +82,7 @@ struct ContentView: View {
             ServerDetailView(
                 server: server, thumbnail: store.thumbnails[id],
                 sessionLog: store.sessionLogs.contains(id) ? SessionLogs.url(for: id) : nil,
+                sceneSize: effectiveSceneSize,
                 isNew: false,
                 failure: activeServer?.id == id ? failure : nil, canConnect: player.surface == nil,
                 editRequest: $editRequest, onSave: store.save, onConnect: connect, onCancelNew: {},
@@ -72,7 +92,8 @@ struct ContentView: View {
         } else if let draft = newServer, selection == draft.id {
             // Once saved, the server comes from the store and the branch above takes over.
             ServerDetailView(
-                server: draft, thumbnail: nil, sessionLog: nil, isNew: true, failure: nil, canConnect: false,
+                server: draft, thumbnail: nil, sessionLog: nil, sceneSize: effectiveSceneSize,
+                isNew: true, failure: nil, canConnect: false,
                 editRequest: $editRequest, onSave: store.save, onConnect: connect,
                 onCancelNew: {
                     newServer = nil
@@ -82,6 +103,10 @@ struct ContentView: View {
         } else if !store.servers.isEmpty {
             ContentUnavailableView("Select a Server", systemImage: "display")
         }
+    }
+
+    private var effectiveSceneSize: CGSize {
+        sceneSize.width > 0 && sceneSize.height > 0 ? sceneSize : DeviceScreen.logicalSize
     }
 
     private var failure: String? {
@@ -99,13 +124,18 @@ struct ContentView: View {
     }
 
     private func connect(_ server: RemoteServer) {
-        guard let endpoint = server.address.endpoint else { return }
+        guard let endpoint = server.address.endpoint,
+            let stream = server.stream.parameters(screenLogicalSize: effectiveSceneSize)
+        else {
+            return
+        }
         let wireGuard = server.useWireGuard ? server.wireGuard.configuration : nil
         guard !server.useWireGuard || wireGuard != nil else { return }
         activeServer = server
         let id = server.id
-        player.connect(to: endpoint, wireGuard: wireGuard, log: store.beginSessionLog(id)) {
-            [store] frame in
+        player.connect(
+            to: endpoint, wireGuard: wireGuard, stream: stream, log: store.beginSessionLog(id)
+        ) { [store] frame in
             store.recordSession(id, finalFrame: frame)
         }
     }

@@ -16,3 +16,14 @@ public protocol ScreenFrameSource: AnyObject {
 protocol NotifyingScreenFrameSource: ScreenFrameSource {
     var frameArrivals: AsyncStream<Void> { get }
 }
+
+#if os(macOS)
+    import CoreGraphics
+
+    /// Internal extension for display-backed sources so cursor tracking and remote control target
+    /// the actual captured display (the main display or a per-client virtual display).
+    protocol DisplayScreenFrameSource: ScreenFrameSource {
+        var displayID: CGDirectDisplayID { get }
+        var isVirtualDisplay: Bool { get }
+    }
+#endif

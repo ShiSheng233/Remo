@@ -205,7 +205,7 @@ private final class StillSource: ScreenFrameSource {
         shape: try shape(3))
     var port: UInt16?
     let server = try await RemoteScreenServer(
-        configuration: .init(source: .custom { StillSource() }), cursor: { reading }
+        configuration: .init(source: .custom { _ in StillSource() }), cursor: { reading }
     ) { event in
         if case .listening(let value) = event { port = value }
     }

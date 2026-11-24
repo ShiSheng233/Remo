@@ -161,7 +161,7 @@ func movingPictureSurvivesALossyLink(link: LinkQuality) async throws {
     let keyFrames = Counter()
     let server = try await RemoteScreenServer(
         configuration: .init(
-            source: .custom { DraggingSource() },
+            source: .custom { _ in DraggingSource() },
             diagnostics: .init {
                 if $0.message.hasPrefix("key frame=") && $0.message.hasSuffix(" sent until delivered") {
                     keyFrames.increment()

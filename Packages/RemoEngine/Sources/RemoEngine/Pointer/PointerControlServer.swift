@@ -34,6 +34,18 @@ final class PointerControlServer {
 
     private let initialState: () -> InitialState?
     private let emit: @MainActor (Event) -> Void
+    #if os(macOS)
+        private final class DisplayTarget {
+            var displayID: CGDirectDisplayID
+            var onPost: @MainActor (CGPoint) -> Void
+
+            init(displayID: CGDirectDisplayID, onPost: @escaping @MainActor (CGPoint) -> Void) {
+                self.displayID = displayID
+                self.onPost = onPost
+            }
+        }
+        private var displayTarget: DisplayTarget?
+    #endif
     private var owner: UUID?
     private var position = CGPoint.zero
     /// The button whose press is still down, and its click state.
@@ -90,7 +102,6 @@ final class PointerControlServer {
             latestPosition = sequence
             switch action {
             case .leftDown, .rightDown:
-                // A second press while a button is held is ignored, like the old wire's.
                 guard heldButton == nil else { break }
                 heldButton = action
                 heldClickCount = clickCount
@@ -142,6 +153,9 @@ final class PointerControlServer {
         heldButton = nil
         heldClickCount = 1
         owner = nil
+        #if os(macOS)
+            displayTarget?.onPost = { _ in }
+        #endif
         latestPosition = 0
         latestButton = 0
         pendingMove = nil
@@ -172,15 +186,20 @@ private extension PointerButton {
             onPost: @escaping @MainActor (CGPoint) -> Void = { _ in }
         ) {
             nonisolated(unsafe) let source = CGEventSource(stateID: .hidSystemState)
+            let target = DisplayTarget(displayID: displayID, onPost: onPost)
             self.init(initialState: {
-                guard let geometry = DisplayGeometry(displayID: displayID),
+                guard let geometry = DisplayGeometry(displayID: target.displayID),
                     let width = UInt32(exactly: geometry.bounds.width), width > 0,
                     let height = UInt32(exactly: geometry.bounds.height), height > 0,
                     let location = CGEvent(source: nil)?.location
                 else { return nil }
-                return InitialState(position: geometry.normalize(location), width: width, height: height)
+                let position =
+                    geometry.bounds.contains(location)
+                    ? geometry.normalize(location)
+                    : CGPoint(x: 0.5, y: 0.5)
+                return InitialState(position: position, width: width, height: height)
             }, emit: { event in
-                guard let geometry = DisplayGeometry(displayID: displayID) else { return }
+                guard let geometry = DisplayGeometry(displayID: target.displayID) else { return }
                 let remoteFlags = modifierFlags()
                 let post: @MainActor (CGEventType, CGMouseButton, CGPoint, Int) -> Void = {
                     type, button, position, clickCount in
@@ -195,7 +214,7 @@ private extension PointerButton {
                             .mouseEventClickState, value: Int64(clickCount))
                     }
                     event?.post(tap: .cghidEventTap)
-                    onPost(position)
+                    target.onPost(position)
                 }
                 switch event {
                 case let .move(position, dragging, clickCount):
@@ -251,6 +270,19 @@ private extension PointerButton {
                     scrollEvent?.post(tap: .cghidEventTap)
                 }
             })
+            self.displayTarget = target
+        }
+
+        /// Grants control targeting a specific display (main display or a per-client virtual
+        /// display) without affecting an already-active controlling peer.
+        func begin(
+            for peer: UUID, displayID: CGDirectDisplayID,
+            onPost: @escaping @MainActor (CGPoint) -> Void
+        ) -> InitialState? {
+            guard owner == nil else { return nil }
+            displayTarget?.displayID = displayID
+            displayTarget?.onPost = onPost
+            return begin(for: peer)
         }
     }
 #endif

@@ -10,9 +10,6 @@ import Foundation
 /// The pointer moves here first, where the client draws it; its position goes to the server
 /// when the client chooses to send it. Messages arrive in no particular order, so every move
 /// and button change carries the sequence of the button change it follows.
-///
-/// A grant that echoes the extended-pointer flag carries `capabilities`; without one the wire
-/// offers only the original input: primary clicks and holds, and whole-line vertical scrolls.
 struct PointerControlClient {
     /// The remote display's size in points, once the server has granted control.
     private(set) var displaySize: CGSize?
@@ -22,26 +19,18 @@ struct PointerControlClient {
     private(set) var dragging = false
     /// Whether the position has moved since it was last sent.
     private(set) var moved = false
-    /// Extended input the granted server accepts; empty for an original-format grant.
-    private(set) var capabilities: PointerCapabilities = []
     private var sequence: UInt64 = 0
     private var buttonSequence: UInt64 = 0
-    /// A secondary press an unextended server only learns of as a click on release.
-    private var pendingRightDown = false
     /// Scroll deltas too small to fill a whole wire unit, per unit kind.
     private var lineRemainder = CGVector.zero
     private var pixelRemainder = CGVector.zero
 
     /// Accepts the server's control grant. Returns false if control is already active.
     @discardableResult
-    mutating func begin(
-        position: CGPoint, displaySize: CGSize,
-        capabilities: PointerCapabilities = []
-    ) -> Bool {
+    mutating func begin(position: CGPoint, displaySize: CGSize) -> Bool {
         guard self.displaySize == nil else { return false }
         self.position = position
         self.displaySize = displaySize
-        self.capabilities = capabilities
         return true
     }
 
@@ -83,42 +72,20 @@ struct PointerControlClient {
     }
 
     /// A button change carries the position, so it also stands for any unsent move.
-    /// `clickCount` rides on the extended wire format; without `extendedButtons` it falls
-    /// back to one, and a secondary hold falls back to a click on release.
     mutating func press(_ button: PointerButton, clickCount: Int = 1) -> PointerMessage? {
         guard displaySize != nil else { return nil }
-        let count = min(Int(UInt8.max), max(1, clickCount))
-        if capabilities.contains(.extendedButtons) {
-            return makeButton(button, clickCount: count)
-        }
-        switch button {
-        case .rightDown:
-            pendingRightDown = true
-            return nil
-        case .rightUp:
-            guard pendingRightDown else { return nil }
-            pendingRightDown = false
-            return makeButton(.rightClick)
-        default:
-            // Click counts need the extended wire format; send what the server knows.
-            return makeButton(button)
-        }
-    }
-
-    private mutating func makeButton(
-        _ action: PointerButton, clickCount: Int = 1
-    ) -> PointerMessage {
         let previous = buttonSequence
         sequence += 1
         buttonSequence = sequence
-        switch action {
+        switch button {
         case .leftDown, .rightDown: dragging = true
         case .leftUp, .rightUp: dragging = false
         case .leftClick, .rightClick: break
         }
+        let count = min(Int(UInt8.max), max(1, clickCount))
         return .button(
-            sequence: sequence, afterButton: previous, action: action,
-            clickCount: clickCount, position: position)
+            sequence: sequence, afterButton: previous, action: button,
+            clickCount: count, position: position)
     }
 
     /// Whole lines; positive values move the content down, following the finger.
@@ -129,8 +96,7 @@ struct PointerControlClient {
     }
 
     /// Scrolls both axes at an explicit normalized location, in `unit` steps signed like
-    /// `scroll(lines:)`. Without `vectorScroll` it degrades to whole vertical lines, pixels
-    /// at a fixed share of a line; fractions accumulate until they fill a step.
+    /// `scroll(lines:)`. Sub-unit fractions accumulate until they fill a whole wire step.
     mutating func scroll(
         by delta: CGVector, unit: PointerScrollUnit, at location: CGPoint
     ) -> PointerMessage? {
@@ -138,18 +104,10 @@ struct PointerControlClient {
             location.x.isFinite, location.y.isFinite
         else { return nil }
         let at = CGPoint(x: min(1, max(0, location.x)), y: min(1, max(0, location.y)))
-        if capabilities.contains(.vectorScroll) {
-            switch unit {
-            case .line: return Self.scrollVector(delta, unit: unit, at: at, remainder: &lineRemainder)
-            case .pixel: return Self.scrollVector(delta, unit: unit, at: at, remainder: &pixelRemainder)
-            }
+        switch unit {
+        case .line: return Self.scrollVector(delta, unit: unit, at: at, remainder: &lineRemainder)
+        case .pixel: return Self.scrollVector(delta, unit: unit, at: at, remainder: &pixelRemainder)
         }
-        let total =
-            lineRemainder.dy + (unit == .line ? delta.dy : delta.dy / Self.pointsPerLine)
-        let lines = Self.quantized(
-            total, limit: PointerScrollUnit.line.wireLimit, remainder: &lineRemainder.dy)
-        guard lines != 0 else { return nil }
-        return .scroll(lines: lines)
     }
 
     private static func scrollVector(
@@ -170,7 +128,4 @@ struct PointerControlClient {
         remainder = bounded.truncatingRemainder(dividingBy: 1)
         return Int32(bounded.rounded(.towardZero))
     }
-
-    /// Remote points that make one line, for the legacy line-only scroll wire.
-    private static let pointsPerLine: CGFloat = 10
 }
